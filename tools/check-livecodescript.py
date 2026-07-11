@@ -25,6 +25,11 @@ It checks every target for:
      false-positive.)
   4. The dangling-else pairing (a bare ``else`` after a single-line
      ``if … then <stmt>``), which the structural pass cannot see.
+  5. Chunk expressions taken directly off an array element
+     (``byte i of tA[j]``, ``item 1 of tA["k"]``) -- house gotcha H6: the
+     engine throws a double/binary conversion error at runtime (found on
+     holde-em's first OXT pass, in the seed-XOR path). Copy the element
+     into a plain local, then chunk the local.
 
 Usage::
 
@@ -162,6 +167,27 @@ def check_structure(text):
     return errors
 
 
+CHUNK_OF_ELEMENT = re.compile(
+    r"\b(byte|char|item|word|line|token)\b[^\n]*?\bof\s+[A-Za-z_][A-Za-z0-9_]*\s*\[")
+
+
+def check_chunk_of_element(text):
+    """A chunk expression whose source is an array element (``byte i of
+    tA[j]``) throws a double/binary conversion error at runtime on OXT --
+    confirmed on holde-em's first OXT pass (heXorSeedsA), invisible to the
+    compiler. The rule: copy the element to a plain local, chunk the local.
+    Plurals (``the number of bytes of ...``) do not match; a bracket later
+    on the line without an ``of`` directly before it does not match."""
+    errors = []
+    for lineno, code in logical_lines(text):
+        if CHUNK_OF_ELEMENT.search(code):
+            errors.append(
+                f"  L{lineno}: chunk of an array element -- copy the element to a"
+                " plain local first (house gotcha H6)"
+            )
+    return errors
+
+
 def check_dangling_else(text):
     """A single-line ``if … then <stmt>`` directly followed by a BARE ``else``
     line. LiveCode/OXT binds that else to the single-line if (the dangling-else
@@ -201,6 +227,7 @@ def main():
         problems += check_smart_quotes(text)
         problems += check_structure(text)
         problems += check_dangling_else(text)
+        problems += check_chunk_of_element(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")

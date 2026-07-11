@@ -241,6 +241,12 @@ House additions for THIS repo (earned in the siblings, restated as law here):
 - **H5. Pure logic stays pure.** Evaluator, betting engine, transcript fold, settlement:
   values in, values out, no UI reads, no `the result` reliance inside — this is what
   keeps them machine-testable (and it is why the KATs can run in CI at all).
+- **H6. Never take a chunk of an array element directly.** `byte i of tA[j]`,
+  `char 5 to -1 of tA["from"]`, `item n of tA["stacks"]` — all of them throw a
+  double/binary conversion error at runtime (found on this repo's first OXT pass, in
+  the seed-XOR path; the compiler accepts the syntax happily). Copy the element into a
+  plain local, then chunk the local. Same rule for `replace ... in tA["k"]` — copy out,
+  modify, or avoid. The static gate flags the chunk pattern (check 5).
 
 ## The single-threaded performance playbook (condensed for a card game)
 
