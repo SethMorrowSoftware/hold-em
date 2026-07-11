@@ -446,12 +446,16 @@ function heSeedCommitOf pSeedData
 end heSeedCommitOf
 
 function heXorSeedsA pSeedsA, pCount
-   local tOut, tBytePos, tSeatPos, tAcc
+   -- H6 (first OXT pass): a chunk taken directly off an array element
+   -- ("byte i of pSeedsA[j]") throws a double/binary conversion error on
+   -- engine; copy the element to a plain local, then chunk the local
+   local tOut, tBytePos, tSeatPos, tAcc, tSeedData
    put empty into tOut
    repeat with tBytePos = 1 to 32
       put 0 into tAcc
       repeat with tSeatPos = 1 to pCount
-         put bitXOr(tAcc, byteToNum(byte tBytePos of pSeedsA[tSeatPos])) into tAcc
+         put pSeedsA[tSeatPos] into tSeedData
+         put bitXOr(tAcc, byteToNum(byte tBytePos of tSeedData)) into tAcc
       end repeat
       put numToByte(tAcc) after tOut
    end repeat
@@ -1202,7 +1206,7 @@ function heFoldTranscript pLogTxt
    local tOutA, tEnvA, tLogLine, tBodyA, tStateA, tHaveHand, tSeatNum
    local tHolesA, tBoardList, tRanksA, tDeltasA, tDeltasTxt, tSevenList
    local tOccList, tButtonSeat, tSB, tBB, tHandNum, tSeedsHexA, tCommitsA
-   local tVerb, tAmt, tCardTxt, tPos, tOneCard
+   local tVerb, tAmt, tCardTxt, tPos, tOneCard, tFromTxt, tStacksTxt
    set the itemDelimiter to comma
    put 0 into tOutA["handNum"]
    put empty into tOutA["trace"]
@@ -1224,14 +1228,15 @@ function heFoldTranscript pLogTxt
             split tBodyA by comma and "="
             put tBodyA["sb"] into tSB
             put tBodyA["bb"] into tBB
-            replace "|" with comma in tBodyA["seats"]
             put tBodyA["seats"] into tOccList
+            replace "|" with comma in tOccList
             put tBodyA["button"] into tButtonSeat
-            replace "|" with comma in tBodyA["stacks"]
+            put tBodyA["stacks"] into tStacksTxt
+            replace "|" with comma in tStacksTxt
             put 0 into tPos
             repeat for each item tSeatNum in tOccList
                add 1 to tPos
-               put item tPos of tBodyA["stacks"] into tOutA["stacksBy"][tSeatNum]
+               put item tPos of tStacksTxt into tOutA["stacksBy"][tSeatNum]
             end repeat
             break
 
@@ -1289,7 +1294,8 @@ function heFoldTranscript pLogTxt
             end if
             put tEnvA["body"] into tBodyA
             split tBodyA by comma and "="
-            put word 1 of (char 5 to -1 of tEnvA["from"]) into tSeatNum
+            put tEnvA["from"] into tFromTxt
+            put char 5 to -1 of tFromTxt into tSeatNum
             if tEnvA["type"] is "act" then
                put heBetApply(tStateA, "act", tSeatNum, tBodyA["verb"] & comma & tBodyA["amount"]) into tStateA
             else
@@ -1428,7 +1434,7 @@ end heSeatsAlive
 
 command heHandStart
    local tOccList, tSeatNum, tSeedsA, tCommitsA, tXorData, tKeyData, tPos
-   local tDeckList, tDealA, tHoleNames, tCount, tSeatPos
+   local tDeckList, tDealA, tHoleNames, tCount, tSeatPos, tHolePair
    set the itemDelimiter to comma
    if gGame["phase"] is "hand" then
       exit heHandStart
@@ -1488,8 +1494,9 @@ command heHandStart
 
    -- step 4: hole delivery (hotseat: plain body; Phase 2 seals per seat)
    repeat for each item tSeatNum in tOccList
-      put heCardName(item 1 of tDealA["holesBy"][tSeatNum]) & "|" \
-            & heCardName(item 2 of tDealA["holesBy"][tSeatNum]) into tHoleNames
+      put tDealA["holesBy"][tSeatNum] into tHolePair
+      put heCardName(item 1 of tHolePair) & "|" \
+            & heCardName(item 2 of tHolePair) into tHoleNames
       heLogAppend "holeDeliver", "seat" & gGame["buttonSeat"], "seat=" & tSeatNum & ",cards=" & tHoleNames
    end repeat
 
@@ -1556,8 +1563,9 @@ command heActionDo pSeatNum, pVerb, pAmount
 end heActionDo
 
 command heReactToNotes
-   local tNoteLine
-   repeat for each line tNoteLine in gGame["state"]["note"]
+   local tNoteLine, tNotesTxt
+   put gGame["state"]["note"] into tNotesTxt
+   repeat for each line tNoteLine in tNotesTxt
       switch item 1 of tNoteLine
          case "advance:flop"
             heDealBoard "flop"
@@ -1638,6 +1646,7 @@ command heHandShowdown
    -- settle, reveal seeds, audit, receipt line, schedule the next hand
    local tStateA, tRanksA, tSeatNum, tSevenList, tDeltasA, tDeltasTxt
    local tDealA, tInHandList, tAuditTxt, tBoardIdxList, tSettleBody, tSeatPos
+   local tOccList
    set the itemDelimiter to comma
    put gGame["state"] into tStateA
    put gGame["deal"] into tDealA
@@ -1662,9 +1671,11 @@ command heHandShowdown
    delete char -1 of tDeltasTxt
 
    -- step 5 (spec 7.1): reveal, audit, and log the result
+   put tStateA["occ"] into tOccList
    repeat with tSeatPos = 1 to tDealA["seatCount"]
-      heLogAppend "seedReveal", "seat" & item tSeatPos of tStateA["occ"], \
-            "seat=" & item tSeatPos of tStateA["occ"] & ",seed=" & heBin2Hex(tDealA["seedsA"][tSeatPos])
+      put item tSeatPos of tOccList into tSeatNum
+      heLogAppend "seedReveal", "seat" & tSeatNum, \
+            "seat=" & tSeatNum & ",seed=" & heBin2Hex(tDealA["seedsA"][tSeatPos])
    end repeat
    if heHasSodium() then
       put heAuditHand(gGame["tableIdData"], gGame["handNum"], tDealA["seedsA"], \
