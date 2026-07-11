@@ -1708,6 +1708,9 @@ end heNextHandTick
 
 command heBuildTable
    local tSeatNum, tSpotTxt, tSpotX, tSpotY, tPos
+   -- create targets the defaultStack, which is not guaranteed to be us
+   -- during openStack in a multi-stack IDE session
+   set the defaultStack to the short name of this stack
    if there is a graphic "heFelt" and the uHeUIVersion of this stack is kUIVersion then
       exit heBuildTable
    end if
