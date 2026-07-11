@@ -75,11 +75,22 @@ carried from Box2Dxt (where it has caught real breakage repeatedly); the embedde
 drift check was dropped as not-yet-applicable — restore it if this repo ever embeds a
 library between sentinels.
 
-**Pure-logic pinning** (Phase 1+): the evaluator vectors and protocol KATs run headless
-in CI (`tools/` scripts, per the plan) because they are plain algorithms — the one part
-of this project that CAN be fully machine-verified. Keep it that way: game rules,
-crypto sequencing, and settlement must live in handlers that take values and return
-values, with no UI reads inside.
+**Pure-logic pinning** (Phase 1+): the evaluator vectors, betting-engine cases, and
+protocol KATs run headless in CI because they are plain algorithms — the one part of
+this project that CAN be fully machine-verified. The gates, in the order CI runs them:
+
+```sh
+python3 tools/check-livecodescript.py   # dialect gates, every .livecodescript
+python3 tools/check-docs.py             # smart-quote scan over *.md
+python3 tools/evaluator-kat.py          # spec 8.2 vectors (mirror of heEval7/heRank5)
+python3 tools/betting-kat.py            # spec 8.1/8.3 cases (mirror of heBetApply/heSettleOf)
+python3 tools/protocol-kat.py           # spec 6/7.1: envelopes, chain, Level 0 deal
+```
+
+The same vectors are embedded in `src/holdem-selftest.livecodescript`, so a green
+harness run on-engine plus green KATs in CI pins the xTalk to the mirrors byte-for-
+byte. Keep it that way: game rules, crypto sequencing, and settlement must live in
+handlers that take values and return values, with no UI reads inside.
 
 **Do not claim runtime behavior you cannot observe.** Anything visual, timed, socket-,
 or extension-touching gets the phrase "verified statically; needs an OXT pass" and the
@@ -161,7 +172,7 @@ lessons that only apply to platformer-style games and were left behind. OXT's co
 is **stricter than LiveCode's**; every one of these broke a real build or shipped a real
 bug in the family.
 
-1. **No smart quotes.** Curly `“ ” ‘ ’` anywhere — even in a comment or string literal —
+1. **No smart quotes.** Curly quotes (U+201C U+201D U+2018 U+2019) anywhere — even in a comment or string literal —
    fail OXT compilation. Straight ASCII `"` and `'` only. (Unicode glyphs in *display*
    strings are fine.) The static gate enforces this.
 2. **Avoid names that shadow engine tokens.** Custom property/variable names whose stem
@@ -282,12 +293,16 @@ keys only ever sign. When in doubt, the spec's threat model (section 2) decides.
 ```
 README.md                          front door
 CLAUDE.md                          you are here
+LICENSE                            MIT (the family default, decided Phase 0)
 holdem-spec.md                     the design contract
 IMPLEMENTATION-PLAN.md             the phased build order
 tools/check-livecodescript.py     static gates (carried from the family)
-tools/protocol-kat.py              Phase 2+: envelope/chain/deal known-answer vectors
+tools/check-docs.py                docs smart-quote scan
+tools/evaluator-kat.py             spec 8.2 evaluator vectors (CI mirror of heEval7)
+tools/betting-kat.py               spec 8.1/8.3 betting + settlement cases (CI mirror)
+tools/protocol-kat.py              spec 6/7.1 envelope/chain/deal known-answer vectors
 src/holdem.livecodescript          the game: one self-building paste-and-run stack
 src/holdem-selftest.livecodescript the harness (evaluator vectors, protocol asserts,
-                                   adversarial cheater bots)
+                                   adversarial cheater bots from Phase 4)
 .github/workflows/ci.yml           runs the gates + KATs on every push/PR
 ```

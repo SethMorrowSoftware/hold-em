@@ -18,8 +18,14 @@ Built by composing the OXT extension family:
 
 ## Status
 
-**Pre-implementation.** This repo currently contains the design documents; code lands
-per the phased plan.
+**Phase 1 logic landed; first OXT pass pending.** The pure game logic — hand
+evaluator, betting engine with side pots, Level 0 commit-reveal deal, settlement,
+transcript fold — is written (`src/holdem.livecodescript`), mirrored in headless
+Python KATs that run in CI (`tools/*-kat.py`), and carried on-engine by the self-test
+harness (`src/holdem-selftest.livecodescript`). The table UI self-builds in a
+dependency-free flat mode, with the Box2Dxt Kit mode scaffolded for the art pass.
+Nothing here has run in OXT yet: every on-engine behavior is "verified statically;
+needs an OXT pass".
 
 - **[holdem-spec.md](holdem-spec.md)** — the design contract: threat model, the
   three-level deal protocol ladder, the transcript, settlement receipts, and the honest

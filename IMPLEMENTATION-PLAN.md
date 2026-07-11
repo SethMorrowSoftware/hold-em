@@ -11,31 +11,42 @@ M3 = Phase 4 (+ workstream U), M4 = Phase 5.
 
 ---
 
-## Phase 0 — repo bootstrap (current)
+## Phase 0 — repo bootstrap (done, pending the OXT compile confirmation)
 
 The seed folder becomes its own repository and gains its safety net.
 
 1. Move `docs/holde-em/` out of Box2Dxt into the new repo root (this folder is laid out
-   so the move is a plain copy; nothing references Box2Dxt paths).
-2. `README.md` (done in the seed), license decision (the family is MIT — confirm).
-3. CI (`.github/workflows/ci.yml`): run `tools/check-livecodescript.py` on every
-   push/PR (it passes trivially until `src/` exists), plus the docs smart-quote scan.
-4. Skeletons: `src/holdem.livecodescript` and `src/holdem-selftest.livecodescript`
-   with the stack scaffolding (openStack/closeStack brackets, build-UI stub, harness
-   runner stub with `kHeHarnessV = 1`).
-5. **Decision to record here when made — Kit delivery:** `start using` the Box2Dxt Kit
-   stack as an installed dependency, vs embedding a synced copy between sentinels (the
-   Box2Dxt-examples pattern; requires carrying `sync-embedded-kit.py` and its CI gate).
-   Default leaning: **embed**, so the game stays one paste-and-run stack like the rest
-   of the family's examples — but measure the paste size first.
+   so the move is a plain copy; nothing references Box2Dxt paths). **Done.**
+2. `README.md` (done in the seed), license decision. **Decided: MIT** (the family
+   default), `LICENSE` at the repo root.
+3. CI (`.github/workflows/ci.yml`): runs `tools/check-livecodescript.py`, the docs
+   smart-quote scan (`tools/check-docs.py`), and every headless KAT
+   (`tools/evaluator-kat.py`, `tools/betting-kat.py`, `tools/protocol-kat.py`) on
+   every push/PR. **Done.**
+4. Skeletons: superseded — Phase 1's pure logic landed directly (see below); the two
+   stacks exist with full scaffolding and `kHeHarnessV = 1`.
+5. **Decision recorded — Kit delivery:** `start using` the installed Kit stack for now
+   (`heKitTryInit` probes for stack "box2dxt-kit" and degrades to the dependency-free
+   flat UI mode when absent). Embedding a synced copy between sentinels stays open as
+   a Phase 1d option once the Kit is actually wired to art and the paste size can be
+   measured; the sync tooling is not carried until then.
 
-**Exit:** CI green in the new repo; skeleton stack compiles in OXT (user-confirmed).
+**Exit:** CI green in the new repo ✅; skeleton stack compiles in OXT (user-confirmed —
+**pending, needs the first OXT pass**).
 
 ## Phase 1 — hotseat game (spec M0)
 
 Everything runs locally, six seats on one machine, zero networking. This phase is
 where all visual iteration happens and where the pure logic gets pinned. Build order
 inside the phase matters:
+
+**Status:** 1a/1b/1c and the pure halves of 1e are written and machine-pinned (CI
+KATs green; the xTalk carries the same vectors for the on-engine run). 1d exists as
+the self-building chrome in two modes — a dependency-free flat mode and the Kit mode
+scaffold (atlas loading, pre-warm, gated frame loop); the animation polish (deal
+slides, squash flips, chip tosses) is deliberately left for the first OXT pass since
+none of it can be verified statically. Everything below stays "verified statically;
+needs an OXT pass" until the user runs the harness and plays hands in OXT.
 
 - **1a. Hand evaluator** (spec 8.2) — first code written, pure function, pinned by
   known-answer vectors in the harness AND mirrored in `tools/` so CI runs them

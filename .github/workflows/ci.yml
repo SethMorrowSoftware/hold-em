@@ -1,0 +1,28 @@
+# CI for holde-em (Phase 0 gate, IMPLEMENTATION-PLAN.md).
+#
+# There is no headless way to compile or run a .livecodescript, so CI is the
+# static gate plus every pure-logic known-answer test that CAN run headless:
+# the evaluator vectors, the betting-engine cases, and the protocol KATs
+# (canonical envelopes, hash chain, Level 0 deal). Anything visual, timed, or
+# extension-touching stays "verified statically; needs an OXT pass".
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: static gates (.livecodescript)
+        run: python3 tools/check-livecodescript.py
+      - name: docs smart-quote scan
+        run: python3 tools/check-docs.py
+      - name: evaluator KATs (spec 8.2)
+        run: python3 tools/evaluator-kat.py
+      - name: betting-engine KATs (spec 8.1, 8.3)
+        run: python3 tools/betting-kat.py
+      - name: protocol KATs (spec 6, 7.1)
+        run: python3 tools/protocol-kat.py
