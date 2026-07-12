@@ -105,6 +105,8 @@ on closeStack
    local tMsgLine
    put false into gHudTickOn
    -- cancel only our own timers; pendingMessages lines are id,time,name,target
+   -- (gotcha 5: set the delimiter before parsing -- closeStack inherits it)
+   set the itemDelimiter to comma
    repeat for each line tMsgLine in the pendingMessages
       if item 3 of tMsgLine begins with "he" then
          cancel item 1 of tMsgLine
@@ -2101,6 +2103,7 @@ end heTestBettingRun
 
 command heTestShuffleRun
    local tDeckList, tDealA, tPos, tSeenA, tDup, tSecond
+   set the itemDelimiter to comma
    put return & "-- 3. integer shuffle (binary-free deal)" & return after gRpt
 
    -- draw bounds: every draw is within 1..n
