@@ -111,17 +111,20 @@ and KAT-pinned in `tools/protocol-kat.py` as the Phase 2 / value-path target; wi
 back only behind a confirmed `heProbeSodium` (which tries each `sx*` call in its own
 `try` and names any that throws).
 
-**What `heProbeSodium` found (OXT pass, v0.2.0) — `sxHash` throws.** On the tester's
-engine `sxRandomUniform`, `sxRandomBytes`, and `sxBin2Hex` all work (so the FFI/binary
-boundary is fine), but **`sxHash` itself throws** — that was the real cause of every
-earlier "double/binary" crash, since all of them ran through the `sxHash`-based keyed
-stream or commitments, not the chunk evaluator. The playable v0.2.0 deal calls no
-`sxHash`, which is why it runs. Phase 2 (the crypto deal) is blocked on resolving
-`sxHash` on this engine: the expanded probe discriminates input-type vs handler vs
-arity (`sxHash(rawData)`, `sxHash(text)`, `sxHash(data, 32)`), and the likely fixes to
-check against SodiumXT's `docs/api-reference.md` are a required output-length argument
-or a differently-named hashing entry point. Do NOT re-introduce `sxHash` into any path
-until the probe reports it `ok`.
+**RESOLVED (v0.4.0) — `sxHash` needs an output-length argument.** The v0.2.0 probe
+found `sxHash` threw while `sxRandomUniform`/`sxRandomBytes`/`sxBin2Hex` worked; reading
+SodiumXT's real `docs/api-reference.md` (cloned into the session) showed why: the
+signature is **`sxHash(pData, pOutLen)`** — the earlier code called `sxHash(data)` with
+one argument, which throws. Use `sxHash(data, 32)` for BLAKE2b-256. Two other guessed
+shapes were also wrong and are now corrected against the real API: **`sxSignKeypairFrom-
+Seed pSeed, out rPub, out rSec`** is a *command with out-parameters* (not a function
+returning an array), and hole-card delivery uses **`sxSeal(msg, recipPub)` /
+`sxSealOpen(sealed, recipPub, recipSec)`**. Everything crosses as `Data`; `textEncode`
+strings before hashing/signing, `textDecode(..., "ascii")` the hex helpers back to
+text. The crypto seams (`heHash32`, `heHashDomHex`, `heDeriveIdentity`, `heSignDetachedD`,
+`heVerifyDetached`, `heSeal`) now wrap these one place each; `heProbeSodium` exercises
+the full roundtrip. Lesson: **read the sibling's `docs/api-reference.md`, do not guess
+FFI signatures** — the family repos are addable to the session for exactly this.
 
 **Do not claim runtime behavior you cannot observe.** Anything visual, timed, socket-,
 or extension-touching gets the phrase "verified statically; needs an OXT pass" and the
@@ -162,12 +165,17 @@ into TorrentXT), `btDhtGetMutable`, `btDhtPutImmutable`/`btDhtGetImmutable`; por
 
 **SodiumXT** — everything is `Data`; `textEncode` xTalk strings before hashing/sealing;
 failures **throw** (wrap in `try`), except `sxSignVerifyDetached` which returns false.
-Identity/signing: `sxSignKeypairFromSeed` (deterministic, BEP44-compatible),
-`sxSignDetached`/`sxSignVerifyDetached`. Private lanes: `sxBoxKeypair`, sealed boxes
-`sxSeal`/`sxSealOpen` (anonymous sender), `sxBox`/`sxBoxOpen` (authenticated).
-Symmetric: `sxSecretBox`/`sxSecretBoxOpen`, `sxAeadEncrypt`/`sxAeadDecrypt` (nonces are
-handled internally — there is deliberately no bring-your-own-nonce entry point).
-Hashing/commitments: `sxHash`, `sxHashKeyed`, `sxHmacSha256`. Randomness:
+**Exact signatures matter (see the resolved-`sxHash` note above):** identity/signing is
+`sxSignKeypairFromSeed pSeed, out rPub, out rSec` (a **command with out-params**, not a
+function), then `sxSignDetached(msg, sec)` → `Data` and `sxSignVerifyDetached(sig, msg,
+pub)` → `Boolean` (never throws). Private lanes: `sxBoxKeypair`/`sxBoxKeypairFromSeed
+pSeed, out rPub, out rSec` (commands), sealed boxes `sxSeal(msg, recipPub)` /
+`sxSealOpen(sealed, recipPub, recipSec)` (anonymous sender), `sxBox`/`sxBoxOpen`
+(authenticated). Symmetric: `sxSecretBox`/`sxSecretBoxOpen`, `sxAeadEncrypt`/
+`sxAeadDecrypt` (nonces handled internally). Hashing/commitments: **`sxHash(pData,
+pOutLen)`** (the output length is mandatory — use `32` for BLAKE2b-256), `sxHashKeyed(pData,
+pKey, pOutLen)`, `sxHmacSha256`. Hex helpers `sxBin2Hex`/`sxHex2Bin` take and return
+`Data` (ASCII) — `textDecode(..., "ascii")` for a display string. Randomness:
 `sxRandomBytes`, `sxRandomUniform`. Utility: `sxMemEqual` (constant-time — the ONLY
 legal way to compare secrets/MACs), `sxBin2Hex`/`sxHex2Bin`, `sxBin2Base64`/
 `sxBase642Bin`. Passphrases (if a UI lock is ever added): `sxPwHash*` (Argon2id).
