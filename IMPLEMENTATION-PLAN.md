@@ -47,6 +47,18 @@ and the Kit mode scaffold (atlas loading, pre-warm, gated frame loop); animation
 polish is left for the OXT pass. Everything below stays "verified statically; needs an
 OXT pass" until the user runs the harness and plays hands in OXT.
 
+**Math + rules audit (v0.3.0).** The betting engine, side pots, settlement, evaluator,
+and PRNG were audited: property tests (an independent conserving side-pot reference vs
+the engine over 60k+ configs; 6k random full games; 400 full sessions to elimination;
+min-raise invariants; PRNG uniformity) all pass with zero defects, and an
+xTalk-vs-Python equivalence pass confirmed the shipped stack matches the tested
+mirrors. The one rules gap found -- no dead-button handling, so an elimination could
+double- or skip-charge a blind -- is fixed: the big blind now always advances to the
+next live seat (`heScheduleButton`, pinned in `tools/betting-kat.py` and the on-engine
+harness). The table UI was also rebuilt chip-forward (per-seat panels, chip totals,
+bets in front, dealer/blind badges, fold/all-in/acting/winner states, pot, quick-bet
+buttons) -- verified statically, needs an OXT pass.
+
 **As-built deal (v0.2.0, a code-wins decision).** 1c was originally the Level 0
 commit-reveal keyed-stream deal (spec 7.1). Repeated OXT passes threw double/binary
 conversion errors wherever script code touched FFI-bridged SodiumXT `Data` through the

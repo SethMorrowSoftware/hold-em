@@ -6,6 +6,15 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.3.0 -- richer chip-forward table UI (per-seat panels with names, chip
+totals, bets-in-front, dealer/blind badges, folded/all-in/acting/winner
+states, pot display, quick-bet buttons, suit-glyph cards) and a
+dead-button-aware blind schedule (the big blind always advances to the next
+live seat, so eliminations never double- or skip-charge a blind -- TDA rule
+10). The math (side pots, chip conservation, min-raise, PRNG, evaluator) is
+verified sound by property tests over tens of thousands of configs; see the
+tools/ KATs. The UI is verified statically and needs an OXT pass.
+
 v0.2.0 -- binary-free playable path. The first OXT passes hit repeated
 double/binary conversion errors wherever script code touched FFI-bridged
 binary (SodiumXT Data) through the chunk/arithmetic evaluator. This version
@@ -38,9 +47,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.2.0"
-constant kHeHarnessV = "3"
-constant kUIVersion = "2"
+constant kHeVersion = "0.3.0"
+constant kHeHarnessV = "4"
+constant kUIVersion = "3"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -61,15 +70,28 @@ constant kHeDefaultStack = 400
 constant kHeNextHandDelayMs = 3500
 
 -- UI geometry (flat mode and kit mode share the layout)
-constant kHeStackRect = "0,0,1024,660"
-constant kHeFeltRect = "32,40,992,560"
-constant kHeSeatSpots = "512,510;190,455;150,240;512,115;874,240;834,455"
+constant kHeStackRect = "0,0,1024,690"
+constant kHeFeltRect = "40,48,984,566"
+constant kHeSeatSpots = "512,516;196,470;150,250;512,120;874,250;828,470"
 constant kHeBoardY = 300
-constant kHeBoardX0 = 400
-constant kHeBoardDX = 56
-constant kHeCardW = 46
-constant kHeCardH = 64
+constant kHeBoardX0 = 404
+constant kHeBoardDX = 58
+constant kHeCardW = 50
+constant kHeCardH = 70
 constant kHeHudMs = 250
+constant kHeTableCenter = "512,300"
+
+-- fun seat names (hotseat: one human plays all seats) + palette
+constant kHeSeatNames = "You,Ada,Boris,Cleo,Dax,Eve"
+constant kHeFeltColor = "18,104,66"
+constant kHeFeltRim = "116,74,38"
+constant kHePanelColor = "14,64,44"
+constant kHePanelActive = "196,150,44"
+constant kHeChipColor = "196,58,58"
+constant kHeGoldColor = "244,206,96"
+constant kHeInk = "24,24,24"
+constant kHeRed = "196,36,36"
+constant kHeWhite = "246,246,246"
 
 --------------------------------------------------------------------------
 -- script-local state (g prefix per the family convention)
@@ -105,6 +127,8 @@ on closeStack
    local tMsgLine
    put false into gHudTickOn
    -- cancel only our own timers; pendingMessages lines are id,time,name,target
+   -- (gotcha 5: set the delimiter before parsing -- closeStack inherits it)
+   set the itemDelimiter to comma
    repeat for each line tMsgLine in the pendingMessages
       if item 3 of tMsgLine begins with "he" then
          cancel item 1 of tMsgLine
@@ -132,10 +156,16 @@ function heHasSodium
 end heHasSodium
 
 command heProbeSodium
-   -- diagnostic: try each sx* call in its own try and report ok/threw, so a
-   -- double/binary failure names the exact handler. Prints to the message box.
-   local tRpt, tTmp, tData
+   -- diagnostic: try each sx* call in its own try and report ok/threw so a
+   -- failure names the exact handler. Prints to the message box.
+   -- On this engine (confirmed 0.2.0): sxRandomUniform / sxRandomBytes /
+   -- sxBin2Hex all work; sxHash THROWS. The playable deal deliberately uses
+   -- none of the throwing calls. The sxHash block below discriminates WHY
+   -- it throws (input type vs handler vs arity), for the Phase 2 crypto deal.
+   local tRpt, tTmp, tData, tEnc
    put "SodiumXT probe (holde-em " & kHeVersion & "):" & return into tRpt
+
+   put "-- primitives the game relies on --" & return after tRpt
    try
       put sxRandomUniform(1000) into tTmp
       put "  sxRandomUniform(1000) -> " & tTmp & "  : ok" & return after tRpt
@@ -154,18 +184,44 @@ command heProbeSodium
    catch tErr
       put "  sxBin2Hex(sxRandomBytes): THREW: " & tErr & return after tRpt
    end try
+
+   put "-- sxHash discriminators (Phase 2 crypto deal) --" & return after tRpt
+   -- is textEncode itself the thrower, or sxHash?
    try
-      put sxHash(textEncode("holdem", "UTF-8")) into tData
-      put "  sxHash(text): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+      put textEncode("holdem", "UTF-8") into tEnc
+      put "  textEncode(text): ok (" & the number of bytes of tEnc & " bytes)" & return after tRpt
    catch tErr
-      put "  sxHash: THREW: " & tErr & return after tRpt
+      put "  textEncode: THREW: " & tErr & return after tRpt
    end try
+   -- sxHash on raw Data straight from sxRandomBytes (no textEncode in play)
    try
-      put sxBin2Hex(sxHash(textEncode("holdem", "UTF-8"))) into tTmp
-      put "  sxBin2Hex(sxHash(text)) -> " & tTmp & "  : ok" & return after tRpt
+      put sxHash(sxRandomBytes(8)) into tData
+      put "  sxHash(sxRandomBytes): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
    catch tErr
-      put "  sxBin2Hex(sxHash): THREW: " & tErr & return after tRpt
+      put "  sxHash(sxRandomBytes): THREW: " & tErr & return after tRpt
    end try
+   -- sxHash on a plain text argument (some wrappers accept text directly)
+   try
+      put sxHash("holdem") into tData
+      put "  sxHash(plainText): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+   catch tErr
+      put "  sxHash(plainText): THREW: " & tErr & return after tRpt
+   end try
+   -- sxHash with an explicit 32-byte output length (libsodium generichash arity)
+   try
+      put sxHash(sxRandomBytes(8), 32) into tData
+      put "  sxHash(data,32): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+   catch tErr
+      put "  sxHash(data,32): THREW: " & tErr & return after tRpt
+   end try
+   -- if any sxHash form worked, is it a valid hash input to sxBin2Hex?
+   try
+      put sxBin2Hex(sxHash(sxRandomBytes(8))) into tTmp
+      put "  sxBin2Hex(sxHash(data)) -> " & tTmp & "  : ok" & return after tRpt
+   catch tErr
+      put "  sxBin2Hex(sxHash(data)): THREW: " & tErr & return after tRpt
+   end try
+
    put tRpt
    return tRpt
 end heProbeSodium
@@ -221,6 +277,53 @@ function heRotateAfter pList, pEntry
    end repeat
    return pList
 end heRotateAfter
+
+function heNextLiveAfterPos pLiveList, pPos
+   -- next live seat strictly after physical position pPos, circular over the
+   -- live seats -- works even when pPos itself is not live (a busted seat).
+   -- pLiveList must be ascending.
+   local tSeatNum
+   set the itemDelimiter to comma
+   repeat for each item tSeatNum in pLiveList
+      if tSeatNum > pPos then
+         return tSeatNum
+      end if
+   end repeat
+   return item 1 of pLiveList
+end heNextLiveAfterPos
+
+function hePrevLiveBeforePos pLiveList, pPos
+   -- previous live seat strictly before physical position pPos, circular
+   local tSeatNum, tPrev
+   set the itemDelimiter to comma
+   put item -1 of pLiveList into tPrev
+   repeat for each item tSeatNum in pLiveList
+      if tSeatNum < pPos then
+         put tSeatNum into tPrev
+      end if
+   end repeat
+   return tPrev
+end hePrevLiveBeforePos
+
+function heScheduleButton pLiveList, pLastBB
+   -- dead-button-aware blind schedule (TDA rule 10, simplified to always post
+   -- a live small blind): the big blind ALWAYS advances to the next live seat
+   -- clockwise from the previous big blind, so nobody posts it twice running
+   -- and no live seat skips it across an elimination. Returns the button seat;
+   -- heBetNewHand then derives SB = next live after button, BB = next after SB
+   -- (heads-up: button IS the SB), which reproduces this schedule exactly.
+   local tBB, tSB
+   set the itemDelimiter to comma
+   if pLastBB is 0 then
+      return item 1 of pLiveList
+   end if
+   put heNextLiveAfterPos(pLiveList, pLastBB) into tBB
+   put hePrevLiveBeforePos(pLiveList, tBB) into tSB
+   if heCountItems(pLiveList) is 2 then
+      return tSB
+   end if
+   return hePrevLiveBeforePos(pLiveList, tSB)
+end heScheduleButton
 
 function heHexId pLen
    -- a random lowercase-hex id built char by char (no binary, no FFI): a
@@ -1196,6 +1299,7 @@ command heTableNew
    put kHeDefaultBB into gGame["bb"]
    put 0 into gGame["handNum"]
    put 0 into gGame["buttonSeat"]
+   put 0 into gGame["lastBB"]
    put "idle" into gGame["phase"]
    put empty into gGame["log"]
    repeat with tSeatNum = 1 to kHeDefaultSeats
@@ -1232,18 +1336,6 @@ function heSeatsAlive
    return tOut
 end heSeatsAlive
 
-function heNextAliveAfter pSeatNum
-   local tTry
-   put pSeatNum into tTry
-   repeat kHeDefaultSeats times
-      put tTry mod kHeDefaultSeats + 1 into tTry
-      if gGame["stacksBy"][tTry] > 0 then
-         return tTry
-      end if
-   end repeat
-   return pSeatNum
-end heNextAliveAfter
-
 command heHandStart
    local tOccList, tSeatNum, tDeckList, tDealA, tHolePair, tHoleNames
    local tSeatsTxt
@@ -1258,11 +1350,9 @@ command heHandStart
       exit heHandStart
    end if
    add 1 to gGame["handNum"]
-   if gGame["handNum"] is 1 then
-      put item 1 of tOccList into gGame["buttonSeat"]
-   else
-      put heNextAliveAfter(gGame["buttonSeat"]) into gGame["buttonSeat"]
-   end if
+   -- dead-button-aware schedule: the big blind advances to the next live seat
+   -- each hand, so eliminations never double- or skip-charge a blind
+   put heScheduleButton(tOccList, gGame["lastBB"]) into gGame["buttonSeat"]
    put tOccList into gGame["occ"]
    put "hand" into gGame["phase"]
 
@@ -1286,6 +1376,7 @@ command heHandStart
 
    -- blinds through the engine, then the table is live
    put heBetNewHand(gGame["sb"], gGame["bb"], gGame["stacksBy"], tOccList, gGame["buttonSeat"]) into gGame["state"]
+   put gGame["state"]["bbSeat"] into gGame["lastBB"]
    heEngineDo "bidSB", gGame["state"]["sbSeat"], min(gGame["sb"], gGame["stacksBy"][gGame["state"]["sbSeat"]])
    heEngineDo "bidBB", gGame["state"]["bbSeat"], min(gGame["bb"], gGame["stacksBy"][gGame["state"]["bbSeat"]])
    heUIHandStart
@@ -1468,7 +1559,7 @@ function heHasKit
 end heHasKit
 
 command heBuildTable
-   local tSeatNum, tSpotTxt, tSpotX, tSpotY, tPos
+   local tSeatNum, tSpotTxt, tSpotX, tSpotY, tPos, tBetX, tBetY, tName
    set the defaultStack to the short name of this stack
    if there is a graphic "heFelt" and the uHeUIVersion of this stack is kUIVersion then
       exit heBuildTable
@@ -1476,52 +1567,110 @@ command heBuildTable
    lock screen
    heWipeChrome
    set the uHeUIVersion of this stack to kUIVersion
+   set the backgroundColor of this stack to "26,32,30"
 
+   -- felt: a wooden rim behind, green oval-ish table on top
+   create graphic "heFeltRim"
+   set the style of graphic "heFeltRim" to "roundrect"
+   set the roundRadius of graphic "heFeltRim" to 90
+   set the rect of graphic "heFeltRim" to "32,40,992,574"
+   set the backgroundColor of graphic "heFeltRim" to kHeFeltRim
+   set the opaque of graphic "heFeltRim" to true
    create graphic "heFelt"
    set the style of graphic "heFelt" to "roundrect"
-   set the roundRadius of graphic "heFelt" to 48
+   set the roundRadius of graphic "heFelt" to 80
    set the rect of graphic "heFelt" to kHeFeltRect
-   set the backgroundColor of graphic "heFelt" to "20,90,50"
+   set the backgroundColor of graphic "heFelt" to kHeFeltColor
    set the opaque of graphic "heFelt" to true
 
+   -- header + pot
+   create field "heHeader"
+   set the rect of field "heHeader" to "40,10,984,38"
+   set the lockText of field "heHeader" to true
+   set the textAlign of field "heHeader" to "center"
+   set the textSize of field "heHeader" to 15
+   set the textFont of field "heHeader" to "Helvetica"
+   set the textColor of field "heHeader" to kHeGoldColor
+   set the borderWidth of field "heHeader" to 0
+   set the opaque of field "heHeader" to true
+   set the backgroundColor of field "heHeader" to "26,32,30"
+
+   create graphic "hePotChip"
+   set the style of graphic "hePotChip" to "oval"
+   set the rect of graphic "hePotChip" to "498,236,526,258"
+   set the backgroundColor of graphic "hePotChip" to kHeGoldColor
+   set the opaque of graphic "hePotChip" to true
+   create field "hePot"
+   set the rect of field "hePot" to "412,262,612,296"
+   set the lockText of field "hePot" to true
+   set the textAlign of field "hePot" to "center"
+   set the textSize of field "hePot" to 20
+   set the textColor of field "hePot" to kHeGoldColor
+   set the opaque of field "hePot" to true
+   set the backgroundColor of field "hePot" to kHeFeltColor
+   set the borderWidth of field "hePot" to 0
+
+   -- board slots
+   repeat with tPos = 1 to 5
+      heMakeCardSlot "heBoard" & tPos, kHeBoardX0 + (tPos - 1) * kHeBoardDX, kHeBoardY
+   end repeat
+
+   -- per-seat: panel, name, stack, badge, state, bet chip+amount, hole cards
    repeat with tSeatNum = 1 to kHeDefaultSeats
       set the itemDelimiter to ";"
       put item tSeatNum of kHeSeatSpots into tSpotTxt
       set the itemDelimiter to comma
       put item 1 of tSpotTxt into tSpotX
       put item 2 of tSpotTxt into tSpotY
-      create field ("heSeatName" & tSeatNum)
-      set the rect of field ("heSeatName" & tSeatNum) to \
-            (tSpotX - 55) & comma & (tSpotY - 12) & comma & (tSpotX + 55) & comma & (tSpotY + 8)
-      set the text of field ("heSeatName" & tSeatNum) to "Seat " & tSeatNum
-      set the lockText of field ("heSeatName" & tSeatNum) to true
-      create field ("heSeatStack" & tSeatNum)
-      set the rect of field ("heSeatStack" & tSeatNum) to \
-            (tSpotX - 55) & comma & (tSpotY + 8) & comma & (tSpotX + 55) & comma & (tSpotY + 28)
-      set the lockText of field ("heSeatStack" & tSeatNum) to true
-      heMakeCardSlot "heHole" & tSeatNum & "a", tSpotX - 26, tSpotY - 46
-      heMakeCardSlot "heHole" & tSeatNum & "b", tSpotX + 26, tSpotY - 46
+      put item tSeatNum of kHeSeatNames into tName
+
+      create graphic ("hePanel" & tSeatNum)
+      set the style of graphic ("hePanel" & tSeatNum) to "roundrect"
+      set the roundRadius of graphic ("hePanel" & tSeatNum) to 14
+      set the rect of graphic ("hePanel" & tSeatNum) to \
+            (tSpotX - 76) & comma & (tSpotY - 4) & comma & (tSpotX + 76) & comma & (tSpotY + 54)
+      set the backgroundColor of graphic ("hePanel" & tSeatNum) to kHePanelColor
+      set the opaque of graphic ("hePanel" & tSeatNum) to true
+
+      heMakeLabel "heSeatName" & tSeatNum, (tSpotX - 72) & comma & (tSpotY - 2) & comma & (tSpotX + 72) & comma & (tSpotY + 22), tName, kHeWhite, 14
+      heMakeLabel "heSeatStack" & tSeatNum, (tSpotX - 72) & comma & (tSpotY + 24) & comma & (tSpotX + 72) & comma & (tSpotY + 50), "", kHeGoldColor, 15
+      heMakeLabel "heSeatBadge" & tSeatNum, (tSpotX + 20) & comma & (tSpotY - 26) & comma & (tSpotX + 76) & comma & (tSpotY - 6), "", kHeInk, 11
+      heMakeLabel "heSeatState" & tSeatNum, (tSpotX - 54) & comma & (tSpotY - 74) & comma & (tSpotX + 54) & comma & (tSpotY - 54), "", kHeGoldColor, 12
+
+      put tSpotX + trunc((512 - tSpotX) * 0.42) into tBetX
+      put tSpotY + trunc((300 - tSpotY) * 0.42) into tBetY
+      create graphic ("heSeatChip" & tSeatNum)
+      set the style of graphic ("heSeatChip" & tSeatNum) to "oval"
+      set the rect of graphic ("heSeatChip" & tSeatNum) to \
+            (tBetX - 11) & comma & (tBetY - 11) & comma & (tBetX + 11) & comma & (tBetY + 11)
+      set the backgroundColor of graphic ("heSeatChip" & tSeatNum) to kHeChipColor
+      set the opaque of graphic ("heSeatChip" & tSeatNum) to true
+      set the visible of graphic ("heSeatChip" & tSeatNum) to false
+      heMakeLabel "heSeatBet" & tSeatNum, (tBetX - 26) & comma & (tBetY + 12) & comma & (tBetX + 26) & comma & (tBetY + 30), "", kHeWhite, 12
+
+      heMakeCardSlot "heHole" & tSeatNum & "a", tSpotX - 28, tSpotY - 40
+      heMakeCardSlot "heHole" & tSeatNum & "b", tSpotX + 28, tSpotY - 40
    end repeat
 
-   repeat with tPos = 1 to 5
-      heMakeCardSlot "heBoard" & tPos, kHeBoardX0 + (tPos - 1) * kHeBoardDX, kHeBoardY
-   end repeat
-
-   create field "hePot"
-   set the rect of field "hePot" to "432,340,592,364"
-   set the lockText of field "hePot" to true
-
-   create graphic "heDealerDisc"
-   set the style of graphic "heDealerDisc" to "oval"
-   set the rect of graphic "heDealerDisc" to "0,0,22,22"
-   set the backgroundColor of graphic "heDealerDisc" to "250,250,220"
-   set the opaque of graphic "heDealerDisc" to true
+   create field "heDealerDisc"
+   set the rect of field "heDealerDisc" to "0,0,26,26"
+   set the lockText of field "heDealerDisc" to true
+   set the textAlign of field "heDealerDisc" to "center"
+   set the textSize of field "heDealerDisc" to 12
+   set the textColor of field "heDealerDisc" to kHeInk
+   set the backgroundColor of field "heDealerDisc" to kHeWhite
+   set the text of field "heDealerDisc" to "D"
+   set the visible of field "heDealerDisc" to false
 
    create field "heStatus"
-   set the rect of field "heStatus" to "32,620,760,654"
+   set the rect of field "heStatus" to "40,632,984,672"
    set the lockText of field "heStatus" to true
+   set the textSize of field "heStatus" to 13
+   set the opaque of field "heStatus" to true
+   set the backgroundColor of field "heStatus" to "26,32,30"
+   set the textColor of field "heStatus" to kHeWhite
+   set the borderWidth of field "heStatus" to 0
 
-   heMakeActionButton "heBtnDeal", "Deal", 780
    heMakeActionButton "heBtnFold", "Fold", 40
    heMakeActionButton "heBtnCheck", "Check", 120
    heMakeActionButton "heBtnCall", "Call", 200
@@ -1529,12 +1678,29 @@ command heBuildTable
    heMakeActionButton "heBtnRaise", "Raise", 360
    heMakeActionButton "heBtnAllin", "All-in", 440
    create field "heAmount"
-   set the rect of field "heAmount" to "524,588,600,612"
+   set the rect of field "heAmount" to "528,596,600,620"
+   set the textAlign of field "heAmount" to "center"
    set the text of field "heAmount" to "0"
+   heMakeActionButton "heBtnMin", "Min", 608
+   heMakeActionButton "heBtnHalf", "1/2 Pot", 688
+   heMakeActionButton "heBtnPot", "Pot", 768
+   heMakeActionButton "heBtnDeal", "Deal", 848
 
    heKitTryInit
    unlock screen
 end heBuildTable
+
+command heMakeLabel pName, pRect, pText, pColor, pSize
+   create field pName
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the textAlign of field pName to "center"
+   set the textSize of field pName to pSize
+   set the textColor of field pName to pColor
+   set the borderWidth of field pName to 0
+   set the opaque of field pName to false
+   set the text of field pName to pText
+end heMakeLabel
 
 command heWipeChrome
    local tPos
@@ -1552,15 +1718,46 @@ command heMakeCardSlot pSlotName, pCenterX, pCenterY
          & (pCenterX + kHeCardW div 2) & comma & (pCenterY + kHeCardH div 2)
    set the lockText of field pSlotName to true
    set the textAlign of field pSlotName to "center"
-   set the textSize of field pSlotName to 16
+   set the textSize of field pSlotName to 22
+   set the textStyle of field pSlotName to "bold"
    set the opaque of field pSlotName to true
-   set the backgroundColor of field pSlotName to "255,255,255"
+   set the backgroundColor of field pSlotName to kHeWhite
+   set the borderWidth of field pSlotName to 1
+   set the borderColor of field pSlotName to "60,60,60"
    set the visible of field pSlotName to false
 end heMakeCardSlot
 
+function heSuitGlyph pSuitVal
+   -- built from codepoints so the source stays ASCII (no glyphs in the file)
+   switch pSuitVal
+      case 1
+         return numToCodepoint(9827)  -- clubs
+      case 2
+         return numToCodepoint(9830)  -- diamonds
+      case 3
+         return numToCodepoint(9829)  -- hearts
+      case 4
+         return numToCodepoint(9824)  -- spades
+   end switch
+   return "?"
+end heSuitGlyph
+
+function heCardFace pIdx
+   -- rank + suit glyph, e.g. A + spade; ten shows as "10"
+   local tName, tRankCh, tRankTxt
+   put heCardName(pIdx) into tName
+   put char 1 of tName into tRankCh
+   if tRankCh is "T" then
+      put "10" into tRankTxt
+   else
+      put tRankCh into tRankTxt
+   end if
+   return tRankTxt & heSuitGlyph(heCardSuitVal(pIdx))
+end heCardFace
+
 command heMakeActionButton pBtnName, pLabelTxt, pLeftX
    create button pBtnName
-   set the rect of button pBtnName to pLeftX & ",584" & comma & (pLeftX + 76) & ",616"
+   set the rect of button pBtnName to pLeftX & ",592" & comma & (pLeftX + 76) & ",624"
    set the label of button pBtnName to pLabelTxt
 end heMakeActionButton
 
@@ -1604,6 +1801,18 @@ on mouseUp
    if tSeatNum is 0 then
       exit mouseUp
    end if
+   -- quick-bet buttons only fill the amount box; the player still commits
+   switch tWho
+      case "heBtnMin"
+         set the text of field "heAmount" to heQuickAmount(tSeatNum, "min")
+         exit mouseUp
+      case "heBtnHalf"
+         set the text of field "heAmount" to heQuickAmount(tSeatNum, "half")
+         exit mouseUp
+      case "heBtnPot"
+         set the text of field "heAmount" to heQuickAmount(tSeatNum, "pot")
+         exit mouseUp
+   end switch
    put word 1 of the text of field "heAmount" into tAmt
    if tAmt is not a number then
       put 0 into tAmt
@@ -1637,6 +1846,39 @@ function heCallAmountFor pSeatNum
    return min(tOwe, gGame["state"]["stackBy"][pSeatNum])
 end heCallAmountFor
 
+function heQuickAmount pSeatNum, pKind
+   -- a convenience "raise to" amount, clamped to [minTo, maxTo]. Pot-sized
+   -- uses the pot after this player calls (standard pot-raise definition).
+   local tState, tOwe, tPotAfter, tMaxTo, tMinTo, tTo, tSeat
+   set the itemDelimiter to comma
+   put gGame["state"] into tState
+   put tState["betCur"] - tState["streetBy"][pSeatNum] into tOwe
+   put 0 into tPotAfter
+   repeat for each item tSeat in tState["occ"]
+      add tState["handBy"][tSeat] to tPotAfter
+   end repeat
+   add tOwe to tPotAfter
+   put tState["streetBy"][pSeatNum] + tState["stackBy"][pSeatNum] into tMaxTo
+   put min(tState["betCur"] + tState["raiseFull"], tMaxTo) into tMinTo
+   switch pKind
+      case "half"
+         put tState["betCur"] + tOwe + (tPotAfter div 2) into tTo
+         break
+      case "pot"
+         put tState["betCur"] + tOwe + tPotAfter into tTo
+         break
+      default
+         put tMinTo into tTo
+   end switch
+   if tTo < tMinTo then
+      put tMinTo into tTo
+   end if
+   if tTo > tMaxTo then
+      put tMaxTo into tTo
+   end if
+   return tTo
+end heQuickAmount
+
 command heUISetStatus pTxt
    if there is a field "heStatus" then
       set the text of field "heStatus" to pTxt
@@ -1644,7 +1886,9 @@ command heUISetStatus pTxt
 end heUISetStatus
 
 command heUIPromptToAct
-   local tSeatNum, tLegalTxt
+   local tSeatNum, tLegalTxt, tLine, tHasCheck, tHasCall, tHasBet, tHasRaise
+   local tHasAllin, tCallAmt, tName
+   set the itemDelimiter to comma
    if gGame["phase"] is not "hand" then
       exit heUIPromptToAct
    end if
@@ -1653,9 +1897,82 @@ command heUIPromptToAct
       exit heUIPromptToAct
    end if
    put heBetLegal(gGame["state"], tSeatNum) into tLegalTxt
-   replace return with " / " in tLegalTxt
-   heUISetStatus "Seat " & tSeatNum & " to act (" & gGame["state"]["street"] & "): " & tLegalTxt
+   put false into tHasCheck
+   put false into tHasCall
+   put false into tHasBet
+   put false into tHasRaise
+   put false into tHasAllin
+   put heCallAmountFor(tSeatNum) into tCallAmt
+   repeat for each line tLine in tLegalTxt
+      switch word 1 of tLine
+         case "check"
+            put true into tHasCheck
+            break
+         case "call"
+            put true into tHasCall
+            break
+         case "bet"
+            put true into tHasBet
+            break
+         case "raise"
+            put true into tHasRaise
+            break
+         case "allin"
+            put true into tHasAllin
+            break
+      end switch
+   end repeat
+   heEnableBtn "heBtnCheck", tHasCheck
+   heEnableBtn "heBtnCall", tHasCall
+   heEnableBtn "heBtnBet", tHasBet
+   heEnableBtn "heBtnRaise", tHasRaise
+   heEnableBtn "heBtnAllin", tHasAllin
+   heEnableBtn "heBtnFold", true
+   if there is a button "heBtnCall" then
+      if tHasCall then
+         set the label of button "heBtnCall" to "Call " & tCallAmt
+      else
+         set the label of button "heBtnCall" to "Call"
+      end if
+   end if
+   -- seed the amount box with the minimum legal bet/raise-to
+   if (tHasBet or tHasRaise) and there is a field "heAmount" then
+      set the text of field "heAmount" to heQuickAmount(tSeatNum, "min")
+   end if
+   put item tSeatNum of kHeSeatNames into tName
+   heUISetStatus tName & " to act  --  " & toUpper(gGame["state"]["street"]) \
+         & ".  Pot " & heCurrentPot() & ".  To call: " & tCallAmt
 end heUIPromptToAct
+
+command heEnableBtn pBtnName, pOn
+   if there is not a button pBtnName then
+      exit heEnableBtn
+   end if
+   set the disabled of button pBtnName to not pOn
+end heEnableBtn
+
+command heDisableActions
+   local tBtn
+   set the itemDelimiter to comma
+   repeat for each item tBtn in "heBtnFold,heBtnCheck,heBtnCall,heBtnBet,heBtnRaise,heBtnAllin,heBtnMin,heBtnHalf,heBtnPot"
+      heEnableBtn tBtn, false
+   end repeat
+   if there is a button "heBtnCall" then
+      set the label of button "heBtnCall" to "Call"
+   end if
+end heDisableActions
+
+function heCurrentPot
+   local tSeatNum, tPot
+   set the itemDelimiter to comma
+   put 0 into tPot
+   if gGame["phase"] is "hand" then
+      repeat for each item tSeatNum in gGame["state"]["occ"]
+         add gGame["state"]["handBy"][tSeatNum] to tPot
+      end repeat
+   end if
+   return tPot
+end heCurrentPot
 
 command heHudMark
    put true into gHudDirty
@@ -1673,29 +1990,113 @@ on heHudTick
 end heHudTick
 
 command heHudRefresh
-   local tSeatNum, tPotAmt, tSpotTxt, tSpotX, tSpotY, tHandBy
+   local tSeatNum, tPotAmt, tSpotTxt, tSpotX, tSpotY, tHandBy, tInHand, tStreetBy
+   local tActing, tSbSeat, tBbSeat, tBadge
    if there is not a field "hePot" then
       exit heHudRefresh
    end if
-   put 0 into tPotAmt
+   set the itemDelimiter to comma
+   put heCurrentPot() into tPotAmt
+   set the text of field "hePot" to "POT  " & tPotAmt
+   set the visible of graphic "hePotChip" to (tPotAmt > 0)
+   set the text of field "heHeader" to heHeaderTxt()
+   heEnableBtn "heBtnDeal", (gGame["phase"] is not "hand")
+   if gGame["phase"] is not "hand" then
+      heDisableActions
+   end if
+
+   put 0 into tActing
+   put 0 into tSbSeat
+   put 0 into tBbSeat
+   if gGame["phase"] is "hand" then
+      put gGame["state"]["toAct"] into tActing
+      put gGame["state"]["sbSeat"] into tSbSeat
+      put gGame["state"]["bbSeat"] into tBbSeat
+   end if
+
    repeat with tSeatNum = 1 to kHeDefaultSeats
       put heHandByOf(tSeatNum) into tHandBy
-      add tHandBy to tPotAmt
+      -- chip TOTAL behind (always visible, even between hands)
       if gGame["stacksBy"][tSeatNum] is a number then
          set the text of field ("heSeatStack" & tSeatNum) to \
-               (gGame["stacksBy"][tSeatNum] - tHandBy) & " chips"
+               (gGame["stacksBy"][tSeatNum] - tHandBy)
       end if
+      -- bet in front this street
+      put 0 into tStreetBy
+      if gGame["phase"] is "hand" and gGame["state"]["streetBy"][tSeatNum] is a number then
+         put gGame["state"]["streetBy"][tSeatNum] into tStreetBy
+      end if
+      if tStreetBy > 0 then
+         set the text of field ("heSeatBet" & tSeatNum) to tStreetBy
+         set the visible of graphic ("heSeatChip" & tSeatNum) to true
+      else
+         set the text of field ("heSeatBet" & tSeatNum) to ""
+         set the visible of graphic ("heSeatChip" & tSeatNum) to false
+      end if
+      -- role badge (D / SB / BB), acting highlight, folded / all-in state
+      put "" into tBadge
+      if tSeatNum is tSbSeat then
+         put "SB" into tBadge
+      end if
+      if tSeatNum is tBbSeat then
+         put "BB" into tBadge
+      end if
+      set the text of field ("heSeatBadge" & tSeatNum) to tBadge
+      heSeatFace tSeatNum, (tSeatNum is tActing)
    end repeat
-   set the text of field "hePot" to "Pot: " & tPotAmt
+
+   -- dealer button disc
    if gGame["buttonSeat"] > 0 then
       set the itemDelimiter to ";"
       put item gGame["buttonSeat"] of kHeSeatSpots into tSpotTxt
       set the itemDelimiter to comma
       put item 1 of tSpotTxt into tSpotX
       put item 2 of tSpotTxt into tSpotY
-      set the loc of graphic "heDealerDisc" to (tSpotX + 66) & comma & (tSpotY - 20)
+      set the loc of field "heDealerDisc" to (tSpotX - 92) & comma & (tSpotY + 24)
+      set the visible of field "heDealerDisc" to true
+   else
+      set the visible of field "heDealerDisc" to false
    end if
 end heHudRefresh
+
+command heSeatFace pSeatNum, pActing
+   -- panel colour + state label: acting (gold), folded (dim), all-in (gold text)
+   local tState, tFolded, tAllin
+   put "false" into tFolded
+   put "false" into tAllin
+   if gGame["phase"] is "hand" then
+      put gGame["state"] into tState
+      put tState["foldedBy"][pSeatNum] into tFolded
+      put tState["allinBy"][pSeatNum] into tAllin
+   end if
+   if pActing then
+      set the backgroundColor of graphic ("hePanel" & pSeatNum) to kHePanelActive
+   else
+      set the backgroundColor of graphic ("hePanel" & pSeatNum) to kHePanelColor
+   end if
+   if tFolded is "true" then
+      set the text of field ("heSeatState" & pSeatNum) to "FOLDED"
+      set the textColor of field ("heSeatState" & pSeatNum) to "150,150,150"
+   else if tAllin is "true" then
+      set the text of field ("heSeatState" & pSeatNum) to "ALL-IN"
+      set the textColor of field ("heSeatState" & pSeatNum) to kHeGoldColor
+   else
+      set the text of field ("heSeatState" & pSeatNum) to ""
+   end if
+end heSeatFace
+
+function heHeaderTxt
+   local tTxt
+   put "holde-em " & kHeVersion into tTxt
+   if gGame["handNum"] > 0 then
+      put "     Hand " & gGame["handNum"] after tTxt
+   end if
+   if gGame["phase"] is "hand" then
+      put "     " & toUpper(gGame["state"]["street"]) after tTxt
+   end if
+   put "     Blinds " & gGame["sb"] & "/" & gGame["bb"] after tTxt
+   return tTxt
+end heHeaderTxt
 
 function heHandByOf pSeatNum
    if gGame["phase"] is "hand" and gGame["state"]["handBy"][pSeatNum] is a number then
@@ -1712,7 +2113,7 @@ command heUIHandStart
    repeat for each item tSeatNum in gGame["occ"]
       heUIShowHole tSeatNum, tDealA["holesBy"][tSeatNum]
    end repeat
-   heUISetStatus "Hand " & gGame["handNum"] & " -- blinds posted."
+   heUISetStatus "Hand " & gGame["handNum"] & " dealt -- blinds " & gGame["sb"] & "/" & gGame["bb"] & " posted."
 end heUIHandStart
 
 command heUIShowHole pSeatNum, pIdxPair
@@ -1729,12 +2130,13 @@ command heUIShowCardIn pSlotName, pIdx
    if there is not a field pSlotName then
       exit heUIShowCardIn
    end if
-   set the text of field pSlotName to heCardName(pIdx)
+   set the text of field pSlotName to heCardFace(pIdx)
    if heCardSuitVal(pIdx) is 2 or heCardSuitVal(pIdx) is 3 then
-      set the textColor of field pSlotName to "200,30,30"
+      set the textColor of field pSlotName to kHeRed
    else
-      set the textColor of field pSlotName to "20,20,20"
+      set the textColor of field pSlotName to kHeInk
    end if
+   set the backgroundColor of field pSlotName to kHeWhite
    set the visible of field pSlotName to true
 end heUIShowCardIn
 
@@ -1759,14 +2161,53 @@ command heUIShowBoardStreet pStreetName, pIdxList
 end heUIShowBoardStreet
 
 command heUIShowdownReveal pInHandList, pRanksA
-   local tSeatNum, tTxt
+   local tSeatNum, tTxt, tName, tBest, tOrder
    set the itemDelimiter to comma
-   put "Showdown: " into tTxt
-   repeat for each item tSeatNum in heShowdownOrderOf(gGame["state"])
-      put "seat " & tSeatNum & " (" & pRanksA[tSeatNum] & ") " after tTxt
+   put heShowdownOrderOf(gGame["state"]) into tOrder
+   -- best rank among those who showed -> winner highlight
+   put empty into tBest
+   repeat for each item tSeatNum in pInHandList
+      if tBest is empty or pRanksA[tSeatNum] > tBest then
+         put pRanksA[tSeatNum] into tBest
+      end if
+   end repeat
+   put "Showdown -- " into tTxt
+   repeat for each item tSeatNum in tOrder
+      put item tSeatNum of kHeSeatNames into tName
+      put tName & " (" & heHandLabel(pRanksA[tSeatNum]) & ")   " after tTxt
+      if pRanksA[tSeatNum] is tBest and there is a field ("heSeatState" & tSeatNum) then
+         set the text of field ("heSeatState" & tSeatNum) to "WINNER"
+         set the textColor of field ("heSeatState" & tSeatNum) to kHeGoldColor
+      end if
    end repeat
    heUISetStatus tTxt
 end heUIShowdownReveal
+
+function heHandLabel pPacked
+   -- turn a packed rank into a human category name for the status line
+   local tCat
+   put char 1 to 2 of pPacked into tCat
+   switch tCat
+      case "08"
+         return "straight flush"
+      case "07"
+         return "four of a kind"
+      case "06"
+         return "full house"
+      case "05"
+         return "flush"
+      case "04"
+         return "straight"
+      case "03"
+         return "three of a kind"
+      case "02"
+         return "two pair"
+      case "01"
+         return "one pair"
+      default
+         return "high card"
+   end switch
+end heHandLabel
 
 command heUIClearCards
    local tSeatNum, tPos
@@ -1774,6 +2215,19 @@ command heUIClearCards
       if there is a field ("heHole" & tSeatNum & "a") then
          set the visible of field ("heHole" & tSeatNum & "a") to false
          set the visible of field ("heHole" & tSeatNum & "b") to false
+      end if
+      if there is a field ("heSeatState" & tSeatNum) then
+         set the text of field ("heSeatState" & tSeatNum) to ""
+      end if
+      if there is a field ("heSeatBet" & tSeatNum) then
+         set the text of field ("heSeatBet" & tSeatNum) to ""
+         set the visible of graphic ("heSeatChip" & tSeatNum) to false
+      end if
+      if there is a field ("heSeatBadge" & tSeatNum) then
+         set the text of field ("heSeatBadge" & tSeatNum) to ""
+      end if
+      if there is a graphic ("hePanel" & tSeatNum) then
+         set the backgroundColor of graphic ("hePanel" & tSeatNum) to kHePanelColor
       end if
    end repeat
    repeat with tPos = 1 to 5
@@ -1815,6 +2269,7 @@ command heRunSelftest
          & return & return after gRpt
    heTestEvaluatorRun
    heTestBettingRun
+   heTestScheduleRun
    heTestShuffleRun
    heTestFoldRun
    put return & heProbeSodium() after gRpt
@@ -2099,8 +2554,42 @@ command heTestBettingRun
    heTAssert "blind: both blinds all-in -> runout", tStateA["phase"], "runout"
 end heTestBettingRun
 
+function heTButtonSchedule pLiveList, pLastBB
+   -- returns "button,SB,BB" the way the shell schedules a hand, via the pure
+   -- heScheduleButton + heBetNewHand derivation
+   local tBtn, tStateA, tStacksA, tSeatNum
+   set the itemDelimiter to comma
+   repeat for each item tSeatNum in pLiveList
+      put 100 into tStacksA[tSeatNum]
+   end repeat
+   put heScheduleButton(pLiveList, pLastBB) into tBtn
+   put heBetNewHand(1, 2, tStacksA, pLiveList, tBtn) into tStateA
+   return tBtn & comma & tStateA["sbSeat"] & comma & tStateA["bbSeat"]
+end heTButtonSchedule
+
+command heTestScheduleRun
+   local tSeq, tLastBB, tRound, tOne
+   set the itemDelimiter to comma
+   put return & "-- 2b. blind schedule (dead-button; TDA rule 10)" & return after gRpt
+   -- 3-handed no-bust: button and BB each advance one seat per hand
+   put empty into tSeq
+   put 0 into tLastBB
+   repeat with tRound = 1 to 4
+      put heTButtonSchedule("1,2,3", tLastBB) into tOne
+      put tOne & ";" after tSeq
+      put item 3 of tOne into tLastBB
+   end repeat
+   delete char -1 of tSeq
+   heTAssert "sched: 3-handed no-bust rotation", tSeq, "1,2,3;2,3,1;3,1,2;1,2,3"
+   -- seat 1 busts after button=1/BB=3: heads-up must not post BB twice for seat 3
+   heTAssert "sched: bust-to-HU no double BB", heTButtonSchedule("2,3", 3), "3,3,2"
+   -- seats 2,3 bust after button=1/BB=3: BB advances to the survivor (seat 4)
+   heTAssert "sched: double-bust BB advances to survivor", heTButtonSchedule("1,4,5,6", 3), "6,1,4"
+end heTestScheduleRun
+
 command heTestShuffleRun
    local tDeckList, tDealA, tPos, tSeenA, tDup, tSecond
+   set the itemDelimiter to comma
    put return & "-- 3. integer shuffle (binary-free deal)" & return after gRpt
 
    -- draw bounds: every draw is within 1..n

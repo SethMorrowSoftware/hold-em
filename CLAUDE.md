@@ -111,6 +111,18 @@ and KAT-pinned in `tools/protocol-kat.py` as the Phase 2 / value-path target; wi
 back only behind a confirmed `heProbeSodium` (which tries each `sx*` call in its own
 `try` and names any that throws).
 
+**What `heProbeSodium` found (OXT pass, v0.2.0) — `sxHash` throws.** On the tester's
+engine `sxRandomUniform`, `sxRandomBytes`, and `sxBin2Hex` all work (so the FFI/binary
+boundary is fine), but **`sxHash` itself throws** — that was the real cause of every
+earlier "double/binary" crash, since all of them ran through the `sxHash`-based keyed
+stream or commitments, not the chunk evaluator. The playable v0.2.0 deal calls no
+`sxHash`, which is why it runs. Phase 2 (the crypto deal) is blocked on resolving
+`sxHash` on this engine: the expanded probe discriminates input-type vs handler vs
+arity (`sxHash(rawData)`, `sxHash(text)`, `sxHash(data, 32)`), and the likely fixes to
+check against SodiumXT's `docs/api-reference.md` are a required output-length argument
+or a differently-named hashing entry point. Do NOT re-introduce `sxHash` into any path
+until the probe reports it `ok`.
+
 **Do not claim runtime behavior you cannot observe.** Anything visual, timed, socket-,
 or extension-touching gets the phrase "verified statically; needs an OXT pass" and the
 user confirms in the IDE. This discipline is house law across the family.
