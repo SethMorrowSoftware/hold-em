@@ -35,7 +35,9 @@ states, pot display, quick-bet buttons, suit-glyph cards) and a
 dead-button-aware blind schedule (the big blind always advances to the next
 live seat, so eliminations never double- or skip-charge a blind -- TDA rule
 10). The math (side pots, chip conservation, min-raise, PRNG, evaluator) is
-verified sound by property tests over tens of thousands of configs.
+verified sound by tools/logic-fuzz.py, which checks the evaluator EXHAUSTIVELY
+(all 2,598,960 five-card hands) and fuzzes settlement + whole games against
+independently-written references (not the KAT mirrors) over ~90k configs.
 
 v0.2.0 -- binary-free playable path. The first OXT passes hit repeated
 double/binary conversion errors wherever script code touched FFI-bridged

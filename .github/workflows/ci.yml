@@ -28,3 +28,5 @@ jobs:
         run: python3 tools/shuffle-kat.py
       - name: protocol KATs (spec 6, 7.1 -- Phase 2 crypto deal)
         run: python3 tools/protocol-kat.py
+      - name: independent-reference fuzz (rules, not the port)
+        run: python3 tools/logic-fuzz.py
