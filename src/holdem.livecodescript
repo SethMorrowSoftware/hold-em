@@ -79,6 +79,8 @@ constant kHeDomainShuf = "HOLDEM-SHUF-v1|"
 constant kHeDomainChain = "HOLDEM-CHAIN-v1|"
 constant kHeDomainSettle = "HOLDEM-SETL-v1|"
 constant kHeDomainSess = "HOLDEM-SESS-v1|"
+constant kHeGenesisPrev = "0000000000000000000000000000000000000000000000000000000000000000"
+constant kHeTwo32 = 4294967296
 
 -- table defaults
 constant kHeDefaultSeats = 6
@@ -206,10 +208,10 @@ function heHex2BinD pHexTxt
    return sxHex2Bin(textEncode(pHexTxt, "ascii"))
 end heHex2BinD
 
-command heDeriveIdentity pSeedData, @rPubData, @rSecData
-   -- ed25519 identity from a 32-byte seed (out params, per the real API)
-   sxSignKeypairFromSeed pSeedData, rPubData, rSecData
-end heDeriveIdentity
+-- Identity keys are derived by calling sxSignKeypairFromSeed directly into
+-- plain locals at each site (the proven-safe form -- same as
+-- sxBoxKeypairFromSeed in heProbeSodium). No @-reference wrapper, so there is
+-- no script indirection between the foreign out-param and a real variable.
 
 function heSignDetachedD pMsgData, pSecData
    return sxSignDetached(pMsgData, pSecData)
@@ -246,7 +248,7 @@ command heProbeSodium
       put "  sxHash: THREW: " & tErr & return after tRpt
    end try
    try
-      heDeriveIdentity heHash32(textEncode("seed", "utf-8")), tPub, tSec
+      sxSignKeypairFromSeed heHash32(textEncode("seed", "utf-8")), tPub, tSec
       put "  sxSignKeypairFromSeed: ok  pub=" & char 1 to 16 of heBin2HexS(tPub) & "..." & return after tRpt
    catch tErr
       put "  sxSignKeypairFromSeed: THREW: " & tErr & return after tRpt
@@ -270,7 +272,7 @@ command heProbeSodium
       sxBoxKeypairFromSeed heHash32(textEncode("box", "utf-8")), tRecPub, tRecSec
       put sxSeal(tMsg, tRecPub) into tSealed
       put sxSealOpen(tSealed, tRecPub, tRecSec) into tOpened
-      if tOpened is tMsg then
+      if sxMemEqual(tOpened, tMsg) then
          put "  sxSeal + sxSealOpen: ok (sealed-box roundtrip)" & return after tRpt
       else
          put "  sxSeal/Open: roundtrip mismatch" & return after tRpt
@@ -290,7 +292,9 @@ end heProbeSodium
 --------------------------------------------------------------------------
 
 command heProbeTorrent
-   local tRpt, tSession, tHash, tHandle
+   -- capture "the result" immediately after each bt* command (gotcha 27):
+   -- per the docs only btStartSession throws, the rest report via the result
+   local tRpt, tSession, tHash, tHandle, tRC
    put "TorrentXT probe (holde-em " & kHeVersion & "):" & return into tRpt
    try
       put btStartSession() into tSession
@@ -307,18 +311,25 @@ command heProbeTorrent
    put "  btStartSession -> session " & tSession & return after tRpt
    try
       btSetBool tSession, "enable_dht", true
-      put "  btSetBool enable_dht: ok" & return after tRpt
+      put the result into tRC
+      put "  btSetBool enable_dht -> " & heRcTxt(tRC) & return after tRpt
       btRp1Enable tSession
-      put "  btRp1Enable: ok" & return after tRpt
+      put the result into tRC
+      put "  btRp1Enable -> " & heRcTxt(tRC) & return after tRpt
       if heHasSodium() then
          put char 1 to 40 of heHashHex(textEncode("holde-em-probe-table", "utf-8")) into tHash
       else
          put "0123456789abcdef0123456789abcdef01234567" into tHash
       end if
       put btAddInfohash(tSession, tHash, heTempPath()) into tHandle
-      put "  btAddInfohash(" & char 1 to 10 of tHash & "...) -> handle " & tHandle & return after tRpt
+      if tHandle > 0 then
+         put "  btAddInfohash(" & char 1 to 10 of tHash & "...) -> handle " & tHandle & return after tRpt
+      else
+         put "  btAddInfohash FAILED: " & btLastError() & return after tRpt
+      end if
       btDhtAnnounce tSession, tHash, 0
-      put "  btDhtAnnounce: ok (announced rendezvous id)" & return after tRpt
+      put the result into tRC
+      put "  btDhtAnnounce -> " & heRcTxt(tRC) & return after tRpt
    catch tErr
       put "  transport call THREW: " & tErr & return after tRpt
    end try
@@ -333,6 +344,17 @@ function heTempPath
    return "he_rendezvous"
 end heTempPath
 
+function heRcTxt pRC
+   -- a bt* command reports 0/negative via the result; label it for the probe
+   if pRC is empty or pRC is 0 then
+      return "ok"
+   end if
+   if pRC < 0 then
+      return "FAILED (" & pRC & "): " & btLastError()
+   end if
+   return "rc=" & pRC
+end heRcTxt
+
 --------------------------------------------------------------------------
 -- Online transcript: the canonical signed, hash-chained envelope (spec 6),
 -- byte-pinned in tools/protocol-kat.py. Layered signatures -- a sender
@@ -344,10 +366,9 @@ end heTempPath
 --   wire        = envLine TAB hostSigHex             (one wire line = one rp1 payload)
 --   chainHead   = H("HOLDEM-CHAIN-v1|" || utf8(wire)); genesis prev = 64 zero hex
 -- All binary fields travel as lowercase hex; bodies are hex of their UTF-8
--- text, so no tab can ever leak into the frame.
+-- text, so no tab can ever leak into the frame. (kHeGenesisPrev -- the
+-- 64-zero-hex genesis prev -- lives in the top constant block.)
 --------------------------------------------------------------------------
-
-constant kHeGenesisPrev = "0000000000000000000000000000000000000000000000000000000000000000"
 
 function heEnvContentLine pTableHex, pHandNum, pFromHex, pTypeTxt, pBodyTxt
    return kHeEnvV & tab & pTableHex & tab & pHandNum & tab & pFromHex \
@@ -425,6 +446,159 @@ function heEnvVerify pWireLine, pFromPubHex, pHostPubHex, pExpectedPrevHex
    end if
    return "ok"
 end heEnvVerify
+
+--------------------------------------------------------------------------
+-- Level 0 deal (spec 7.1): commit-reveal keyed-stream shuffle. Byte-pinned
+-- in tools/protocol-kat.py. Every player commits H("HOLDEM-SEEDC-v1"||seed),
+-- shares its seed to the dealer sealed, and the shuffle is a Fisher-Yates
+-- draw from stream = H("HOLDEM-SHUF-v1"||table||"|"||hand||"|"||XOR(seeds)),
+-- so the dealer cannot stack the deck (its own seed was committed first).
+-- The stream is materialised as HEX text and every draw chunks plain hex
+-- chars, so no FFI-bridged binary ever reaches the script chunk evaluator
+-- (H6): raw Data appears only inside sxHash arguments. Seeds travel as hex.
+--------------------------------------------------------------------------
+
+function heXorSeedsHex pSeedsHexA, pCount
+   -- XOR of pCount 32-byte seeds (each a 64-hex string), done in hex; returns hex
+   local tPairPos, tSeatPos, tAcc, tHexTxt, tOutHex, tPairHex
+   put empty into tOutHex
+   repeat with tPairPos = 1 to 63 step 2
+      put 0 into tAcc
+      repeat with tSeatPos = 1 to pCount
+         put pSeedsHexA[tSeatPos] into tHexTxt
+         put bitXor(tAcc, baseConvert(char tPairPos to (tPairPos + 1) of tHexTxt, 16, 10)) into tAcc
+      end repeat
+      put toLower(baseConvert(tAcc, 10, 16)) into tPairHex
+      if the number of chars of tPairHex is 1 then
+         put "0" & tPairHex into tPairHex
+      end if
+      put tPairHex after tOutHex
+   end repeat
+   return tOutHex
+end heXorSeedsHex
+
+function heU32BEData pNum
+   -- 4-byte big-endian Data (built from arithmetic, fed straight into sxHash)
+   return numToByte(pNum div 16777216 mod 256) & numToByte(pNum div 65536 mod 256) \
+         & numToByte(pNum div 256 mod 256) & numToByte(pNum mod 256)
+end heU32BEData
+
+function heStreamKeyData pTableData, pHandNum, pXorHex
+   -- H("HOLDEM-SHUF-v1|" || table || "|" || decimal(hand) || "|" || seedsXor)
+   return heHash32(textEncode(kHeDomainShuf, "utf-8") & pTableData \
+         & textEncode("|" & pHandNum & "|", "utf-8") & heHex2BinD(pXorHex))
+end heStreamKeyData
+
+function heStreamBlocksHex pKeyData, pBlockCount
+   -- hex text of block_j = H(key || uint32be(j)), j = 0 .. pBlockCount-1
+   local tOut, tBlockPos
+   put empty into tOut
+   repeat with tBlockPos = 0 to pBlockCount - 1
+      put heBin2HexS(heHash32(pKeyData & heU32BEData(tBlockPos))) after tOut
+   end repeat
+   return tOut
+end heStreamBlocksHex
+
+function heDrawUniform pStreamHex, pOffset, pRangeN
+   -- uniform 1..pRangeN via 32-bit BE words (8 hex chars each), rejection
+   -- sampled (no modulo bias). The word is two 16-bit halves so baseConvert's
+   -- 32-bit signedness is never a factor. Returns "value,nextOffset".
+   local tLimit, tWordVal
+   put (kHeTwo32 div pRangeN) * pRangeN into tLimit
+   repeat forever
+      if pOffset + 7 > the number of chars of pStreamHex then
+         throw "he-stream-exhausted"
+      end if
+      put baseConvert(char pOffset to (pOffset + 3) of pStreamHex, 16, 10) * 65536 \
+            + baseConvert(char (pOffset + 4) to (pOffset + 7) of pStreamHex, 16, 10) into tWordVal
+      add 8 to pOffset
+      if tWordVal < tLimit then
+         return (tWordVal mod pRangeN) + 1 & comma & pOffset
+      end if
+   end repeat
+end heDrawUniform
+
+function heShuffleFromStreamHex pStreamHex
+   -- Fisher-Yates over deck[1..52]; deck 1 is the top, dealt first
+   local tDeckA, tPos, tSwapPos, tDrawPair, tHold, tOut, tOffset, tLoopI
+   set the itemDelimiter to comma
+   repeat with tPos = 1 to 52
+      put tPos into tDeckA[tPos]
+   end repeat
+   put 1 into tOffset
+   repeat with tLoopI = 52 down to 2
+      put heDrawUniform(pStreamHex, tOffset, tLoopI) into tDrawPair
+      put item 1 of tDrawPair into tSwapPos
+      put item 2 of tDrawPair into tOffset
+      put tDeckA[tLoopI] into tHold
+      put tDeckA[tSwapPos] into tDeckA[tLoopI]
+      put tHold into tDeckA[tSwapPos]
+   end repeat
+   put empty into tOut
+   repeat with tPos = 1 to 52
+      put tDeckA[tPos] & comma after tOut
+   end repeat
+   delete char -1 of tOut
+   return tOut
+end heShuffleFromStreamHex
+
+function heDeckFromStreamKey pKeyData
+   -- 16 blocks (1024 hex chars) covers 51 draws with slack; extend on the
+   -- astronomically-unlikely stream exhaustion rather than fail
+   local tBlockCount, tDeckList
+   put 16 into tBlockCount
+   repeat forever
+      try
+         put heShuffleFromStreamHex(heStreamBlocksHex(pKeyData, tBlockCount)) into tDeckList
+         return tDeckList
+      catch tShufErr
+         if tShufErr contains "he-stream-exhausted" and tBlockCount < 256 then
+            put tBlockCount * 2 into tBlockCount
+         else
+            throw tShufErr
+         end if
+      end try
+   end repeat
+end heDeckFromStreamKey
+
+function heLevel0Deck pTableData, pHandNum, pSeedsHexA, pCount
+   -- the full Level 0 shuffled deck from committed seeds
+   return heDeckFromStreamKey(heStreamKeyData(pTableData, pHandNum, heXorSeedsHex(pSeedsHexA, pCount)))
+end heLevel0Deck
+
+function heSeedCommitHex pSeedHex
+   -- H("HOLDEM-SEEDC-v1|" || seed bytes), hex (spec 7.1 step 1)
+   return heHashDomHex(kHeDomainSeedC, heHex2BinD(pSeedHex))
+end heSeedCommitHex
+
+function heAuditDeal pTableData, pHandNum, pSeedsHexA, pCommitsA, pCount, pDealA, pOccList, pButton
+   -- end-of-hand audit (spec 7.1 step 5): recompute the whole deal from the
+   -- revealed seeds and name the FIRST failing step. Returns "pass"/"fail:..".
+   local tSeatPos, tDeckList, tCheckA, tSeatNum
+   set the itemDelimiter to comma
+   repeat with tSeatPos = 1 to pCount
+      if heSeedCommitHex(pSeedsHexA[tSeatPos]) is not pCommitsA[tSeatPos] then
+         return "fail:commit-mismatch-position-" & tSeatPos
+      end if
+   end repeat
+   put heLevel0Deck(pTableData, pHandNum, pSeedsHexA, pCount) into tDeckList
+   put heDealAssign(tDeckList, pOccList, pButton) into tCheckA
+   repeat for each item tSeatNum in pOccList
+      if tCheckA["holesBy"][tSeatNum] is not pDealA["holesBy"][tSeatNum] then
+         return "fail:hole-mismatch-seat-" & tSeatNum
+      end if
+   end repeat
+   if tCheckA["flopList"] is not pDealA["flopList"] then
+      return "fail:flop-mismatch"
+   end if
+   if tCheckA["turnIx"] is not pDealA["turnIx"] then
+      return "fail:turn-mismatch"
+   end if
+   if tCheckA["riverIx"] is not pDealA["riverIx"] then
+      return "fail:river-mismatch"
+   end if
+   return "pass"
+end heAuditDeal
 
 --------------------------------------------------------------------------
 -- small pure utilities
@@ -2493,6 +2667,7 @@ command heRunSelftest
    heTestShuffleRun
    heTestFoldRun
    heTestCryptoRun
+   heTestDealRun
    put return & heProbeSodium() after gRpt
    put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
          & return after gRpt
@@ -2534,6 +2709,46 @@ command heTSkip pLabel, pWhy
    put "SKIP  " & pLabel & " (" & pWhy & ")" & return after gRpt
 end heTSkip
 
+command heTestDealRun
+   -- on-engine mirror of the Level 0 keyed-stream deal (spec 7.1), pinned in
+   -- tools/protocol-kat.py. SKIPs without SodiumXT. Exercises the real
+   -- commit-reveal dealing protocol the online game uses.
+   local tSeedsA, tXorHex, tKeyData, tDeckList, tDealA, tCommitsA, tTableData
+   put return & "-- 7. Level 0 keyed-stream deal (spec 7.1, crypto path)" & return after gRpt
+   if not heHasSodium() then
+      heTSkip "deal: Level 0 keyed-stream", "SodiumXT not installed"
+      exit heTestDealRun
+   end if
+   set the itemDelimiter to comma
+   put kKatSeed1 into tSeedsA[1]
+   put kKatSeed2 into tSeedsA[2]
+   put kKatSeed3 into tSeedsA[3]
+   heTAssert "deal: seeds XOR", heXorSeedsHex(tSeedsA, 3), kKatSeedsXor
+   put heHex2BinD(kKatTableHex) into tTableData
+   put heStreamKeyData(tTableData, 1, kKatSeedsXor) into tKeyData
+   heTAssert "deal: stream key", heBin2HexS(tKeyData), kKatStreamKey
+   put heDeckFromStreamKey(tKeyData) into tDeckList
+   heTAssert "deal: full shuffled deck (52 cards)", heTNamesOf(tDeckList), kKatDeck
+   put heDealAssign(tDeckList, "1,2,3", 1) into tDealA
+   heTAssert "deal: hole cards seat 1", heTNamesOf(tDealA["holesBy"][1]), kKatHole1
+   heTAssert "deal: hole cards seat 2", heTNamesOf(tDealA["holesBy"][2]), kKatHole2
+   heTAssert "deal: hole cards seat 3", heTNamesOf(tDealA["holesBy"][3]), kKatHole3
+   heTAssert "deal: flop", heTNamesOf(tDealA["flopList"]), kKatFlop
+   heTAssert "deal: turn", heCardName(tDealA["turnIx"]), kKatTurn
+   heTAssert "deal: river", heCardName(tDealA["riverIx"]), kKatRiver
+   -- end-of-hand audit: honest deal passes; a corrupted commit is named
+   put heSeedCommitHex(kKatSeed1) into tCommitsA[1]
+   put heSeedCommitHex(kKatSeed2) into tCommitsA[2]
+   put heSeedCommitHex(kKatSeed3) into tCommitsA[3]
+   heTAssert "deal: seed commitment 1", tCommitsA[1], kKatCommit1
+   heTAssert "deal: audit passes the honest deal", \
+         heAuditDeal(tTableData, 1, tSeedsA, tCommitsA, 3, tDealA, "1,2,3", 1), "pass"
+   put kKatCommit1 into tCommitsA[2]
+   heTAssert "deal: audit names a corrupted commit", \
+         heAuditDeal(tTableData, 1, tSeedsA, tCommitsA, 3, tDealA, "1,2,3", 1), \
+         "fail:commit-mismatch-position-2"
+end heTestDealRun
+
 command heTestCryptoRun
    -- on-engine mirror of tools/protocol-kat.py (spec 6 + 7.1 crypto). SKIPs
    -- cleanly without SodiumXT; all-green confirms the online transcript
@@ -2555,7 +2770,7 @@ command heTestCryptoRun
    heTAssert "crypto: domain-separated seed commit 3", \
          heHashDomHex(kHeDomainSeedC, heHex2BinD(kKatSeed3)), kKatCommit3
 
-   heDeriveIdentity heHex2BinD(kKatIdSeed1), tPub, tSec
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tPub, tSec
    heTAssert "crypto: ed25519 identity pubkey from seed", heBin2HexS(tPub), kKatIdPub1
 
    put heEnvContentLine(kKatTableHex, 0, kKatIdPub1, "cfg", kKatCfgBody) into tContent
@@ -2565,7 +2780,7 @@ command heTestCryptoRun
          heEnvSenderSigHex(tContent, tSec), kKatEnv0SenderSig
 
    -- rebuild the six-envelope hash chain (host relay = identity 1)
-   heDeriveIdentity heHex2BinD(kKatIdSeed1), tHostPub, tHostSec
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tHostPub, tHostSec
    put kKatIdSeed1 & return & kKatIdSeed1 & return & kKatIdSeed2 & return \
          & kKatIdSeed3 & return & kKatIdSeed2 & return & kKatIdSeed3 into tSenderSeeds
    put "0,1,1,1,1,1" into tHands
@@ -2574,19 +2789,19 @@ command heTestCryptoRun
          & kKatCommit3 & return & "amount=1" & return & "amount=2" into tBodies
    put kHeGenesisPrev into tPrevHex
    repeat with tSeq = 1 to 6
-      heDeriveIdentity heHex2BinD(line tSeq of tSenderSeeds), tPub, tSec
+      sxSignKeypairFromSeed heHex2BinD(line tSeq of tSenderSeeds), tPub, tSec
       put heEnvContentLine(kKatTableHex, item tSeq of tHands, heBin2HexS(tPub), \
             item tSeq of tTypes, line tSeq of tBodies) into tContent
       put heWireBuild(tContent, tSec, tSeq, tPrevHex, tHostSec) into tWire
-      put heHex2BinD(heChainNextHex(tWire)) into tChainData
       put heChainNextHex(tWire) into tPrevHex
+      put heHex2BinD(tPrevHex) into tChainData
    end repeat
    heTAssert "crypto: six-envelope chain head", tPrevHex, kKatChainHead6
    heTAssert "crypto: settlement receipt hash", \
          heSettleHashHex("1:-4,2:8,3:-4", tChainData), kKatSettleHash
 
    -- verify-or-drop (spec 6): honest wire accepted, tampered body rejected
-   heDeriveIdentity heHex2BinD(kKatIdSeed1), tPub, tSec
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tPub, tSec
    put heEnvContentLine(kKatTableHex, 0, heBin2HexS(tPub), "cfg", kKatCfgBody) into tContent
    put heWireBuild(tContent, tSec, 1, kHeGenesisPrev, tSec) into tWire
    heTAssert "crypto: verify accepts an honest wire", \
@@ -2598,7 +2813,7 @@ command heTestCryptoRun
    heTAssert "crypto: verify drops a tampered body", \
          heEnvVerify(tTampered, heBin2HexS(tPub), heBin2HexS(tPub), kHeGenesisPrev), "drop:bad-sender-sig"
    -- expect a DIFFERENT admitted key than the wire's actual signer
-   heDeriveIdentity heHex2BinD(kKatIdSeed2), tHostPub, tHostSec
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed2), tHostPub, tHostSec
    heTAssert "crypto: verify drops an unknown sender", \
          heEnvVerify(tWire, heBin2HexS(tHostPub), heBin2HexS(tPub), kHeGenesisPrev), "drop:unknown-from"
    heTAssert "crypto: verify drops a chain break", \
