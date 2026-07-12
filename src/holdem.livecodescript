@@ -24,7 +24,7 @@ and needs an OXT pass. The pure sections are pinned by the KATs.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.1.0"
+constant kHeVersion = "0.1.1"
 constant kUIVersion = "1"
 constant kHeEnvV = "1"
 
@@ -146,8 +146,15 @@ function heTwoDigits pNum
 end heTwoDigits
 
 function heBin2Hex pData
-   -- lowercase hex, pure xTalk so no SodiumXT dependency for transcripts
+   -- lowercase hex. Prefer the native converter: the OXT chunk evaluator
+   -- has thrown double/binary conversion errors on FFI-bridged binary
+   -- (H6), and sxBin2Hex is proven on-engine (the sodium probe uses it).
+   -- The script loop remains as the no-sodium fallback for engine-built
+   -- binary (textEncode output and the like).
    local tOut, tPos, tByteVal, tHexPair
+   if heHasSodium() then
+      return toLower(sxBin2Hex(pData))
+   end if
    put empty into tOut
    repeat with tPos = 1 to the number of bytes of pData
       put byteToNum(byte tPos of pData) into tByteVal
@@ -162,6 +169,9 @@ end heBin2Hex
 
 function heHex2Bin pHex
    local tOut, tPos
+   if heHasSodium() then
+      return sxHex2Bin(pHex)
+   end if
    put empty into tOut
    repeat with tPos = 1 to the number of chars of pHex step 2
       put numToByte(baseConvert(char tPos to (tPos + 1) of pHex, 16, 10)) after tOut
@@ -209,14 +219,6 @@ function heRotateAfter pList, pEntry
    end repeat
    return pList
 end heRotateAfter
-
-function heU32At pData, pPos
-   -- 4 bytes big-endian starting at byte pPos, exact in a double
-   return byteToNum(byte pPos of pData) * 16777216 \
-         + byteToNum(byte pPos + 1 of pData) * 65536 \
-         + byteToNum(byte pPos + 2 of pData) * 256 \
-         + byteToNum(byte pPos + 3 of pData)
-end heU32At
 
 function heU32BEBytes pNum
    return numToByte(pNum div 16777216 mod 256) \
@@ -437,64 +439,77 @@ end heRandomSeedData
 
 --------------------------------------------------------------------------
 -- Level 0 deal: commit-reveal keyed-stream shuffle (spec 7.1, pinned by
--- tools/protocol-kat.py). The draw and shuffle are pure xTalk; only the
--- stream key and blocks touch sxHash.
+-- tools/protocol-kat.py). As of v0.1.1 the whole script side works in
+-- HEX TEXT: the OXT chunk evaluator threw double/binary conversion
+-- errors on FFI-bridged binary (H6), so seeds and the draw stream travel
+-- as hex and raw Data exists only at the sx* boundary. Byte semantics
+-- are unchanged -- the KAT-pinned decks and commitments are identical.
 --------------------------------------------------------------------------
 
-function heSeedCommitOf pSeedData
-   return heBin2Hex(heHashData(textEncode(kHeDomainSeedC, "UTF-8") & pSeedData))
+function heSeedCommitOf pSeedHex
+   -- commitment = H("HOLDEM-SEEDC-v1|" || seed bytes); the seed travels
+   -- script-side as hex and becomes bytes only at the hash boundary
+   return heBin2Hex(heHashData(textEncode(kHeDomainSeedC, "UTF-8") & heHex2Bin(pSeedHex)))
 end heSeedCommitOf
 
-function heXorSeedsA pSeedsA, pCount
-   -- H6 (first OXT pass): a chunk taken directly off an array element
-   -- ("byte i of pSeedsA[j]") throws a double/binary conversion error on
-   -- engine; copy the element to a plain local, then chunk the local
-   local tOut, tBytePos, tSeatPos, tAcc, tSeedData
-   put empty into tOut
-   repeat with tBytePos = 1 to 32
+function heXorSeedsA pSeedsHexA, pCount
+   -- XOR of N 32-byte seeds, done entirely in hex text; returns hex
+   local tSeatPos, tPairPos, tAcc, tHexTxt, tOutHex, tPairHex
+   put empty into tOutHex
+   repeat with tPairPos = 1 to 63 step 2
       put 0 into tAcc
       repeat with tSeatPos = 1 to pCount
-         put pSeedsA[tSeatPos] into tSeedData
-         put bitXOr(tAcc, byteToNum(byte tBytePos of tSeedData)) into tAcc
+         put pSeedsHexA[tSeatPos] into tHexTxt
+         put bitXOr(tAcc, baseConvert(char tPairPos to (tPairPos + 1) of tHexTxt, 16, 10)) into tAcc
       end repeat
-      put numToByte(tAcc) after tOut
+      put toLower(baseConvert(tAcc, 10, 16)) into tPairHex
+      if the number of chars of tPairHex is 1 then
+         put "0" & tPairHex into tPairHex
+      end if
+      put tPairHex after tOutHex
    end repeat
-   return tOut
+   return tOutHex
 end heXorSeedsA
 
-function heStreamKeyOf pTableIdData, pHandNum, pXorData
+function heStreamKeyOf pTableIdData, pHandNum, pXorHex
    -- H("HOLDEM-SHUF-v1|" || table || "|" || decimal(hand) || "|" || seedsXor)
    return heHashData(textEncode(kHeDomainShuf, "UTF-8") & pTableIdData \
-         & textEncode("|" & pHandNum & "|", "UTF-8") & pXorData)
+         & textEncode("|" & pHandNum & "|", "UTF-8") & heHex2Bin(pXorHex))
 end heStreamKeyOf
 
 function heStreamBlocks pKeyData, pBlockCount
+   -- the stream is returned as hex text so the draw below only ever
+   -- chunks plain chars (H6)
    local tOut, tBlockPos
    put empty into tOut
    repeat with tBlockPos = 0 to pBlockCount - 1
-      put heHashData(pKeyData & heU32BEBytes(tBlockPos)) after tOut
+      put heBin2Hex(heHashData(pKeyData & heU32BEBytes(tBlockPos))) after tOut
    end repeat
    return tOut
 end heStreamBlocks
 
-function heDrawUniform pStreamData, pOffset, pRangeN
-   -- uniform 1..pRangeN via 4-byte BE words, rejection sampled (no modulo
-   -- bias); returns "value,nextOffset"
+function heDrawUniform pStreamHex, pOffset, pRangeN
+   -- uniform 1..pRangeN via 32-bit big-endian words read as 8 hex chars,
+   -- rejection sampled (no modulo bias). pOffset is a char position into
+   -- the hex stream; returns "value,nextOffset". The word is assembled
+   -- from two 16-bit halves: baseConvert's 32-bit signedness is not a
+   -- documented contract, and 16-bit halves are unambiguous everywhere.
    local tLimit, tWordVal
    put (kHeTwo32 div pRangeN) * pRangeN into tLimit
    repeat forever
-      if pOffset + 3 > the number of bytes of pStreamData then
+      if pOffset + 7 > the number of chars of pStreamHex then
          throw "he-stream-exhausted"
       end if
-      put heU32At(pStreamData, pOffset) into tWordVal
-      add 4 to pOffset
+      put baseConvert(char pOffset to (pOffset + 3) of pStreamHex, 16, 10) * 65536 \
+            + baseConvert(char (pOffset + 4) to (pOffset + 7) of pStreamHex, 16, 10) into tWordVal
+      add 8 to pOffset
       if tWordVal < tLimit then
          return (tWordVal mod pRangeN) + 1 & comma & pOffset
       end if
    end repeat
 end heDrawUniform
 
-function heShuffleFromStream pStreamData
+function heShuffleFromStream pStreamHex
    -- Fisher-Yates over deck[1..52]; deck 1 is the top, dealt first
    local tDeckA, tPos, tSwapPos, tDrawPair, tHold, tOut, tOffset, tLoopI
    set the itemDelimiter to comma
@@ -503,7 +518,7 @@ function heShuffleFromStream pStreamData
    end repeat
    put 1 into tOffset
    repeat with tLoopI = 52 down to 2
-      put heDrawUniform(pStreamData, tOffset, tLoopI) into tDrawPair
+      put heDrawUniform(pStreamHex, tOffset, tLoopI) into tDrawPair
       put item 1 of tDrawPair into tSwapPos
       put item 2 of tDrawPair into tOffset
       put tDeckA[tLoopI] into tHold
@@ -519,9 +534,9 @@ function heShuffleFromStream pStreamData
 end heShuffleFromStream
 
 function heDeckFromStreamKey pKeyData
-   -- 16 blocks (512 bytes) covers 51 draws with ~77 words of rejection
-   -- slack; the stream is conceptually infinite, so extend on the
-   -- astronomically-unlikely exhaustion rather than fail
+   -- 16 blocks (1024 hex chars) covers 51 draws with ~77 words of
+   -- rejection slack; the stream is conceptually infinite, so extend on
+   -- the astronomically-unlikely exhaustion rather than fail
    local tBlockCount, tDeckList
    put 16 into tBlockCount
    repeat forever
@@ -565,18 +580,18 @@ function heDealAssign pDeckList, pOccupiedList, pButtonSeat
    return tOutA
 end heDealAssign
 
-function heAuditHand pTableIdData, pHandNum, pSeedsA, pCommitsA, pCount, pDealA, pOccupiedList, pButtonSeat
+function heAuditHand pTableIdData, pHandNum, pSeedsHexA, pCommitsA, pCount, pDealA, pOccupiedList, pButtonSeat
    -- end-of-hand audit (spec 7.1 step 5): recompute everything from the
-   -- revealed seeds and name the first failing step. Returns "pass" or
-   -- "fail:<step>". Needs SodiumXT (hashing).
+   -- revealed seeds (hex, per H6) and name the first failing step.
+   -- Returns "pass" or "fail:<step>". Needs SodiumXT (hashing).
    local tSeatPos, tKeyData, tDeckList, tCheckA, tSeatNum
    set the itemDelimiter to comma
    repeat with tSeatPos = 1 to pCount
-      if heSeedCommitOf(pSeedsA[tSeatPos]) is not pCommitsA[tSeatPos] then
+      if heSeedCommitOf(pSeedsHexA[tSeatPos]) is not pCommitsA[tSeatPos] then
          return "fail:commit-mismatch-position-" & tSeatPos
       end if
    end repeat
-   put heStreamKeyOf(pTableIdData, pHandNum, heXorSeedsA(pSeedsA, pCount)) into tKeyData
+   put heStreamKeyOf(pTableIdData, pHandNum, heXorSeedsA(pSeedsHexA, pCount)) into tKeyData
    put heDeckFromStreamKey(tKeyData) into tDeckList
    put heDealAssign(tDeckList, pOccupiedList, pButtonSeat) into tCheckA
    repeat for each item tSeatNum in pOccupiedList
@@ -1433,7 +1448,7 @@ function heSeatsAlive
 end heSeatsAlive
 
 command heHandStart
-   local tOccList, tSeatNum, tSeedsA, tCommitsA, tXorData, tKeyData, tPos
+   local tOccList, tSeatNum, tSeedsA, tCommitsA, tXorHex, tKeyData, tPos
    local tDeckList, tDealA, tHoleNames, tCount, tSeatPos, tHolePair
    set the itemDelimiter to comma
    if gGame["phase"] is "hand" then
@@ -1457,14 +1472,15 @@ command heHandStart
    -- Level 0 deal, step 1-3 (spec 7.1): commit, (locally) share, shuffle.
    -- In hotseat every seat is this machine, so the sealed-box hop is a
    -- no-op; the commit-reveal code path still runs for real so the audit
-   -- audits something real.
+   -- audits something real. Seeds travel as hex (H6); fixedSeedsA (the
+   -- harness seam) holds hex too.
    put 0 into tPos
    repeat for each item tSeatNum in tOccList
       add 1 to tPos
       if gGame["fixedSeedsA"][tSeatNum] is not empty then
          put gGame["fixedSeedsA"][tSeatNum] into tSeedsA[tPos]
       else
-         put heRandomSeedData() into tSeedsA[tPos]
+         put heBin2Hex(heRandomSeedData()) into tSeedsA[tPos]
       end if
       if heHasSodium() then
          put heSeedCommitOf(tSeedsA[tPos]) into tCommitsA[tPos]
@@ -1475,8 +1491,8 @@ command heHandStart
    end repeat
    put heCountItems(tOccList) into tCount
    if heHasSodium() then
-      put heXorSeedsA(tSeedsA, tCount) into tXorData
-      put heStreamKeyOf(gGame["tableIdData"], gGame["handNum"], tXorData) into tKeyData
+      put heXorSeedsA(tSeedsA, tCount) into tXorHex
+      put heStreamKeyOf(gGame["tableIdData"], gGame["handNum"], tXorHex) into tKeyData
       put heDeckFromStreamKey(tKeyData) into tDeckList
    else
       -- practice-entropy fallback: still a uniform Fisher-Yates, loudly
@@ -1522,10 +1538,12 @@ function heNextAliveAfter pSeatNum
 end heNextAliveAfter
 
 function hePracticeStream
+   -- 1024 hex chars = the same 512 stream bytes, already in the hex form
+   -- the draw consumes (H6); practice entropy only, never networked
    local tOut
    put empty into tOut
-   repeat 512 times
-      put numToByte(random(256) - 1) after tOut
+   repeat 1024 times
+      put char random(16) of "0123456789abcdef" after tOut
    end repeat
    return tOut
 end hePracticeStream
@@ -1670,12 +1688,12 @@ command heHandShowdown
    end repeat
    delete char -1 of tDeltasTxt
 
-   -- step 5 (spec 7.1): reveal, audit, and log the result
+   -- step 5 (spec 7.1): reveal, audit, and log the result (seeds are hex)
    put tStateA["occ"] into tOccList
    repeat with tSeatPos = 1 to tDealA["seatCount"]
       put item tSeatPos of tOccList into tSeatNum
       heLogAppend "seedReveal", "seat" & tSeatNum, \
-            "seat=" & tSeatNum & ",seed=" & heBin2Hex(tDealA["seedsA"][tSeatPos])
+            "seat=" & tSeatNum & ",seed=" & tDealA["seedsA"][tSeatPos]
    end repeat
    if heHasSodium() then
       put heAuditHand(gGame["tableIdData"], gGame["handNum"], tDealA["seedsA"], \

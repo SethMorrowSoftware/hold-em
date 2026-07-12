@@ -247,6 +247,12 @@ House additions for THIS repo (earned in the siblings, restated as law here):
   the seed-XOR path; the compiler accepts the syntax happily). Copy the element into a
   plain local, then chunk the local. Same rule for `replace ... in tA["k"]` — copy out,
   modify, or avoid. The static gate flags the chunk pattern (check 5).
+  **Corollary (v0.1.1): keep FFI-bridged binary away from the script chunk evaluator
+  entirely.** The double/binary error persisted past the copy-to-local fix, so binary
+  from `sx*` handlers is now hex-encoded at the edge (`sxBin2Hex` — itself proven by
+  the sodium probe) and everything script-side chunks plain hex text; raw Data exists
+  only in expressions passed straight into `sx*` calls. Seeds, the shuffle stream, and
+  every transcript field follow this rule.
 
 ## The single-threaded performance playbook (condensed for a card game)
 
