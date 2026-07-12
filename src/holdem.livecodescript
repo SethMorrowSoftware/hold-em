@@ -56,7 +56,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.4.1"
+constant kHeVersion = "0.4.2"
 constant kHeHarnessV = "6"
 constant kUIVersion = "3"
 
@@ -464,20 +464,21 @@ function heByteXor pA, pB
    -- XOR of two byte values (0..255) using ONLY integer arithmetic (div, mod,
    -- add, multiply) -- no bitwise operator, so nothing can trip the engine's
    -- double/binary conversion. Walks the 8 bits low to high.
-   local tR, tBitVal, tAb, tBb
-   put 0 into tR
+   -- (locals are tWorkA/tWorkB, NOT tAb -- "tAb" is the tab constant, gotcha 2.)
+   local tResult, tBitVal, tWorkA, tWorkB
+   put 0 into tResult
    put 1 into tBitVal
-   put pA into tAb
-   put pB into tBb
+   put pA into tWorkA
+   put pB into tWorkB
    repeat 8 times
-      if (tAb mod 2) is not (tBb mod 2) then
-         add tBitVal to tR
+      if (tWorkA mod 2) is not (tWorkB mod 2) then
+         add tBitVal to tResult
       end if
-      put tAb div 2 into tAb
-      put tBb div 2 into tBb
+      put tWorkA div 2 into tWorkA
+      put tWorkB div 2 into tWorkB
       put tBitVal * 2 into tBitVal
    end repeat
-   return tR
+   return tResult
 end heByteXor
 
 function heXorSeedsHex pSeedsHexA, pCount

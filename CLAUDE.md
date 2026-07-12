@@ -216,7 +216,11 @@ bug in the family.
    strings are fine.) The static gate enforces this.
 2. **Avoid names that shadow engine tokens.** Custom property/variable names whose stem
    is an engine keyword break compilation even when prefixed (real case: `the uCat` /
-   `the uMask` → renamed `uHitChans`/`uOnChans`). Prefer distinctive multi-word stems.
+   `the uMask` → renamed `uHitChans`/`uOnChans`). A whole name that case-insensitively
+   *equals* a token is even worse — it silently evaluates AS the token: `tAb` is read as
+   the `tab` constant (found v0.4.2, in `heByteXor` → renamed `tWorkA`). Prefer
+   distinctive multi-word stems. The static gate now flags any local/param whose name
+   equals an engine token (check 7).
 3. **Prefix conventions:** `u` = custom property, `g` = script-local global, `t` =
    handler local, `p` = parameter, `k` = constant. Public API prefixes in the family:
    `b2k*`, `bt*`, `sx*`, `ox*`; this repo's public surface will be `he*` (holde-em) —

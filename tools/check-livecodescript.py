@@ -188,6 +188,51 @@ def check_chunk_of_element(text):
     return errors
 
 
+# Whole-token names that the engine reads as a constant/keyword regardless of
+# case: a variable named ``tAb`` IS the ``tab`` constant (gotcha 2). Only bare
+# collisions matter -- ``tType`` is fine, ``type`` is not. Kept to tokens a
+# prefixed variable could plausibly spell by accident.
+RESERVED_NAMES = set("""
+tab cr lf crlf return linefeed formfeed space comma colon quote backslash slash
+null empty nan pi true false zero one two three four five six seven eight nine ten
+up down eof it me id the end then else repeat while until for of in is or and not
+to into after before put get set send exit next pass global local constant
+char byte word line item token element each number length offset result target
+message type name owner rect loc text top bottom width height key value sound
+cursor paint sort merge param params
+""".split())
+
+DECL_OPENERS = ("command", "function", "on", "getprop", "setprop", "before", "after")
+
+
+def check_reserved_names(text):
+    """Flag any declared local or handler parameter whose name case-insensitively
+    equals an engine token (the ``tAb`` == ``tab`` trap, gotcha 2). Uses the
+    comment-stripped logical lines so a keyword in prose never false-positives."""
+    errors = []
+    for lineno, code in logical_lines(text):
+        low = code.strip()
+        toks = low.split()
+        if not toks:
+            continue
+        first = toks[0].lower()
+        if first == "local":
+            decl = low[len(toks[0]):]
+        elif first in DECL_OPENERS and len(toks) >= 2:
+            # everything after the handler name is the (comma-separated) params
+            decl = low.split(None, 2)[2] if len(toks) >= 3 else ""
+        else:
+            continue
+        for part in decl.split(","):
+            name = part.strip().lstrip("@").split("[")[0].strip()
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name) and name.lower() in RESERVED_NAMES:
+                errors.append(
+                    f"  L{lineno}: variable/param '{name}' IS the engine token "
+                    f"'{name.lower()}' (gotcha 2) — rename to a distinctive stem"
+                )
+    return errors
+
+
 BITWISE = re.compile(r"\b(bitXor|bitAnd|bitOr|bitNot)\b", re.IGNORECASE)
 
 
@@ -249,6 +294,7 @@ def main():
         problems += check_dangling_else(text)
         problems += check_chunk_of_element(text)
         problems += check_bitwise(text)
+        problems += check_reserved_names(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")
