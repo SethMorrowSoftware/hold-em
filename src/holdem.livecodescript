@@ -134,10 +134,16 @@ function heHasSodium
 end heHasSodium
 
 command heProbeSodium
-   -- diagnostic: try each sx* call in its own try and report ok/threw, so a
-   -- double/binary failure names the exact handler. Prints to the message box.
-   local tRpt, tTmp, tData
+   -- diagnostic: try each sx* call in its own try and report ok/threw so a
+   -- failure names the exact handler. Prints to the message box.
+   -- On this engine (confirmed 0.2.0): sxRandomUniform / sxRandomBytes /
+   -- sxBin2Hex all work; sxHash THROWS. The playable deal deliberately uses
+   -- none of the throwing calls. The sxHash block below discriminates WHY
+   -- it throws (input type vs handler vs arity), for the Phase 2 crypto deal.
+   local tRpt, tTmp, tData, tEnc
    put "SodiumXT probe (holde-em " & kHeVersion & "):" & return into tRpt
+
+   put "-- primitives the game relies on --" & return after tRpt
    try
       put sxRandomUniform(1000) into tTmp
       put "  sxRandomUniform(1000) -> " & tTmp & "  : ok" & return after tRpt
@@ -156,18 +162,44 @@ command heProbeSodium
    catch tErr
       put "  sxBin2Hex(sxRandomBytes): THREW: " & tErr & return after tRpt
    end try
+
+   put "-- sxHash discriminators (Phase 2 crypto deal) --" & return after tRpt
+   -- is textEncode itself the thrower, or sxHash?
    try
-      put sxHash(textEncode("holdem", "UTF-8")) into tData
-      put "  sxHash(text): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+      put textEncode("holdem", "UTF-8") into tEnc
+      put "  textEncode(text): ok (" & the number of bytes of tEnc & " bytes)" & return after tRpt
    catch tErr
-      put "  sxHash: THREW: " & tErr & return after tRpt
+      put "  textEncode: THREW: " & tErr & return after tRpt
    end try
+   -- sxHash on raw Data straight from sxRandomBytes (no textEncode in play)
    try
-      put sxBin2Hex(sxHash(textEncode("holdem", "UTF-8"))) into tTmp
-      put "  sxBin2Hex(sxHash(text)) -> " & tTmp & "  : ok" & return after tRpt
+      put sxHash(sxRandomBytes(8)) into tData
+      put "  sxHash(sxRandomBytes): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
    catch tErr
-      put "  sxBin2Hex(sxHash): THREW: " & tErr & return after tRpt
+      put "  sxHash(sxRandomBytes): THREW: " & tErr & return after tRpt
    end try
+   -- sxHash on a plain text argument (some wrappers accept text directly)
+   try
+      put sxHash("holdem") into tData
+      put "  sxHash(plainText): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+   catch tErr
+      put "  sxHash(plainText): THREW: " & tErr & return after tRpt
+   end try
+   -- sxHash with an explicit 32-byte output length (libsodium generichash arity)
+   try
+      put sxHash(sxRandomBytes(8), 32) into tData
+      put "  sxHash(data,32): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+   catch tErr
+      put "  sxHash(data,32): THREW: " & tErr & return after tRpt
+   end try
+   -- if any sxHash form worked, is it a valid hash input to sxBin2Hex?
+   try
+      put sxBin2Hex(sxHash(sxRandomBytes(8))) into tTmp
+      put "  sxBin2Hex(sxHash(data)) -> " & tTmp & "  : ok" & return after tRpt
+   catch tErr
+      put "  sxBin2Hex(sxHash(data)): THREW: " & tErr & return after tRpt
+   end try
+
    put tRpt
    return tRpt
 end heProbeSodium
