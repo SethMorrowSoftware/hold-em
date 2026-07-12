@@ -646,42 +646,62 @@ command heIdentitySetup
    put tBoxSec into gGame["boxSecData"]
 end heIdentitySetup
 
-function heAdmitTokenData pTableHex, pPubHex, pSecData
+function heAdmitTokenData pTableHex, pPubHex, pSecData, pRole
    -- signed admission claim (spec 5): sign over
-   -- "HOLDEM-SESS-v1|<table>|<pub>", framed pubHex TAB sigHex, published in
-   -- btRp1SetToken so peers drop strangers at handshake before any game message
+   -- "HOLDEM-SESS-v1|<table>|<pub>|<role>", framed pubHex TAB role TAB sigHex,
+   -- published in btRp1SetToken so peers drop strangers at handshake and a
+   -- joining player adopts only a self-declared host (role "host")
    local tSigHex
-   put heBin2HexS(heSignDetachedD(textEncode(kHeDomainSess & pTableHex & "|" & pPubHex, "utf-8"), pSecData)) into tSigHex
-   return textEncode(pPubHex & tab & tSigHex, "utf-8")
+   put heBin2HexS(heSignDetachedD(textEncode(kHeDomainSess & pTableHex & "|" & pPubHex & "|" & pRole, "utf-8"), pSecData)) into tSigHex
+   return textEncode(pPubHex & tab & pRole & tab & tSigHex, "utf-8")
 end heAdmitTokenData
 
 function heAdmitTokenVerify pTokenData, pTableHex
    -- returns the admitted pubHex if the token is well-formed and its signature
    -- verifies, else "" (the peer is a stranger and is ignored)
-   local tTok, tPubHex, tSigHex
+   local tTok, tPubHex, tRole, tSigHex, tSaved
    put textDecode(pTokenData, "utf-8") into tTok
+   put the itemDelimiter into tSaved
    set the itemDelimiter to tab
    put item 1 of tTok into tPubHex
-   put item 2 of tTok into tSigHex
+   put item 2 of tTok into tRole
+   put item 3 of tTok into tSigHex
+   set the itemDelimiter to tSaved
    if the number of chars of tPubHex is not 64 then
       return ""
    end if
    if heVerifyDetached(heHex2BinD(tSigHex), \
-         textEncode(kHeDomainSess & pTableHex & "|" & tPubHex, "utf-8"), heHex2BinD(tPubHex)) then
+         textEncode(kHeDomainSess & pTableHex & "|" & tPubHex & "|" & tRole, "utf-8"), heHex2BinD(tPubHex)) then
       return tPubHex
    end if
    return ""
 end heAdmitTokenVerify
 
+function heAdmitTokenRole pTokenData
+   -- the role field of a token ("host"/"player"), for host adoption
+   local tTok, tRole, tSaved
+   put textDecode(pTokenData, "utf-8") into tTok
+   put the itemDelimiter into tSaved
+   set the itemDelimiter to tab
+   put item 2 of tTok into tRole
+   set the itemDelimiter to tSaved
+   return tRole
+end heAdmitTokenRole
+
 command heNetStart
    -- start THE TorrentXT session, enable rp1, publish our admission token,
    -- and arm the poll drain. NEEDS AN OXT PASS. Requires tableIdHex + identity
    -- already set (heTableCreate/heTableJoin do that first).
-   local tSession
+   local tSession, tRole
    if gGame["online"] is "true" then
       exit heNetStart
    end if
-   put btStartSession() into tSession
+   try
+      put btStartSession() into tSession
+   catch tErr
+      heUISetStatus "Network start threw (ABI mismatch?): " & tErr
+      exit heNetStart
+   end try
    if tSession is 0 or tSession is empty then
       heUISetStatus "Network start failed: " & btLastError()
       exit heNetStart
@@ -689,7 +709,12 @@ command heNetStart
    put tSession into gGame["session"]
    btSetBool tSession, "enable_dht", true
    btRp1Enable tSession
-   btRp1SetToken tSession, heAdmitTokenData(gGame["tableIdHex"], gGame["idPubHex"], gGame["idSecData"])
+   if gGame["isHost"] is "true" then
+      put "host" into tRole
+   else
+      put "player" into tRole
+   end if
+   btRp1SetToken tSession, heAdmitTokenData(gGame["tableIdHex"], gGame["idPubHex"], gGame["idSecData"], tRole)
    put "true" into gGame["online"]
    send "heNetPollTick" to me in 250 milliseconds
 end heNetStart
@@ -734,7 +759,10 @@ command heTableCreate
    put 0 into gGame["seqCounter"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
    put empty into gGame["peerPubA"]
+   put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
+   -- the host must admit ITSELF so heHostRelay accepts the host's own actions
+   put "true" into gGame["admittedA"][gGame["idPubHex"]]
    heNetStart
    heNetJoinSwarm true
    heUISetStatus "Table created. Invite code: " & gGame["tableIdHex"]
@@ -755,6 +783,7 @@ command heTableJoin pCodeTxt
    put empty into gGame["hostPubHex"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
    put empty into gGame["peerPubA"]
+   put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
    heNetStart
    heNetJoinSwarm false
@@ -799,10 +828,11 @@ command heNetOnHandshake pPeer, pTokenData
    put tPubHex into gGame["peerPubA"][pPeer]
    put pPeer into gGame["peerByPub"][tPubHex]
    put "true" into gGame["admittedA"][tPubHex]
-   -- a joining player connects to the announcing host first; adopt it as the
-   -- host so its countersignatures can be verified (real host election, incl.
-   -- host loss, is spec 9 / the 2e increment)
-   if gGame["isHost"] is not "true" and gGame["hostPubHex"] is empty then
+   -- adopt as host only a peer whose token DECLARES role "host" -- the phantom
+   -- swarm connects players to each other too, so "first peer" is not the host
+   -- (full host election, incl. host loss, is spec 9 / the 2e increment)
+   if gGame["isHost"] is not "true" and gGame["hostPubHex"] is empty \
+         and heAdmitTokenRole(pTokenData) is "host" then
       put tPubHex into gGame["hostPubHex"]
    end if
 end heNetOnHandshake
@@ -810,11 +840,13 @@ end heNetOnHandshake
 command heNetOnMessage pPeer, pPayloadData
    -- payload kinds (tab-framed): "c" = a player's signed content line to the
    -- host; "w" = a host-relayed sequenced wire to everyone. Verify-or-drop.
-   local tPayload, tKind, tRest
+   local tPayload, tKind, tRest, tSaved
    put textDecode(pPayloadData, "utf-8") into tPayload
+   put the itemDelimiter into tSaved
    set the itemDelimiter to tab
    put item 1 of tPayload into tKind
    put item 2 to -1 of tPayload into tRest
+   set the itemDelimiter to tSaved
    switch tKind
       case "c"
          if gGame["isHost"] is "true" then
@@ -2956,7 +2988,7 @@ constant kKatEnv0ContentHex = "3109653532363735363530643761643438633731323931383
 constant kKatEnv0SenderSig = "c1d5f49bcc0fb8418830f63cc8be9c6bf7e5fd11a77807af38e672aa7284bba9c9cd58d73976888055851d034d440ab504cd0c9ab984f7df368a5f94225b310b"
 constant kKatChainHead6 = "62fcd52b3757f590c33bede7330620853074c1e5c153549244a8dac7287e3778"
 constant kKatSettleHash = "68095dcf5a74fac1e1340a1073a466dcf117024257f5c265de21698257b34b6f"
-constant kKatAdmitSig = "9bed66e2d5331ccbbfb52b5a37c400b1ca117ee7f1e82f1464287a62119edac02bede68ff5cf2e13b6d3718ceadcb13ff6eccdda4093ff98d386a12fd0c7ac0d"
+constant kKatAdmitSig = "17cf45eeecf27a3e9b63e1e0ff47ae1ea337430cb135fb499944a60681fcd1e949a7a88f532b2f888c0ea32364e93e9aa2f569419f27e8034b695a4ee94d5e0b"
 
 command heRunSelftest
    put empty into gRpt
@@ -3123,16 +3155,19 @@ command heTestCryptoRun
    heTAssert "crypto: verify drops a chain break", \
          heEnvVerify(tWire, heBin2HexS(tPub), heBin2HexS(tPub), kKatChainHead6), "drop:chain-break"
 
-   -- admission token (spec 5): signature pinned, and the verify roundtrip
-   -- returns the admitted pubkey for a good token, "" for a tampered one
+   -- admission token (spec 5): host-role signature pinned, and the verify
+   -- roundtrip returns the admitted pubkey for a good token, "" for a wrong
+   -- table, and the role is recoverable for host adoption
    sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tPub, tSec
-   heTAssert "admit: token signature", \
-         heBin2HexS(heSignDetachedD(textEncode(kHeDomainSess & kKatTableHex & "|" & kKatIdPub1, "utf-8"), tSec)), \
+   heTAssert "admit: host-token signature", \
+         heBin2HexS(heSignDetachedD(textEncode(kHeDomainSess & kKatTableHex & "|" & kKatIdPub1 & "|host", "utf-8"), tSec)), \
          kKatAdmitSig
    heTAssert "admit: verify accepts a good token", \
-         heAdmitTokenVerify(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec), kKatTableHex), kKatIdPub1
+         heAdmitTokenVerify(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec, "host"), kKatTableHex), kKatIdPub1
    heTAssert "admit: verify rejects a wrong-table token", \
-         heAdmitTokenVerify(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec), kKatChainHead6), ""
+         heAdmitTokenVerify(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec, "host"), kKatChainHead6), ""
+   heTAssert "admit: role is recoverable", \
+         heAdmitTokenRole(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec, "host")), "host"
 end heTestCryptoRun
 
 function heTIdxOf pNamesTxt
