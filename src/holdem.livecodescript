@@ -69,8 +69,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.2"
-constant kHeHarnessV = "9"
+constant kHeVersion = "0.5.3"
+constant kHeHarnessV = "10"
 constant kUIVersion = "4"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -881,6 +881,7 @@ command heTableCreate
    put empty into gGame["roleByPub"]
    put empty into gGame["log"]
    put empty into gGame["netLog"]
+   put 0 into gGame["syncCooldown"]
    -- the host must admit ITSELF so heHostRelay accepts the host's own actions
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "host" into gGame["roleByPub"][gGame["idPubHex"]]
@@ -919,6 +920,7 @@ command heTableJoin pCodeTxt
    put empty into gGame["roleByPub"]
    put empty into gGame["log"]
    put empty into gGame["netLog"]
+   put 0 into gGame["syncCooldown"]
    -- admit ourselves as a player so the local roster shows our own seat
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "player" into gGame["roleByPub"][gGame["idPubHex"]]
@@ -933,6 +935,10 @@ on heNetPollTick
    local tEvents, tEv
    if gGame["online"] is not "true" then
       exit heNetPollTick
+   end if
+   -- age the resync debounce one tick (heNetRequestSync sets it to 8)
+   if gGame["syncCooldown"] > 0 then
+      subtract 1 from gGame["syncCooldown"]
    end if
    put btRp1Poll(gGame["session"]) into tEvents
    repeat for each element tEv in tEvents
@@ -957,7 +963,7 @@ end heNetOnRp1
 command heNetOnHandshake pPeer, pTokenData
    -- admit-or-drop (spec 5): a peer whose token does not verify against this
    -- table is ignored, before any game message is accepted from it
-   local tPubHex, tRoleTxt, tIsNew
+   local tPubHex, tRoleTxt, tIsNew, tOldPeer, tReconnect
    put heAdmitTokenVerify(pTokenData, gGame["tableIdHex"]) into tPubHex
    if tPubHex is empty then
       put "drop   handshake from an unadmitted peer" & return after gGame["netLog"]
@@ -966,6 +972,10 @@ command heNetOnHandshake pPeer, pTokenData
    end if
    put heAdmitTokenRole(pTokenData) into tRoleTxt
    put (gGame["admittedA"][tPubHex] is not "true") into tIsNew
+   -- a known key handshaking on a NEW peer handle is a reconnect: it needs the
+   -- transcript replayed too, not just first-time joiners (spec 9)
+   put gGame["peerByPub"][tPubHex] into tOldPeer
+   put (tOldPeer is not empty and tOldPeer is not pPeer) into tReconnect
    put tPubHex into gGame["peerPubA"][pPeer]
    put pPeer into gGame["peerByPub"][tPubHex]
    put "true" into gGame["admittedA"][tPubHex]
@@ -980,11 +990,13 @@ command heNetOnHandshake pPeer, pTokenData
    if tIsNew then
       put "+peer  " & char 1 to 12 of tPubHex & "  (" & tRoleTxt & ")" & return after gGame["netLog"]
    end if
-   -- host: catch a new peer up on the whole transcript (spec 9 replay), then
-   -- re-sign and broadcast the roster so every client's presence agrees
-   if gGame["isHost"] is "true" and tIsNew then
+   -- host: catch a peer up on the whole transcript (spec 9 replay) on first
+   -- join OR reconnect, then re-sign and broadcast the roster so presence agrees
+   if gGame["isHost"] is "true" and (tIsNew or tReconnect) then
       heNetReplayLogTo pPeer
-      heHostEmitRoster
+      if tIsNew then
+         heHostEmitRoster
+      end if
    end if
    heLobbyRefresh
 end heNetOnHandshake
@@ -992,7 +1004,7 @@ end heNetOnHandshake
 command heNetOnMessage pPeer, pPayloadData
    -- payload kinds (tab-framed): "c" = a player's signed content line to the
    -- host; "w" = a host-relayed sequenced wire to everyone. Verify-or-drop.
-   local tPayload, tKind, tRest, tSaved
+   local tPayload, tKind, tRest, tSaved, tPeerPub
    put textDecode(pPayloadData, "utf-8") into tPayload
    put the itemDelimiter into tSaved
    set the itemDelimiter to tab
@@ -1007,6 +1019,17 @@ command heNetOnMessage pPeer, pPayloadData
          break
       case "w"
          heNetIngestWire tRest
+         break
+      case "s?"
+         -- a peer asks us (the host) to replay the transcript so it can catch
+         -- up from a chain gap (spec 9). Only honor it from an admitted,
+         -- connected peer, so an unknown socket cannot trigger a replay.
+         put gGame["peerPubA"][pPeer] into tPeerPub
+         if gGame["isHost"] is "true" and tPeerPub is not empty then
+            put "sync!  replaying transcript to " & char 1 to 8 of tPeerPub & return after gGame["netLog"]
+            heNetReplayLogTo pPeer
+            heLobbyRefresh
+         end if
          break
    end switch
 end heNetOnMessage
@@ -1051,6 +1074,13 @@ command heNetIngestWire pWire
    if tVerdict is not "ok" then
       -- drop and log; a bad/replayed/reordered message is not an exception
       put tVerdict && char 1 to 24 of pWire & return after gGame["netLog"]
+      -- a chain break means we missed a wire (rp1 is lossy/reorders): ask the
+      -- host to replay the transcript so we catch up, instead of wedging here
+      -- forever (spec 9). Debounced in heNetRequestSync. Other drops are real
+      -- rejections and must NOT trigger a resync.
+      if tVerdict is "drop:chain-break" then
+         heNetRequestSync
+      end if
       heLobbyRefresh
       exit heNetIngestWire
    end if
@@ -1093,6 +1123,25 @@ command heNetSendToHost pPayloadTxt
    end if
    get btRp1Send(gGame["session"], tHostPeer, textEncode(pPayloadTxt, "utf-8"))
 end heNetSendToHost
+
+command heNetRequestSync
+   -- recover from a chain gap: ask the host to replay the transcript (spec 9)
+   -- instead of wedging on drop:chain-break forever. Debounced by a tick
+   -- cooldown so a burst of dropped wires -- or a lost request -- re-asks at
+   -- most once every ~2 s, never floods the host. The host never self-syncs.
+   if gGame["isHost"] is "true" then
+      exit heNetRequestSync
+   end if
+   if gGame["syncCooldown"] > 0 then
+      exit heNetRequestSync
+   end if
+   if gGame["hostPubHex"] is empty then
+      exit heNetRequestSync
+   end if
+   put 8 into gGame["syncCooldown"]
+   put "sync?  requested transcript replay (chain gap)" & return after gGame["netLog"]
+   heNetSendToHost "s?"
+end heNetRequestSync
 
 command heNetBroadcast pPayloadTxt
    -- host sends to every admitted peer (star topology, spec 4)
@@ -3519,8 +3568,8 @@ command heTestLobbyRun
    -- then a roster (seq 2) once a player (idSeed2) has joined; a late joiner
    -- replays both from genesis and must land on kKatLobbyHead2. This checks
    -- the exact wires the transport carries, with no network. SKIPs w/o SodiumXT.
-   local tPub, tSec, tHostPubHex, tContent, tWire1, tWire2, tHead1, tHead2
-   local tMembers, tMembersRev, tRoster
+   local tPub, tSec, tHostPubHex, tContent, tWire1, tWire2, tWire3, tHead1, tHead2, tHead3
+   local tMembers, tMembersRev, tRoster, tClientHead, tVerdict
    put return & "-- 8. Online lobby: signed presence + transcript replay (spec 9)" & return after gRpt
    if not heHasSodium() then
       heTSkip "lobby: signed presence + replay", "SodiumXT not installed"
@@ -3554,6 +3603,31 @@ command heTestLobbyRun
    -- out-of-order replay is a chain break: the roster cannot land before the cfg
    heTAssert "lobby: roster before cfg is a chain break", \
          heEnvVerify(tWire2, tHostPubHex, tHostPubHex, kHeGenesisPrev), "drop:chain-break"
+
+   -- resync recovery (spec 9): a client that ingested w1 then MISSED w2 wedges
+   -- on w3 (drop:chain-break) -- but a full-log replay recovers it. Replayed w1
+   -- drops (already have it), w2 lands on head1, w3 on head2: head reaches head3.
+   -- This pins the recovery logic heNetRequestSync/heNetReplayLogTo rely on.
+   put heEnvContentLine(kKatTableHex, 0, tHostPubHex, "roster", tRoster) into tContent
+   put heWireBuild(tContent, tSec, 3, tHead2, tSec) into tWire3
+   put heChainNextHex(tWire3) into tHead3
+   put tHead1 into tClientHead
+   -- w3 arrives with w2 still missing -> chain break, head does not move
+   heTAssert "resync: gapped client drops the ahead-of-gap wire", \
+         heEnvVerify(tWire3, tHostPubHex, tHostPubHex, tClientHead), "drop:chain-break"
+   -- host replays the whole log; step the client head exactly as ingest would
+   put heEnvVerify(tWire1, tHostPubHex, tHostPubHex, tClientHead) into tVerdict
+   heTAssert "resync: replayed already-seen wire drops cleanly", tVerdict, "drop:chain-break"
+   put heEnvVerify(tWire2, tHostPubHex, tHostPubHex, tClientHead) into tVerdict
+   if tVerdict is "ok" then
+      put heChainNextHex(tWire2) into tClientHead
+   end if
+   heTAssert "resync: missing wire now applies", tVerdict, "ok"
+   put heEnvVerify(tWire3, tHostPubHex, tHostPubHex, tClientHead) into tVerdict
+   if tVerdict is "ok" then
+      put heChainNextHex(tWire3) into tClientHead
+   end if
+   heTAssert "resync: client recovers to the current chain head", tClientHead, tHead3
 end heTestLobbyRun
 
 command heTestCryptoRun
