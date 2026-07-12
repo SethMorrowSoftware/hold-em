@@ -283,6 +283,17 @@ def settle_hash(deltas_csv, chain_head):
     return H(b"HOLDEM-SETL-v1|" + deltas_csv.encode("utf-8") + b"|" + chain_head)
 
 
+def admit_token(table_hex, id_seed):
+    """Signed table-admission claim (spec 5): sign over
+    "HOLDEM-SESS-v1|<tableHex>|<pubHex>", framed as pubHex TAB sigHex. Sent in
+    btRp1SetToken so peers can drop strangers at handshake before any game
+    message. Returns (token_line, sig_hex)."""
+    pub_hex = ed_publickey(id_seed).hex()
+    msg = ("HOLDEM-SESS-v1|" + table_hex + "|" + pub_hex).encode("utf-8")
+    sig_hex = ed_sign(msg, id_seed).hex()
+    return pub_hex + "\t" + sig_hex, sig_hex
+
+
 # --------------------------------------------------------------------------
 # Fixtures: everything derived deterministically from tagged strings, so the
 # whole KAT is reproducible from this file alone.
@@ -349,6 +360,7 @@ def compute_all():
     out["env0_wire"] = wires[0]
     out["chain_heads"] = heads
     out["settle_hash"] = settle_hash("1:-4,2:8,3:-4", prev).hex()
+    _, out["admit_sig"] = admit_token(TABLE.hex(), ID_SEEDS[0])
     return out
 
 
@@ -359,6 +371,7 @@ def compute_all():
 # --------------------------------------------------------------------------
 
 PINNED = {
+ "admit_sig": "9bed66e2d5331ccbbfb52b5a37c400b1ca117ee7f1e82f1464287a62119edac02bede68ff5cf2e13b6d3718ceadcb13ff6eccdda4093ff98d386a12fd0c7ac0d",
  "burns": "Jd,9d,3d",
  "chain_heads": [
   "a60914c4c335f520aaef3b3a5dace3f9dafc1ab4a26f7e65dde2e880d51ead02",
@@ -442,6 +455,7 @@ def main():
         print('constant kKatEnv0SenderSig = "%s"' % got["env0_sender_sig"])
         print('constant kKatChainHead6 = "%s"' % got["chain_heads"][5])
         print('constant kKatSettleHash = "%s"' % got["settle_hash"])
+        print('constant kKatAdmitSig = "%s"' % got["admit_sig"])
         return 0
 
     got = compute_all()

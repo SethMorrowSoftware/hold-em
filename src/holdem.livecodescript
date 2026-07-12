@@ -57,7 +57,7 @@ needs an OXT pass.
 --------------------------------------------------------------------------
 
 constant kHeVersion = "0.4.0"
-constant kHeHarnessV = "5"
+constant kHeHarnessV = "6"
 constant kUIVersion = "3"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -146,6 +146,8 @@ end openStack
 on closeStack
    local tMsgLine
    put false into gHudTickOn
+   -- H1: never leave a TorrentXT session running after close
+   heNetStop
    -- cancel only our own timers; pendingMessages lines are id,time,name,target
    -- (gotcha 5: set the delimiter before parsing -- closeStack inherits it)
    set the itemDelimiter to comma
@@ -599,6 +601,307 @@ function heAuditDeal pTableData, pHandNum, pSeedsHexA, pCommitsA, pCount, pDealA
    end if
    return "pass"
 end heAuditDeal
+
+--------------------------------------------------------------------------
+-- Online transport (Phase 2a/2b, spec 3/4/5/10). Peers meet on the DHT via
+-- a phantom swarm keyed by the table code, talk over rp1, and route every
+-- game message through the host (a star topology, spec 4): a player signs a
+-- content line and sends it to the host; the host assigns seq + prev,
+-- countersigns, and rebroadcasts the sequenced wire; everyone verifies-or-
+-- drops and folds it. The admission-token, envelope, and fold logic are pure
+-- and KAT-pinned; the bt*/session/rp1 calls are seams that NEED AN OXT PASS.
+--
+-- gGame online keys: online session isHost tableIdHex infohashHex idPubHex
+-- idSecData boxPubData boxSecData seqCounter chainHeadHex hostPubHex, plus
+-- arrays peerPubA[peer]->pubHex, peerByPub[pubHex]->peer, admittedA[pubHex].
+--------------------------------------------------------------------------
+
+function heIdentitySeedHex
+   -- persistent identity seed (32 bytes, hex), generated once and stored in a
+   -- stack custom property; long-term keys only ever sign (spec 5)
+   local tSeedHex
+   put the uHeIdentitySeed of this stack into tSeedHex
+   if the number of chars of tSeedHex is not 64 then
+      if heHasSodium() then
+         put heBin2HexS(sxRandomBytes(32)) into tSeedHex
+      else
+         put heHexId(64) into tSeedHex
+      end if
+      set the uHeIdentitySeed of this stack to tSeedHex
+   end if
+   return tSeedHex
+end heIdentitySeedHex
+
+command heIdentitySetup
+   -- derive and cache the long-term ed25519 identity and a fresh per-table
+   -- X25519 session box key (private hole-card lanes seal to the box key)
+   local tSeedData, tPub, tSec, tBoxPub, tBoxSec
+   put heHex2BinD(heIdentitySeedHex()) into tSeedData
+   sxSignKeypairFromSeed tSeedData, tPub, tSec
+   put heBin2HexS(tPub) into gGame["idPubHex"]
+   put tSec into gGame["idSecData"]
+   put heFingerprintOf(tPub) into gGame["idFingerprint"]
+   sxBoxKeypairFromSeed heHash32(textEncode(kHeDomainSess, "utf-8") & tSeedData), tBoxPub, tBoxSec
+   put tBoxPub into gGame["boxPubData"]
+   put tBoxSec into gGame["boxSecData"]
+end heIdentitySetup
+
+function heAdmitTokenData pTableHex, pPubHex, pSecData
+   -- signed admission claim (spec 5): sign over
+   -- "HOLDEM-SESS-v1|<table>|<pub>", framed pubHex TAB sigHex, published in
+   -- btRp1SetToken so peers drop strangers at handshake before any game message
+   local tSigHex
+   put heBin2HexS(heSignDetachedD(textEncode(kHeDomainSess & pTableHex & "|" & pPubHex, "utf-8"), pSecData)) into tSigHex
+   return textEncode(pPubHex & tab & tSigHex, "utf-8")
+end heAdmitTokenData
+
+function heAdmitTokenVerify pTokenData, pTableHex
+   -- returns the admitted pubHex if the token is well-formed and its signature
+   -- verifies, else "" (the peer is a stranger and is ignored)
+   local tTok, tPubHex, tSigHex
+   put textDecode(pTokenData, "utf-8") into tTok
+   set the itemDelimiter to tab
+   put item 1 of tTok into tPubHex
+   put item 2 of tTok into tSigHex
+   if the number of chars of tPubHex is not 64 then
+      return ""
+   end if
+   if heVerifyDetached(heHex2BinD(tSigHex), \
+         textEncode(kHeDomainSess & pTableHex & "|" & tPubHex, "utf-8"), heHex2BinD(tPubHex)) then
+      return tPubHex
+   end if
+   return ""
+end heAdmitTokenVerify
+
+command heNetStart
+   -- start THE TorrentXT session, enable rp1, publish our admission token,
+   -- and arm the poll drain. NEEDS AN OXT PASS. Requires tableIdHex + identity
+   -- already set (heTableCreate/heTableJoin do that first).
+   local tSession
+   if gGame["online"] is "true" then
+      exit heNetStart
+   end if
+   put btStartSession() into tSession
+   if tSession is 0 or tSession is empty then
+      heUISetStatus "Network start failed: " & btLastError()
+      exit heNetStart
+   end if
+   put tSession into gGame["session"]
+   btSetBool tSession, "enable_dht", true
+   btRp1Enable tSession
+   btRp1SetToken tSession, heAdmitTokenData(gGame["tableIdHex"], gGame["idPubHex"], gGame["idSecData"])
+   put "true" into gGame["online"]
+   send "heNetPollTick" to me in 250 milliseconds
+end heNetStart
+
+command heNetStop
+   if gGame["online"] is not "true" then
+      exit heNetStop
+   end if
+   put "false" into gGame["online"]
+   btStopSession gGame["session"]
+end heNetStop
+
+command heNetJoinSwarm pIsHost
+   -- add the phantom swarm on the table's rendezvous id, then announce (host)
+   -- or discover (player) on the DHT (spec 10). The DHT carries zero game data.
+   local tSession
+   put gGame["session"] into tSession
+   get btAddInfohash(tSession, gGame["infohashHex"], heTempPath())
+   if pIsHost then
+      btDhtAnnounce tSession, gGame["infohashHex"], 0
+   else
+      btDhtGetPeers tSession, gGame["infohashHex"]
+   end if
+end heNetJoinSwarm
+
+function heTableInfohash pTableHex
+   -- the DHT rendezvous id is the first 40 hex (20 bytes) of H(tableId) (spec 10)
+   return char 1 to 40 of heHashHex(heHex2BinD(pTableHex))
+end heTableInfohash
+
+command heTableCreate
+   -- become the host of a fresh table; the 64-hex table code IS the invite
+   heIdentitySetup
+   if heHasSodium() then
+      put heBin2HexS(sxRandomBytes(32)) into gGame["tableIdHex"]
+   else
+      put heHexId(64) into gGame["tableIdHex"]
+   end if
+   put heTableInfohash(gGame["tableIdHex"]) into gGame["infohashHex"]
+   put "true" into gGame["isHost"]
+   put gGame["idPubHex"] into gGame["hostPubHex"]
+   put 0 into gGame["seqCounter"]
+   put kHeGenesisPrev into gGame["chainHeadHex"]
+   put empty into gGame["peerPubA"]
+   put empty into gGame["admittedA"]
+   heNetStart
+   heNetJoinSwarm true
+   heUISetStatus "Table created. Invite code: " & gGame["tableIdHex"]
+end heTableCreate
+
+command heTableJoin pCodeTxt
+   -- join an existing table from its invite code
+   local tCode
+   put word 1 of pCodeTxt into tCode
+   if the number of chars of tCode is not 64 then
+      heUISetStatus "Invite code must be 64 hex characters."
+      exit heTableJoin
+   end if
+   heIdentitySetup
+   put tCode into gGame["tableIdHex"]
+   put heTableInfohash(tCode) into gGame["infohashHex"]
+   put "false" into gGame["isHost"]
+   put empty into gGame["hostPubHex"]
+   put kHeGenesisPrev into gGame["chainHeadHex"]
+   put empty into gGame["peerPubA"]
+   put empty into gGame["admittedA"]
+   heNetStart
+   heNetJoinSwarm false
+   heUISetStatus "Joining table " & char 1 to 12 of tCode & "..."
+end heTableJoin
+
+on heNetPollTick
+   -- one poll drain per tick (H2): rp1 events for gameplay, plus btPoll to
+   -- keep the engine's own event queue clear. Never per-frame.
+   local tEvents, tEv
+   if gGame["online"] is not "true" then
+      exit heNetPollTick
+   end if
+   put btRp1Poll(gGame["session"]) into tEvents
+   repeat for each element tEv in tEvents
+      heNetOnRp1 tEv
+   end repeat
+   get btPoll(gGame["session"])
+   send "heNetPollTick" to me in 250 milliseconds
+end heNetPollTick
+
+command heNetOnRp1 pEvA
+   -- dispatch one drained rp1 event (an array with name/peer/payload/token)
+   switch pEvA["name"]
+      case "rp1Handshake"
+         heNetOnHandshake pEvA["peer"], pEvA["token"]
+         break
+      case "rp1Message"
+         heNetOnMessage pEvA["peer"], pEvA["payload"]
+         break
+   end switch
+end heNetOnRp1
+
+command heNetOnHandshake pPeer, pTokenData
+   -- admit-or-drop (spec 5): a peer whose token does not verify against this
+   -- table is ignored, before any game message is accepted from it
+   local tPubHex
+   put heAdmitTokenVerify(pTokenData, gGame["tableIdHex"]) into tPubHex
+   if tPubHex is empty then
+      exit heNetOnHandshake
+   end if
+   put tPubHex into gGame["peerPubA"][pPeer]
+   put pPeer into gGame["peerByPub"][tPubHex]
+   put "true" into gGame["admittedA"][tPubHex]
+   -- a joining player connects to the announcing host first; adopt it as the
+   -- host so its countersignatures can be verified (real host election, incl.
+   -- host loss, is spec 9 / the 2e increment)
+   if gGame["isHost"] is not "true" and gGame["hostPubHex"] is empty then
+      put tPubHex into gGame["hostPubHex"]
+   end if
+end heNetOnHandshake
+
+command heNetOnMessage pPeer, pPayloadData
+   -- payload kinds (tab-framed): "c" = a player's signed content line to the
+   -- host; "w" = a host-relayed sequenced wire to everyone. Verify-or-drop.
+   local tPayload, tKind, tRest
+   put textDecode(pPayloadData, "utf-8") into tPayload
+   set the itemDelimiter to tab
+   put item 1 of tPayload into tKind
+   put item 2 to -1 of tPayload into tRest
+   switch tKind
+      case "c"
+         if gGame["isHost"] is "true" then
+            heHostRelay pPeer, tRest
+         end if
+         break
+      case "w"
+         heNetIngestWire tRest
+         break
+   end switch
+end heNetOnMessage
+
+command heHostRelay pPeer, pContentAndSig
+   -- host path: take a player's (contentLine TAB senderSig), assign seq + prev,
+   -- countersign, advance the chain, and broadcast the sequenced wire to all.
+   -- The content's own sender signature is checked before it is relayed.
+   local tContent, tSenderSig, tSaved, tFromHex, tEnvLine, tHostSig, tWire
+   put the itemDelimiter into tSaved
+   set the itemDelimiter to tab
+   -- contentLine is items 1..6, senderSig is item 7 of pContentAndSig
+   put item 1 to 6 of pContentAndSig into tContent
+   put item 7 of pContentAndSig into tSenderSig
+   put item 4 of tContent into tFromHex
+   set the itemDelimiter to tSaved
+   -- verify the sender actually signed this content (host cannot forge content)
+   if not heVerifyDetached(heHex2BinD(tSenderSig), textEncode(tContent, "utf-8"), heHex2BinD(tFromHex)) then
+      exit heHostRelay
+   end if
+   if gGame["admittedA"][tFromHex] is not "true" then
+      exit heHostRelay
+   end if
+   add 1 to gGame["seqCounter"]
+   put tContent & tab & tSenderSig & tab & gGame["seqCounter"] & tab & gGame["chainHeadHex"] into tEnvLine
+   put heBin2HexS(heSignDetachedD(textEncode(tEnvLine, "utf-8"), gGame["idSecData"])) into tHostSig
+   put tEnvLine & tab & tHostSig into tWire
+   heNetBroadcast "w" & tab & tWire
+   heNetIngestWire tWire
+end heHostRelay
+
+command heNetIngestWire pWire
+   -- everyone's inbound path: verify-or-drop against the host key and local
+   -- chain head, then advance the chain and fold the message (spec 6/8).
+   local tVerdict, tA
+   put heEnvVerify(pWire, empty, gGame["hostPubHex"], gGame["chainHeadHex"]) into tVerdict
+   if tVerdict is not "ok" then
+      -- drop and log; a bad/replayed/reordered message is not an exception
+      put tVerdict && char 1 to 24 of pWire & return after gGame["netLog"]
+      exit heNetIngestWire
+   end if
+   put heChainNextHex(pWire) into gGame["chainHeadHex"]
+   put heEnvWireParse(pWire) into tA
+   put pWire & return after gGame["log"]
+   -- the folded transcript drives the betting engine / deal exactly as
+   -- hotseat does (the Phase 2 seam: same engine, different message source)
+end heNetIngestWire
+
+command heNetSendAction pTypeTxt, pBodyTxt
+   -- a player emits a signed content line to the host (or, if we are the host,
+   -- straight into the relay). The host sequences and countersigns it.
+   local tContent, tSenderSig, tPacket
+   put heEnvContentLine(gGame["tableIdHex"], gGame["handNum"], gGame["idPubHex"], pTypeTxt, pBodyTxt) into tContent
+   put heEnvSenderSigHex(tContent, gGame["idSecData"]) into tSenderSig
+   put tContent & tab & tSenderSig into tPacket
+   if gGame["isHost"] is "true" then
+      heHostRelay 0, tPacket
+   else
+      heNetSendToHost "c" & tab & tPacket
+   end if
+end heNetSendAction
+
+command heNetSendToHost pPayloadTxt
+   local tHostPeer
+   put gGame["peerByPub"][gGame["hostPubHex"]] into tHostPeer
+   if tHostPeer is empty then
+      exit heNetSendToHost
+   end if
+   get btRp1Send(gGame["session"], tHostPeer, textEncode(pPayloadTxt, "utf-8"))
+end heNetSendToHost
+
+command heNetBroadcast pPayloadTxt
+   -- host sends to every admitted peer (star topology, spec 4)
+   local tPeer, tData
+   put textEncode(pPayloadTxt, "utf-8") into tData
+   repeat for each key tPeer in gGame["peerPubA"]
+      get btRp1Send(gGame["session"], tPeer, tData)
+   end repeat
+end heNetBroadcast
 
 --------------------------------------------------------------------------
 -- small pure utilities
@@ -2653,6 +2956,7 @@ constant kKatEnv0ContentHex = "3109653532363735363530643761643438633731323931383
 constant kKatEnv0SenderSig = "c1d5f49bcc0fb8418830f63cc8be9c6bf7e5fd11a77807af38e672aa7284bba9c9cd58d73976888055851d034d440ab504cd0c9ab984f7df368a5f94225b310b"
 constant kKatChainHead6 = "62fcd52b3757f590c33bede7330620853074c1e5c153549244a8dac7287e3778"
 constant kKatSettleHash = "68095dcf5a74fac1e1340a1073a466dcf117024257f5c265de21698257b34b6f"
+constant kKatAdmitSig = "9bed66e2d5331ccbbfb52b5a37c400b1ca117ee7f1e82f1464287a62119edac02bede68ff5cf2e13b6d3718ceadcb13ff6eccdda4093ff98d386a12fd0c7ac0d"
 
 command heRunSelftest
    put empty into gRpt
@@ -2818,6 +3122,17 @@ command heTestCryptoRun
          heEnvVerify(tWire, heBin2HexS(tHostPub), heBin2HexS(tPub), kHeGenesisPrev), "drop:unknown-from"
    heTAssert "crypto: verify drops a chain break", \
          heEnvVerify(tWire, heBin2HexS(tPub), heBin2HexS(tPub), kKatChainHead6), "drop:chain-break"
+
+   -- admission token (spec 5): signature pinned, and the verify roundtrip
+   -- returns the admitted pubkey for a good token, "" for a tampered one
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tPub, tSec
+   heTAssert "admit: token signature", \
+         heBin2HexS(heSignDetachedD(textEncode(kHeDomainSess & kKatTableHex & "|" & kKatIdPub1, "utf-8"), tSec)), \
+         kKatAdmitSig
+   heTAssert "admit: verify accepts a good token", \
+         heAdmitTokenVerify(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec), kKatTableHex), kKatIdPub1
+   heTAssert "admit: verify rejects a wrong-table token", \
+         heAdmitTokenVerify(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec), kKatChainHead6), ""
 end heTestCryptoRun
 
 function heTIdxOf pNamesTxt
