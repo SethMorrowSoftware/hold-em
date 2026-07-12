@@ -69,8 +69,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.0"
-constant kHeHarnessV = "7"
+constant kHeVersion = "0.5.1"
+constant kHeHarnessV = "8"
 constant kUIVersion = "4"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -3333,6 +3333,21 @@ constant kKatSeed3 = "e848bf12b0bf2708b52c20053ef674e603e7f3a3c7092533dc92e1b082
 constant kKatCommit1 = "7623721b5a6372fa974ed62f558fce9992259eb2a834ece7bcea66bce970c0e3"
 constant kKatCommit2 = "83726c97707155ba2e81f0e5f673dd9e10dfde06e1c8f643bdd8539403aace51"
 constant kKatCommit3 = "5f043c34bfb7a626581eb8653c88503a5a8524c9b47bdc2e09e37780005e0308"
+-- keyed-stream deal vectors (spec 7.1) -- these were dropped from the block
+-- when the lobby constants were added, which silently broke heTestDealRun
+-- (undeclared names evaluate to their own text, then heHex2BinD throws). The
+-- full set is emitted by tools/protocol-kat.py --gen-xtalk; keep it complete.
+constant kKatSeedsXor = "73e2b09387940cf29398389f4d4fef74987ffac3c369b68cb522ded044cb00b8"
+constant kKatStreamKey = "e4d91a49ee23982afb804fd386cbd3d2df6370ae0a743b0f461325b94818e40f"
+constant kKatDeck = "Ks,4d,3c,Tc,9h,8c,Jd,4h,2c,6d,9d,Th,3d,9s,5s,3h,Qc,2h,9c,8h,7c,Js,7s,2d,6s,Ac,8s,As,Kh,2s,Ah,5h,Jh,Jc,4c,7h,6c,8d,Ad,Kd,Qs,Kc,6h,Qd,7d,5d,Qh,Ts,5c,3s,4s,Td"
+constant kKatHole1 = "3c,8c"
+constant kKatHole2 = "Ks,Tc"
+constant kKatHole3 = "4d,9h"
+constant kKatFlop = "4h,2c,6d"
+constant kKatTurn = "Th"
+constant kKatRiver = "9s"
+constant kKatSynthStream = "8eaba859db2f1a2a3bce5e381fc1afa1339dc9b7a8a1bbc550277e756dabdffcf7390d23167268d1523ac24f71f476cd47cd1fcd31cfa7ec51ef45c7853978859f7a10230ff86f287f1ead8ec6ac797f6f3d3a1eb75bcb435b5f491b81077775b47c0dcf3cc1d1c8f329c4e1cdae9c6e21f3825454f5c04a21fde75572ef04e25e36672b9e4ce78b4333da7090746ff00b8e32e7ad161f033523cb6f5ba2b10af1a1ebf6c815e54e4fe5efed623198c302732bf6e40ed8856a89e15d78f564614531b8f684aa727e51ea968727a22eb6e14bd588d502b2637bd73d59a8518eaf7a2311d555dd86147e83af7f1e9ef7c9baf253b851bbb48abecdea0b27f90761a67fb810022c6eae480866f19839deb884a4ec819be41bcb605df7dd1ee2efcdaab49eef76d4a98b6be858d3324ac616f2b1f58fc9a1749a6164e2a0e276d62d1815d6a042c78b82f3b0d1ff78852cf8778ba3e127411f0121775056de9e5f8e4253f98b54e627e74cf8c2a38c83edd7d6272de4eb6bd645ebcae1f1701bda866beadc5968e757a8f902e2be46933346dcb794676fd609e14f67d20432796eb492a0c86910f10e51c5c02e5a9fa95f407283b3d0abfb8357cc5f94fe4416b5984eb07e046975e1c15edece5c9e80fd6de3d43d6831a310fe9d74e0c5bb9e438da44bffd728a284795046da833ffb8fdd16128b7fdee7ef76e434e035c7471d52"
+constant kKatSynthDeck = "Ac,Kc,3d,5h,Kh,5d,Qc,3h,2h,5c,8c,4h,4d,Tc,7h,Qs,6c,Ts,6h,7d,Th,6s,Kd,3c,Jc,9s,4c,Ah,5s,2d,8s,As,2s,Ad,9d,Qh,8d,Jh,Qd,Jd,2c,6d,7s,Ks,7c,Js,8h,3s,4s,9h,9c,Td"
 constant kKatIdSeed1 = "629a089485b96c24fef651012c8deae57aa438a7a11c81f3e6a99b5e22f83b38"
 constant kKatIdSeed2 = "fa645b9f3778a3b162514e3a00436568aef46b726e10ef563c94e73b2c2cb448"
 constant kKatIdSeed3 = "7833fb1675dbb196e2222ad6f93ff30aacd313faf7a7818078e30a47f6890083"
@@ -3886,6 +3901,15 @@ command heTestShuffleRun
    heTAssert "deal: flop is deck 8-10 after two rounds + burn", \
          heTNamesOf(tDealA["flopList"]), \
          (heCardName(item 8 of tDeckList)) & comma & (heCardName(item 9 of tDeckList)) & comma & (heCardName(item 10 of tDeckList))
+
+   -- keyed-stream shuffle CORE, cross-checked WITHOUT SodiumXT: feed the fixed
+   -- synthetic hex stream (tools/protocol-kat.py SYNTH_STREAM) straight through
+   -- the rejection-sampling draw + Fisher-Yates and compare to the pinned deck.
+   -- This pins heDrawUniform (modulo-bias/off-by-one) + heShuffleFromStreamHex
+   -- on every engine, even one with no crypto installed (that is exactly why
+   -- SYNTH_STREAM exists -- it needs no hashing).
+   heTAssert "shuffle: synthetic keyed-stream deck (no crypto)", \
+         heTNamesOf(heShuffleFromStreamHex(kKatSynthStream)), kKatSynthDeck
 end heTestShuffleRun
 
 function heTKatLog pTamper

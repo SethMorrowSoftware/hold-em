@@ -30,6 +30,12 @@ It checks every target for:
      engine throws a double/binary conversion error at runtime (found on
      holde-em's first OXT pass, in the seed-XOR path). Copy the element
      into a plain local, then chunk the local.
+  6. Bitwise operators (``bitXor`` etc.) -- throw double/binary on OXT (H7).
+  7. Declared locals/params whose name equals an engine token (``tAb`` == the
+     ``tab`` constant, gotcha 2).
+  8. ``k``-prefixed constant names used but never declared -- OXT resolves the
+     bare word to its own text and it throws downstream (this silently broke
+     heTestDealRun when the deal constants were dropped from the block).
 
 Usage::
 
@@ -71,6 +77,21 @@ def strip_comment(line):
         else:
             out.append(c)
         i += 1
+    return "".join(out)
+
+
+def strip_strings(code):
+    """Remove double-quoted string literal *contents* (keep the quotes) so a
+    token scan never matches inside a string. LiveCode strings have no escapes,
+    so a double quote always toggles in/out."""
+    out = []
+    in_string = False
+    for c in code:
+        if c == '"':
+            in_string = not in_string
+            out.append(c)
+        elif not in_string:
+            out.append(c)
     return "".join(out)
 
 
@@ -253,6 +274,42 @@ def check_bitwise(text):
     return errors
 
 
+K_CONST_DECL = re.compile(r"^\s*constant\s+(k[A-Za-z0-9]+)\s*=")
+K_CONST_USE = re.compile(r"\b(k[A-Z][A-Za-z0-9]*)\b")
+
+
+def check_undeclared_kconsts(text):
+    """Flag any k-prefixed constant NAME that is used but never declared with
+    ``constant kName = ...`` in the same file. The ``k`` prefix is the family's
+    reserved marker for a constant (CLAUDE.md gotcha 3), so a used ``k...`` name
+    with no declaration is a paste/typo bug: OXT resolves the bare word to its
+    own text (or errors under explicitVariables), which then flows into a hash
+    or hex decode and throws at runtime -- invisible to every other gate. This
+    exact defect silently broke heTestDealRun when the deal constants were
+    dropped from the block (nine kKat... names used, none declared). String
+    literals are stripped first so a k-word inside a message never false-flags."""
+    declared = set()
+    for _, code in logical_lines(text):
+        m = K_CONST_DECL.match(code)
+        if m:
+            declared.add(m.group(1))
+    errors = []
+    seen = set()
+    for lineno, code in logical_lines(text):
+        bare = strip_strings(code)
+        if K_CONST_DECL.match(bare):
+            continue  # the declaration line itself
+        for name in K_CONST_USE.findall(bare):
+            if name not in declared and name not in seen:
+                seen.add(name)
+                errors.append(
+                    f"  L{lineno}: constant '{name}' is used but never declared "
+                    "(a 'k' name with no 'constant ... =' -- OXT reads it as its own "
+                    "text and it throws downstream; complete the --gen-xtalk paste)"
+                )
+    return errors
+
+
 def check_dangling_else(text):
     """A single-line ``if … then <stmt>`` directly followed by a BARE ``else``
     line. LiveCode/OXT binds that else to the single-line if (the dangling-else
@@ -295,6 +352,7 @@ def main():
         problems += check_chunk_of_element(text)
         problems += check_bitwise(text)
         problems += check_reserved_names(text)
+        problems += check_undeclared_kconsts(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")
