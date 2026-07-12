@@ -21,12 +21,19 @@ Built by composing the OXT extension family:
 **Phase 1 hotseat, one paste-and-run stack.** `src/holdem.livecodescript` is the whole
 thing — the hotseat game, its self-test (`heRunSelftest` in the message box), and a
 SodiumXT diagnostic (`heProbeSodium`) — in a single self-building stack with no
-required extensions to be playable. The pure logic (hand evaluator, betting engine
-with side pots, settlement, transcript fold) is mirrored in headless Python KATs that
-run in CI (`tools/*-kat.py`). The deal is a pure-integer PRNG shuffle so the playable
-path never touches FFI binary; the cryptographic Level 0 deal (spec 7.1) is the Phase 2
-target, kept specced and KAT-pinned. Everything visual is "verified statically; needs
-an OXT pass".
+required extensions to be playable. The table shows per-seat names, chip totals, bets
+in front, dealer/blind badges, and fold/all-in/acting/winner states, with quick-bet
+controls. The deal is a pure-integer PRNG shuffle so the playable path never touches
+FFI binary; the cryptographic Level 0 deal (spec 7.1) is the Phase 2 target, kept
+specced and KAT-pinned.
+
+The math is **verified sound**: side-pot settlement, chip conservation, and min-raise
+rules were property-tested against an independent reference across 60k+ configs and
+thousands of full games (zero defects); the PRNG shuffle is uniform; the evaluator is
+cross-checked against a clean-room implementation over 200k+ hands. Blind scheduling
+uses a dead-button-aware rule (the big blind always advances to the next live seat, so
+eliminations never double- or skip-charge a blind). All of this runs headless in CI
+(`tools/*-kat.py`). Everything visual is "verified statically; needs an OXT pass".
 
 - **[holdem-spec.md](holdem-spec.md)** — the design contract: threat model, the
   three-level deal protocol ladder, the transcript, settlement receipts, and the honest

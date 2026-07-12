@@ -473,7 +473,65 @@ def case_check_around():
     check("out-of-turn check rejected", bad["err"], "act-out-of-turn")
 
 
+# --------------------------------------------------------------------------
+# Dead-button-aware blind schedule (mirror of heScheduleButton). The BB
+# advances to the next live seat each hand, so eliminations never double- or
+# skip-charge a blind. SB = prev live before BB; button = prev live before SB
+# (heads-up: button IS the SB). Pins the audit's elimination scenarios.
+# --------------------------------------------------------------------------
+
+def _next_live_after_pos(live, pos):
+    for s in live:
+        if s > pos:
+            return s
+    return live[0]
+
+
+def _prev_live_before_pos(live, pos):
+    prev = live[-1]
+    for s in live:
+        if s < pos:
+            prev = s
+    return prev
+
+
+def schedule_button(live, last_bb):
+    if last_bb == 0:
+        return live[0]
+    bb = _next_live_after_pos(live, last_bb)
+    sb = _prev_live_before_pos(live, bb)
+    if len(live) == 2:
+        return sb
+    return _prev_live_before_pos(live, sb)
+
+
+def case_blind_schedule():
+    # button and BB each advance exactly one seat/hand with no busts
+    seq = []
+    lb = 0
+    for _ in range(4):
+        btn = schedule_button([1, 2, 3], lb)
+        st = new_hand(1, 2, {1: 100, 2: 100, 3: 100}, [1, 2, 3], btn)
+        seq.append((btn, st["sbSeat"], st["bbSeat"]))
+        lb = st["bbSeat"]
+    check("schedule: 3-handed no-bust button/SB/BB rotation", seq,
+          [(1, 2, 3), (2, 3, 1), (3, 1, 2), (1, 2, 3)])
+
+    # seat 1 busts after button=1/BB=3 -> heads-up; seat 3 must NOT post BB twice
+    btn = schedule_button([2, 3], 3)
+    st = new_hand(1, 2, {2: 100, 3: 100}, [2, 3], btn)
+    check("schedule: bust-to-HU no double BB (button/SB/BB)",
+          (btn, st["sbSeat"], st["bbSeat"]), (3, 3, 2))
+
+    # seats 2,3 bust after button=1/BB=3 -> BB advances to the next survivor (4)
+    btn = schedule_button([1, 4, 5, 6], 3)
+    st = new_hand(1, 2, {1: 100, 4: 100, 5: 100, 6: 100}, [1, 4, 5, 6], btn)
+    check("schedule: double-bust BB advances to survivor",
+          (btn, st["sbSeat"], st["bbSeat"]), (6, 1, 4))
+
+
 def main():
+    case_blind_schedule()
     case_min_raise()
     case_under_raise_no_reopen()
     case_three_way_side_pots()
