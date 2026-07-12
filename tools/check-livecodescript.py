@@ -188,6 +188,26 @@ def check_chunk_of_element(text):
     return errors
 
 
+BITWISE = re.compile(r"\b(bitXor|bitAnd|bitOr|bitNot)\b", re.IGNORECASE)
+
+
+def check_bitwise(text):
+    """Bitwise operators (``bitXor``/``bitAnd``/``bitOr``/``bitNot``) throw a
+    double/binary conversion error at runtime on this OXT engine (found the
+    hard way in the seed-XOR path). They are valid LiveCode syntax, so no
+    structural check sees them; the fix is pure integer arithmetic (see
+    ``heByteXor`` — div/mod/add only). Flag any use so it cannot slip back in."""
+    errors = []
+    for lineno, code in logical_lines(text):
+        m = BITWISE.search(code)
+        if m:
+            errors.append(
+                f"  L{lineno}: bitwise operator '{m.group(1)}' — throws double/binary on "
+                "OXT; use pure integer arithmetic (div/mod/add, e.g. heByteXor)"
+            )
+    return errors
+
+
 def check_dangling_else(text):
     """A single-line ``if … then <stmt>`` directly followed by a BARE ``else``
     line. LiveCode/OXT binds that else to the single-line if (the dangling-else
@@ -228,6 +248,7 @@ def main():
         problems += check_structure(text)
         problems += check_dangling_else(text)
         problems += check_chunk_of_element(text)
+        problems += check_bitwise(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")

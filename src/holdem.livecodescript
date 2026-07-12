@@ -56,7 +56,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.4.0"
+constant kHeVersion = "0.4.1"
 constant kHeHarnessV = "6"
 constant kUIVersion = "3"
 
@@ -460,15 +460,36 @@ end heEnvVerify
 -- (H6): raw Data appears only inside sxHash arguments. Seeds travel as hex.
 --------------------------------------------------------------------------
 
+function heByteXor pA, pB
+   -- XOR of two byte values (0..255) using ONLY integer arithmetic (div, mod,
+   -- add, multiply) -- no bitwise operator, so nothing can trip the engine's
+   -- double/binary conversion. Walks the 8 bits low to high.
+   local tR, tBitVal, tAb, tBb
+   put 0 into tR
+   put 1 into tBitVal
+   put pA into tAb
+   put pB into tBb
+   repeat 8 times
+      if (tAb mod 2) is not (tBb mod 2) then
+         add tBitVal to tR
+      end if
+      put tAb div 2 into tAb
+      put tBb div 2 into tBb
+      put tBitVal * 2 into tBitVal
+   end repeat
+   return tR
+end heByteXor
+
 function heXorSeedsHex pSeedsHexA, pCount
    -- XOR of pCount 32-byte seeds (each a 64-hex string), done in hex; returns hex
-   local tPairPos, tSeatPos, tAcc, tHexTxt, tOutHex, tPairHex
+   local tPairPos, tSeatPos, tAcc, tHexTxt, tOutHex, tPairHex, tByteVal
    put empty into tOutHex
    repeat with tPairPos = 1 to 63 step 2
       put 0 into tAcc
       repeat with tSeatPos = 1 to pCount
          put pSeedsHexA[tSeatPos] into tHexTxt
-         put bitXor(tAcc, baseConvert(char tPairPos to (tPairPos + 1) of tHexTxt, 16, 10)) into tAcc
+         put baseConvert(char tPairPos to (tPairPos + 1) of tHexTxt, 16, 10) into tByteVal
+         put heByteXor(tAcc, tByteVal) into tAcc
       end repeat
       put toLower(baseConvert(tAcc, 10, 16)) into tPairHex
       if the number of chars of tPairHex is 1 then

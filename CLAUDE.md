@@ -292,6 +292,12 @@ House additions for THIS repo (earned in the siblings, restated as law here):
   the sodium probe) and everything script-side chunks plain hex text; raw Data exists
   only in expressions passed straight into `sx*` calls. Seeds, the shuffle stream, and
   every transcript field follow this rule.
+- **H7. No bitwise operators.** `bitXor`/`bitAnd`/`bitOr`/`bitNot` throw the same
+  double/binary conversion error at runtime on this OXT engine (found v0.4.1, in the
+  seed-XOR path — `bitXor(acc, baseConvert(...))`). They are valid LiveCode syntax, so
+  no structural check sees them. Do every bit operation with **pure integer arithmetic**
+  (`div`, `mod`, `add`, `*`) — the repo carries `heByteXor` (an 8-iteration div/mod XOR)
+  for exactly this. The static gate flags any bitwise operator (check 6).
 
 ## The single-threaded performance playbook (condensed for a card game)
 
