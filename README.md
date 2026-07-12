@@ -18,14 +18,27 @@ Built by composing the OXT extension family:
 
 ## Status
 
-**Phase 1 hotseat, one paste-and-run stack.** `src/holdem.livecodescript` is the whole
-thing — the hotseat game, its self-test (`heRunSelftest` in the message box), and a
-SodiumXT diagnostic (`heProbeSodium`) — in a single self-building stack with no
-required extensions to be playable. The table shows per-seat names, chip totals, bets
-in front, dealer/blind badges, and fold/all-in/acting/winner states, with quick-bet
-controls. The deal is a pure-integer PRNG shuffle so the playable path never touches
-FFI binary; the cryptographic Level 0 deal (spec 7.1) is the Phase 2 target, kept
-specced and KAT-pinned.
+**Phase 2 online lobby + Phase 1 hotseat, one paste-and-run stack.**
+`src/holdem.livecodescript` is the whole thing — the hotseat game, the online lobby, its
+self-test (`heRunSelftest` in the message box), and SodiumXT/TorrentXT diagnostics
+(`heProbeSodium` / `heProbeTorrent`) — in a single self-building stack with no required
+extensions to be playable hotseat. The table shows per-seat names, chip totals, bets in
+front, dealer/blind badges, and fold/all-in/acting/winner states, with quick-bet
+controls. The deal is a pure-integer PRNG shuffle so the playable path never touches FFI
+binary; the cryptographic Level 0 deal (spec 7.1) is KAT-pinned and drives the online
+path.
+
+With **SodiumXT + TorrentXT** installed, the stack opens on an **online lobby**: Create a
+table (its 64-hex code is the invite) or Join one, and peers meet over the BitTorrent
+DHT. Every peer admits-or-drops others at handshake against a signed session token; the
+host catches each new joiner up by replaying the whole signed, hash-chained wire log from
+genesis (the spec 9 reconnect seam); and a signed `cfg` + `roster` presence pair
+propagates so every client verifies (or drops) it and the roster stays in agreement. The
+overlay shows the live peer roster and a feed of every verify/drop verdict. The presence
+wires are machine-pinned in `tools/protocol-kat.py` and re-checked on-engine by
+`heTestLobbyRun`; the transport itself is verified statically and needs an OXT pass (two
+machines, one code). Online betting/dealing orchestration builds on this confirmed
+transport next.
 
 The math is **verified sound**: side-pot settlement, chip conservation, and min-raise
 rules were property-tested against an independent reference across 60k+ configs and

@@ -295,6 +295,16 @@ def admit_token(table_hex, id_seed, role="host"):
     return pub_hex + "\t" + role + "\t" + sig_hex, sig_hex
 
 
+def roster_body(members):
+    """Canonical lobby-presence body (spec 9): each member rendered as
+    "pubHex:role", sorted ascending, joined by comma. The host re-signs and
+    broadcasts it whenever the peer set changes; every client sorts the same
+    way so the signed bytes are identical everywhere. The body is hex-encoded
+    into the envelope like any other, so its commas never reach the wire frame.
+    members: list of (pub_hex, role)."""
+    return ",".join(sorted(p + ":" + r for p, r in members))
+
+
 # --------------------------------------------------------------------------
 # Fixtures: everything derived deterministically from tagged strings, so the
 # whole KAT is reproducible from this file alone.
@@ -362,6 +372,22 @@ def compute_all():
     out["chain_heads"] = heads
     out["settle_hash"] = settle_hash("1:-4,2:8,3:-4", prev).hex()
     _, out["admit_sig"] = admit_token(TABLE.hex(), ID_SEEDS[0])
+
+    # Lobby presence + reconnect fixture (spec 9): the host (ID0) opens a table
+    # and signs a cfg (seq 1, from genesis); once a player (ID1) has joined the
+    # host signs a roster (seq 2). A late joiner replays both from genesis and
+    # advances its chain to lobby_head2. This pins the exact code path the
+    # online lobby uses -- envelope build, roster canonicalization, chain
+    # advance -- so heTestLobbyRun can machine-check it with no network.
+    lobby_members = [(out["id_pubs"][0], "host"), (out["id_pubs"][1], "player")]
+    out["roster_body"] = roster_body(lobby_members)
+    out["lobby_cfg_body"] = "v=1,level=0,sb=1,bb=2,seats=6,button=1"
+    lw1 = make_wire(1, TABLE, 0, ID_SEEDS[0], "cfg", out["lobby_cfg_body"],
+                    1, GENESIS, HOST_SEED)
+    lh1 = chain_next(lw1)
+    lw2 = make_wire(1, TABLE, 0, ID_SEEDS[0], "roster", out["roster_body"],
+                    2, lh1, HOST_SEED)
+    out["lobby_head2"] = chain_next(lw2).hex()
     return out
 
 
@@ -407,7 +433,10 @@ PINNED = {
   "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10",
   "ad1d6dbbd062cdacf356daf0834471b6246105b17e3b988dd5e7f0db45fb66a6"
  ],
+ "lobby_cfg_body": "v=1,level=0,sb=1,bb=2,seats=6,button=1",
+ "lobby_head2": "54c4df80d160eaaef52536a8ff6f2a7e09caccc629e1c467fe382eedc8a23509",
  "river": "9s",
+ "roster_body": "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10:player,b6ef1a19d789c27bea3f6c127db635929541f34907750ee12d0b715c010c7566:host",
  "seeds_xor": "73e2b09387940cf29398389f4d4fef74987ffac3c369b68cb522ded044cb00b8",
  "settle_hash": "68095dcf5a74fac1e1340a1073a466dcf117024257f5c265de21698257b34b6f",
  "stream_block0": "22a256dd9846bb3d40d24d3d5441cdf5415e9fb3532ba99f4f4812630941108d",
@@ -457,6 +486,10 @@ def main():
         print('constant kKatChainHead6 = "%s"' % got["chain_heads"][5])
         print('constant kKatSettleHash = "%s"' % got["settle_hash"])
         print('constant kKatAdmitSig = "%s"' % got["admit_sig"])
+        print('constant kKatIdPub2 = "%s"' % got["id_pubs"][1])
+        print('constant kKatLobbyCfgBody = "%s"' % got["lobby_cfg_body"])
+        print('constant kKatRosterBody = "%s"' % got["roster_body"])
+        print('constant kKatLobbyHead2 = "%s"' % got["lobby_head2"])
         return 0
 
     got = compute_all()

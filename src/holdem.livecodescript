@@ -6,6 +6,19 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.5.0 -- Phase 2e: the online LOBBY. Create or join a table over the DHT and
+watch the real transport work end to end -- peers admit-or-drop at handshake
+(signed session tokens), the host catches every new joiner up by replaying the
+whole signed wire log from genesis (spec 9 reconnect seam), and a signed,
+hash-chained cfg + roster presence pair propagates to everyone so each client
+verifies (or drops) it and the roster stays in agreement. The overlay shows the
+live peer roster and a network-activity feed of every verify/drop verdict. The
+new heTestLobbyRun section machine-checks the exact presence wires (canonical
+roster body, cfg+roster chain head, verify-or-drop, out-of-order chain break)
+against tools/protocol-kat.py with no network -- so CI pins the code path the
+transport carries. The lobby transport itself is verified statically and needs
+an OXT pass (two machines, one invite code).
+
 v0.4.0 -- Phase 2 (online) foundation. The sxHash mystery is resolved: it
 needs an OUTPUT-LENGTH argument, sxHash(data, 32) -- calling it with one arg
 was the throw that blocked every earlier crypto attempt. With that fixed the
@@ -56,9 +69,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.4.1"
-constant kHeHarnessV = "6"
-constant kUIVersion = "3"
+constant kHeVersion = "0.5.0"
+constant kHeHarnessV = "7"
+constant kUIVersion = "4"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -138,7 +151,9 @@ end preOpenStack
 on openStack
    heBuildTable
    heTableNew
-   heUISetStatus "Welcome to holde-em " & kHeVersion & ". Press Deal to start a hotseat hand."
+   -- open on the lobby so the first choice is host / join / hotseat
+   heLobbyShow
+   heUISetStatus "Create or join an online table, or press Leave to play hotseat."
    put true into gHudTickOn
    send "heHudTick" to me in kHeHudMs milliseconds
 end openStack
@@ -464,20 +479,21 @@ function heByteXor pA, pB
    -- XOR of two byte values (0..255) using ONLY integer arithmetic (div, mod,
    -- add, multiply) -- no bitwise operator, so nothing can trip the engine's
    -- double/binary conversion. Walks the 8 bits low to high.
-   local tR, tBitVal, tAb, tBb
-   put 0 into tR
+   -- (locals are tWorkA/tWorkB, NOT tAb -- "tAb" is the tab constant, gotcha 2.)
+   local tResult, tBitVal, tWorkA, tWorkB
+   put 0 into tResult
    put 1 into tBitVal
-   put pA into tAb
-   put pB into tBb
+   put pA into tWorkA
+   put pB into tWorkB
    repeat 8 times
-      if (tAb mod 2) is not (tBb mod 2) then
-         add tBitVal to tR
+      if (tWorkA mod 2) is not (tWorkB mod 2) then
+         add tBitVal to tResult
       end if
-      put tAb div 2 into tAb
-      put tBb div 2 into tBb
+      put tWorkA div 2 into tWorkA
+      put tWorkB div 2 into tWorkB
       put tBitVal * 2 into tBitVal
    end repeat
-   return tR
+   return tResult
 end heByteXor
 
 function heXorSeedsHex pSeedsHexA, pCount
@@ -709,6 +725,39 @@ function heAdmitTokenRole pTokenData
    return tRole
 end heAdmitTokenRole
 
+function heRosterBody pMembersList
+   -- canonical lobby-presence body (spec 9): each member as "pubHex:role",
+   -- sorted ascending, comma-joined -- the exact mirror of roster_body in
+   -- tools/protocol-kat.py. pMembersList is return-delimited "pubHex TAB role"
+   -- lines; sorting makes every peer sign/verify identical bytes. All chunks
+   -- are of plain locals (H6-safe); the body is hex-encoded into the envelope
+   -- so its commas never reach the tab-framed wire.
+   local tLine, tPubHex, tRoleTxt, tPairs, tSaved
+   put the itemDelimiter into tSaved
+   set the itemDelimiter to tab
+   put empty into tPairs
+   repeat for each line tLine in pMembersList
+      put item 1 of tLine into tPubHex
+      put item 2 of tLine into tRoleTxt
+      put tPubHex & ":" & tRoleTxt & return after tPairs
+   end repeat
+   set the itemDelimiter to tSaved
+   if tPairs is not empty then
+      delete char -1 of tPairs
+   end if
+   sort lines of tPairs
+   replace return with comma in tPairs
+   return tPairs
+end heRosterBody
+
+function heLobbyCfgBody
+   -- the table cfg the host signs into the transcript at create time; a clean,
+   -- canonical string (pinned as kKatLobbyCfgBody) so joiners verify it byte
+   -- for byte. Level 0 is the online deal ladder rung this build targets.
+   return "v=1,level=0,sb=" & gGame["sb"] & ",bb=" & gGame["bb"] \
+         & ",seats=" & kHeDefaultSeats & ",button=1"
+end heLobbyCfgBody
+
 command heNetStart
    -- start THE TorrentXT session, enable rp1, publish our admission token,
    -- and arm the poll drain. NEEDS AN OXT PASS. Requires tableIdHex + identity
@@ -767,7 +816,9 @@ function heTableInfohash pTableHex
 end heTableInfohash
 
 command heTableCreate
-   -- become the host of a fresh table; the 64-hex table code IS the invite
+   -- become the host of a fresh table; the 64-hex table code IS the invite.
+   -- tear down any prior session first so a re-create starts a clean swarm
+   heNetStop
    heIdentitySetup
    if heHasSodium() then
       put heBin2HexS(sxRandomBytes(32)) into gGame["tableIdHex"]
@@ -777,16 +828,24 @@ command heTableCreate
    put heTableInfohash(gGame["tableIdHex"]) into gGame["infohashHex"]
    put "true" into gGame["isHost"]
    put gGame["idPubHex"] into gGame["hostPubHex"]
+   put 0 into gGame["handNum"]
    put 0 into gGame["seqCounter"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
+   put empty into gGame["roleByPub"]
+   put empty into gGame["log"]
+   put empty into gGame["netLog"]
    -- the host must admit ITSELF so heHostRelay accepts the host's own actions
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
+   put "host" into gGame["roleByPub"][gGame["idPubHex"]]
    heNetStart
    heNetJoinSwarm true
-   heUISetStatus "Table created. Invite code: " & gGame["tableIdHex"]
+   -- seed the transcript with a signed table cfg (seq 1, from genesis); late
+   -- joiners replay it and verify the host's key before anything else
+   heNetSendAction "cfg", heLobbyCfgBody()
+   heUISetStatus "Table created. Share this invite code: " & gGame["tableIdHex"]
 end heTableCreate
 
 command heTableJoin pCodeTxt
@@ -797,18 +856,27 @@ command heTableJoin pCodeTxt
       heUISetStatus "Invite code must be 64 hex characters."
       exit heTableJoin
    end if
+   -- tear down any prior session first so a re-join starts clean
+   heNetStop
    heIdentitySetup
    put tCode into gGame["tableIdHex"]
    put heTableInfohash(tCode) into gGame["infohashHex"]
    put "false" into gGame["isHost"]
    put empty into gGame["hostPubHex"]
+   put 0 into gGame["handNum"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
+   put empty into gGame["roleByPub"]
+   put empty into gGame["log"]
+   put empty into gGame["netLog"]
+   -- admit ourselves as a player so the local roster shows our own seat
+   put "true" into gGame["admittedA"][gGame["idPubHex"]]
+   put "player" into gGame["roleByPub"][gGame["idPubHex"]]
    heNetStart
    heNetJoinSwarm false
-   heUISetStatus "Joining table " & char 1 to 12 of tCode & "..."
+   heUISetStatus "Joining table " & char 1 to 12 of tCode & "... waiting for the host."
 end heTableJoin
 
 on heNetPollTick
@@ -841,21 +909,36 @@ end heNetOnRp1
 command heNetOnHandshake pPeer, pTokenData
    -- admit-or-drop (spec 5): a peer whose token does not verify against this
    -- table is ignored, before any game message is accepted from it
-   local tPubHex
+   local tPubHex, tRoleTxt, tIsNew
    put heAdmitTokenVerify(pTokenData, gGame["tableIdHex"]) into tPubHex
    if tPubHex is empty then
+      put "drop   handshake from an unadmitted peer" & return after gGame["netLog"]
+      heLobbyRefresh
       exit heNetOnHandshake
    end if
+   put heAdmitTokenRole(pTokenData) into tRoleTxt
+   put (gGame["admittedA"][tPubHex] is not "true") into tIsNew
    put tPubHex into gGame["peerPubA"][pPeer]
    put pPeer into gGame["peerByPub"][tPubHex]
    put "true" into gGame["admittedA"][tPubHex]
+   put tRoleTxt into gGame["roleByPub"][tPubHex]
    -- adopt as host only a peer whose token DECLARES role "host" -- the phantom
    -- swarm connects players to each other too, so "first peer" is not the host
-   -- (full host election, incl. host loss, is spec 9 / the 2e increment)
+   -- (full host election, incl. host loss, is spec 9 / a later increment)
    if gGame["isHost"] is not "true" and gGame["hostPubHex"] is empty \
-         and heAdmitTokenRole(pTokenData) is "host" then
+         and tRoleTxt is "host" then
       put tPubHex into gGame["hostPubHex"]
    end if
+   if tIsNew then
+      put "+peer  " & char 1 to 12 of tPubHex & "  (" & tRoleTxt & ")" & return after gGame["netLog"]
+   end if
+   -- host: catch a new peer up on the whole transcript (spec 9 replay), then
+   -- re-sign and broadcast the roster so every client's presence agrees
+   if gGame["isHost"] is "true" and tIsNew then
+      heNetReplayLogTo pPeer
+      heHostEmitRoster
+   end if
+   heLobbyRefresh
 end heNetOnHandshake
 
 command heNetOnMessage pPeer, pPayloadData
@@ -910,18 +993,29 @@ end heHostRelay
 command heNetIngestWire pWire
    -- everyone's inbound path: verify-or-drop against the host key and local
    -- chain head, then advance the chain and fold the message (spec 6/8).
-   local tVerdict, tA
+   local tVerdict, tA, tTypeTxt, tSeqTxt
    put heEnvVerify(pWire, empty, gGame["hostPubHex"], gGame["chainHeadHex"]) into tVerdict
    if tVerdict is not "ok" then
       -- drop and log; a bad/replayed/reordered message is not an exception
       put tVerdict && char 1 to 24 of pWire & return after gGame["netLog"]
+      heLobbyRefresh
       exit heNetIngestWire
    end if
    put heChainNextHex(pWire) into gGame["chainHeadHex"]
    put heEnvWireParse(pWire) into tA
    put pWire & return after gGame["log"]
-   -- the folded transcript drives the betting engine / deal exactly as
-   -- hotseat does (the Phase 2 seam: same engine, different message source)
+   put tA["type"] into tTypeTxt
+   put tA["seq"] into tSeqTxt
+   put "ok     " & tTypeTxt & " seq " & tSeqTxt & return after gGame["netLog"]
+   -- lobby presence bodies drive the roster/cfg display; gameplay wires drive
+   -- the betting engine (the deal increment). tA fields are plain locals now,
+   -- so heEnvBodyText chunks only plain text (H6-safe).
+   if tTypeTxt is "roster" then
+      put heEnvBodyText(tA["bodyHex"]) into gGame["rosterBody"]
+   else if tTypeTxt is "cfg" then
+      put heEnvBodyText(tA["bodyHex"]) into gGame["cfgBody"]
+   end if
+   heLobbyRefresh
 end heNetIngestWire
 
 command heNetSendAction pTypeTxt, pBodyTxt
@@ -955,6 +1049,48 @@ command heNetBroadcast pPayloadTxt
       get btRp1Send(gGame["session"], tPeer, tData)
    end repeat
 end heNetBroadcast
+
+command heNetSendWireTo pPeer, pWire
+   -- targeted replay of one sequenced wire to a single peer (star topology).
+   -- Same "w" framing as a broadcast so the receiver's heNetOnMessage path is
+   -- identical whether the wire arrived live or as catch-up.
+   get btRp1Send(gGame["session"], pPeer, textEncode("w" & tab & pWire, "utf-8"))
+end heNetSendWireTo
+
+command heNetReplayLogTo pPeer
+   -- spec 9 reconnect seam: replay the whole signed wire log to a freshly
+   -- handshaked peer, in order, so it advances its chain from genesis and
+   -- catches up. Turn-rate, not frame-rate; a lobby log is a few lines.
+   local tWireLine, tLog
+   put gGame["log"] into tLog
+   repeat for each line tWireLine in tLog
+      if tWireLine is not empty then
+         heNetSendWireTo pPeer, tWireLine
+      end if
+   end repeat
+end heNetReplayLogTo
+
+command heHostEmitRoster
+   -- host-only: re-sign and broadcast the current roster whenever the admitted
+   -- set changes (spec 9 presence). Every client sorts the members identically
+   -- (heRosterBody), so the signed bytes match everywhere.
+   local tKeyPub, tRoleTxt, tMembers
+   if gGame["isHost"] is not "true" then
+      exit heHostEmitRoster
+   end if
+   put empty into tMembers
+   repeat for each key tKeyPub in gGame["admittedA"]
+      put gGame["roleByPub"][tKeyPub] into tRoleTxt
+      if tRoleTxt is empty then
+         put "player" into tRoleTxt
+      end if
+      put tKeyPub & tab & tRoleTxt & return after tMembers
+   end repeat
+   if tMembers is not empty then
+      delete char -1 of tMembers
+   end if
+   heNetSendAction "roster", heRosterBody(tMembers)
+end heHostEmitRoster
 
 --------------------------------------------------------------------------
 -- small pure utilities
@@ -2415,10 +2551,177 @@ command heBuildTable
    heMakeActionButton "heBtnHalf", "1/2 Pot", 688
    heMakeActionButton "heBtnPot", "Pot", 768
    heMakeActionButton "heBtnDeal", "Deal", 848
+   heMakeActionButton "heBtnOnline", "Lobby", 928
 
+   heBuildLobby
    heKitTryInit
    unlock screen
 end heBuildTable
+
+command heBuildLobby
+   -- the online lobby overlay: Create/Join a table, watch peers connect over
+   -- the DHT, and see every signed presence message verify or drop. Built
+   -- hidden; heLobbyShow/heLobbyHide toggle it as one unit. NEEDS AN OXT PASS.
+   create graphic "heLobbyBg"
+   set the style of graphic "heLobbyBg" to "roundrect"
+   set the roundRadius of graphic "heLobbyBg" to 16
+   set the rect of graphic "heLobbyBg" to "192,84,832,556"
+   set the backgroundColor of graphic "heLobbyBg" to "20,26,24"
+   set the borderColor of graphic "heLobbyBg" to kHeGoldColor
+   set the borderWidth of graphic "heLobbyBg" to 2
+   set the opaque of graphic "heLobbyBg" to true
+
+   heMakeLabel "heLobbyTitle", "212,94,812,124", \
+         "holde-em online -- serverless table over the DHT", kHeGoldColor, 16
+   create button "heBtnCreate"
+   set the rect of button "heBtnCreate" to "232,134,432,170"
+   set the label of button "heBtnCreate" to "Create Table"
+   create button "heBtnJoin"
+   set the rect of button "heBtnJoin" to "592,134,792,170"
+   set the label of button "heBtnJoin" to "Join Table"
+
+   heMakeLabel "heJoinLabel", "212,182,812,204", \
+         "paste a 64-hex invite code, then Join -- or Create to host", kHeWhite, 11
+   create field "heJoinCode"
+   set the rect of field "heJoinCode" to "232,208,712,238"
+   set the lockText of field "heJoinCode" to false
+   set the textSize of field "heJoinCode" to 12
+   set the textAlign of field "heJoinCode" to "center"
+   create button "heBtnCopyCode"
+   set the rect of button "heBtnCopyCode" to "724,206,792,240"
+   set the label of button "heBtnCopyCode" to "Copy"
+
+   heMakeLabel "heLobbyId", "212,246,812,270", "", kHeWhite, 12
+   heMakeLabel "heLobbyTable", "212,272,812,296", "", kHeGoldColor, 12
+   heMakeLabel "heRosterHdr", "212,304,502,326", "Players at this table", kHeWhite, 12
+   heMakeLabel "heNetHdr", "522,304,812,326", "Network activity (verify / drop)", kHeWhite, 12
+
+   create field "heLobbyRoster"
+   set the rect of field "heLobbyRoster" to "212,328,502,510"
+   set the lockText of field "heLobbyRoster" to true
+   set the textSize of field "heLobbyRoster" to 12
+   set the opaque of field "heLobbyRoster" to true
+   set the backgroundColor of field "heLobbyRoster" to "14,18,16"
+   set the textColor of field "heLobbyRoster" to kHeWhite
+   set the borderWidth of field "heLobbyRoster" to 0
+
+   create field "heLobbyNet"
+   set the rect of field "heLobbyNet" to "522,328,812,510"
+   set the lockText of field "heLobbyNet" to true
+   set the textSize of field "heLobbyNet" to 11
+   set the opaque of field "heLobbyNet" to true
+   set the backgroundColor of field "heLobbyNet" to "14,18,16"
+   set the textColor of field "heLobbyNet" to "150,220,150"
+   set the borderWidth of field "heLobbyNet" to 0
+
+   create button "heBtnLeave"
+   set the rect of button "heBtnLeave" to "232,516,472,548"
+   set the label of button "heBtnLeave" to "Leave (play hotseat)"
+
+   heLobbyHide
+end heBuildLobby
+
+command heLobbyShow
+   heLobbySetVisible true
+   heLobbyRefresh
+end heLobbyShow
+
+command heLobbyHide
+   heLobbySetVisible false
+end heLobbyHide
+
+command heLobbySetVisible pOn
+   -- toggle the whole overlay by concrete type (by-name generic "control"
+   -- references are not reliably valid in strict OXT; field/button/graphic are)
+   local tFields, tButtons, tNm
+   if there is a graphic "heLobbyBg" then
+      set the visible of graphic "heLobbyBg" to pOn
+   end if
+   put "heLobbyTitle,heJoinLabel,heJoinCode,heLobbyId,heLobbyTable," \
+         & "heRosterHdr,heNetHdr,heLobbyRoster,heLobbyNet" into tFields
+   put "heBtnCreate,heBtnJoin,heBtnCopyCode,heBtnLeave" into tButtons
+   set the itemDelimiter to comma
+   repeat for each item tNm in tFields
+      if there is a field tNm then
+         set the visible of field tNm to pOn
+      end if
+   end repeat
+   repeat for each item tNm in tButtons
+      if there is a button tNm then
+         set the visible of button tNm to pOn
+      end if
+   end repeat
+end heLobbySetVisible
+
+function heLobbyVisible
+   if there is a graphic "heLobbyBg" then
+      return the visible of graphic "heLobbyBg"
+   end if
+   return false
+end heLobbyVisible
+
+command heLobbyRefresh
+   -- repaint identity, table line, roster, and the recent net activity from
+   -- gGame -- called on every handshake and every ingested wire. No-op if the
+   -- overlay is not built or not visible.
+   local tRoleTxt, tKeyPub, tRoster, tSeatRole, tNet, tNetAll, tCount
+   local tMyPub, tTableId
+   if not (there is a field "heLobbyRoster") then
+      exit heLobbyRefresh
+   end if
+   if not heLobbyVisible() then
+      exit heLobbyRefresh
+   end if
+   -- copy array elements to plain locals before chunking them (house gotcha H6)
+   put gGame["idPubHex"] into tMyPub
+   put gGame["tableIdHex"] into tTableId
+   -- identity
+   if gGame["idFingerprint"] is empty then
+      set the text of field "heLobbyId" to "You: identity is generated when you Create or Join."
+   else
+      set the text of field "heLobbyId" to \
+            "You: " & gGame["idFingerprint"] & "   key " & char 1 to 12 of tMyPub
+   end if
+   -- table / role / online line
+   if gGame["online"] is "true" then
+      if gGame["isHost"] is "true" then
+         put "host" into tRoleTxt
+      else
+         put "player" into tRoleTxt
+      end if
+      set the text of field "heLobbyTable" to \
+            "Table " & char 1 to 16 of tTableId & "   role " & tRoleTxt & "   -- online --"
+   else
+      set the text of field "heLobbyTable" to "Not connected. Create a table to host, or Join with a code."
+   end if
+   -- roster from the admitted set (+ roles); the host key is marked
+   put empty into tRoster
+   repeat for each key tKeyPub in gGame["admittedA"]
+      put gGame["roleByPub"][tKeyPub] into tSeatRole
+      if tSeatRole is empty then
+         put "player" into tSeatRole
+      end if
+      if tKeyPub is gGame["idPubHex"] then
+         put "* " after tRoster
+      else
+         put "  " after tRoster
+      end if
+      put char 1 to 12 of tKeyPub & "   " & tSeatRole & return after tRoster
+   end repeat
+   if tRoster is empty then
+      put "(no one yet)" into tRoster
+   end if
+   set the text of field "heLobbyRoster" to tRoster
+   -- last ~14 lines of network activity, newest at the bottom
+   put gGame["netLog"] into tNetAll
+   put the number of lines of tNetAll into tCount
+   if tCount > 14 then
+      put line (tCount - 13) to tCount of tNetAll into tNet
+   else
+      put tNetAll into tNet
+   end if
+   set the text of field "heLobbyNet" to tNet
+end heLobbyRefresh
 
 command heMakeLabel pName, pRect, pText, pColor, pSize
    create field pName
@@ -2518,8 +2821,38 @@ command heKitTryInit
 end heKitTryInit
 
 on mouseUp
-   local tWho, tSeatNum, tAmt
+   local tWho, tSeatNum, tAmt, tCodeTxt
    put the short name of the target into tWho
+   -- lobby routing first: these act whether or not the overlay is up
+   switch tWho
+      case "heBtnOnline"
+         heLobbyShow
+         exit mouseUp
+      case "heBtnCreate"
+         heTableCreate
+         exit mouseUp
+      case "heBtnJoin"
+         put word 1 of the text of field "heJoinCode" into tCodeTxt
+         heTableJoin tCodeTxt
+         exit mouseUp
+      case "heBtnCopyCode"
+         if gGame["tableIdHex"] is empty then
+            heUISetStatus "No table yet -- Create one first."
+         else
+            set the clipboardData["text"] to gGame["tableIdHex"]
+            heUISetStatus "Invite code copied to the clipboard."
+         end if
+         exit mouseUp
+      case "heBtnLeave"
+         heNetStop
+         heLobbyHide
+         heUISetStatus "Back to hotseat. Press Deal to play, or Lobby to go online."
+         exit mouseUp
+   end switch
+   -- while the lobby overlay is up, the table/action buttons are inert
+   if heLobbyVisible() then
+      exit mouseUp
+   end if
    if tWho is "heBtnDeal" then
       heHandStart
       exit mouseUp
@@ -3010,6 +3343,10 @@ constant kKatEnv0SenderSig = "c1d5f49bcc0fb8418830f63cc8be9c6bf7e5fd11a77807af38
 constant kKatChainHead6 = "62fcd52b3757f590c33bede7330620853074c1e5c153549244a8dac7287e3778"
 constant kKatSettleHash = "68095dcf5a74fac1e1340a1073a466dcf117024257f5c265de21698257b34b6f"
 constant kKatAdmitSig = "17cf45eeecf27a3e9b63e1e0ff47ae1ea337430cb135fb499944a60681fcd1e949a7a88f532b2f888c0ea32364e93e9aa2f569419f27e8034b695a4ee94d5e0b"
+constant kKatIdPub2 = "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10"
+constant kKatLobbyCfgBody = "v=1,level=0,sb=1,bb=2,seats=6,button=1"
+constant kKatRosterBody = "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10:player,b6ef1a19d789c27bea3f6c127db635929541f34907750ee12d0b715c010c7566:host"
+constant kKatLobbyHead2 = "54c4df80d160eaaef52536a8ff6f2a7e09caccc629e1c467fe382eedc8a23509"
 
 command heRunSelftest
    put empty into gRpt
@@ -3025,6 +3362,7 @@ command heRunSelftest
    heTestFoldRun
    heTestCryptoRun
    heTestDealRun
+   heTestLobbyRun
    put return & heProbeSodium() after gRpt
    put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
          & return after gRpt
@@ -3105,6 +3443,50 @@ command heTestDealRun
          heAuditDeal(tTableData, 1, tSeedsA, tCommitsA, 3, tDealA, "1,2,3", 1), \
          "fail:commit-mismatch-position-2"
 end heTestDealRun
+
+command heTestLobbyRun
+   -- on-engine mirror of the online lobby's signed-presence + reconnect path
+   -- (spec 9), pinned in tools/protocol-kat.py. Two in-process identities:
+   -- the host (idSeed1) opens a table and signs a cfg (seq 1, from genesis),
+   -- then a roster (seq 2) once a player (idSeed2) has joined; a late joiner
+   -- replays both from genesis and must land on kKatLobbyHead2. This checks
+   -- the exact wires the transport carries, with no network. SKIPs w/o SodiumXT.
+   local tPub, tSec, tHostPubHex, tContent, tWire1, tWire2, tHead1, tHead2
+   local tMembers, tMembersRev, tRoster
+   put return & "-- 8. Online lobby: signed presence + transcript replay (spec 9)" & return after gRpt
+   if not heHasSodium() then
+      heTSkip "lobby: signed presence + replay", "SodiumXT not installed"
+      exit heTestLobbyRun
+   end if
+   set the itemDelimiter to comma
+
+   -- canonical roster body: sorting (not input order) fixes the signed bytes
+   put kKatIdPub1 & tab & "host" & return & kKatIdPub2 & tab & "player" into tMembers
+   put kKatIdPub2 & tab & "player" & return & kKatIdPub1 & tab & "host" into tMembersRev
+   put heRosterBody(tMembers) into tRoster
+   heTAssert "lobby: canonical roster body", tRoster, kKatRosterBody
+   heTAssert "lobby: roster body is order-independent", heRosterBody(tMembersRev), kKatRosterBody
+
+   -- host builds the two presence wires (host is sender AND relay for presence)
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tPub, tSec
+   put heBin2HexS(tPub) into tHostPubHex
+   put heEnvContentLine(kKatTableHex, 0, tHostPubHex, "cfg", kKatLobbyCfgBody) into tContent
+   put heWireBuild(tContent, tSec, 1, kHeGenesisPrev, tSec) into tWire1
+   put heChainNextHex(tWire1) into tHead1
+   put heEnvContentLine(kKatTableHex, 0, tHostPubHex, "roster", tRoster) into tContent
+   put heWireBuild(tContent, tSec, 2, tHead1, tSec) into tWire2
+   put heChainNextHex(tWire2) into tHead2
+   heTAssert "lobby: presence chain head after cfg+roster", tHead2, kKatLobbyHead2
+
+   -- a joiner replays from genesis: cfg verifies at genesis, roster at head1
+   heTAssert "lobby: joiner verifies the cfg wire (from genesis)", \
+         heEnvVerify(tWire1, tHostPubHex, tHostPubHex, kHeGenesisPrev), "ok"
+   heTAssert "lobby: joiner verifies the roster wire (chained)", \
+         heEnvVerify(tWire2, tHostPubHex, tHostPubHex, tHead1), "ok"
+   -- out-of-order replay is a chain break: the roster cannot land before the cfg
+   heTAssert "lobby: roster before cfg is a chain break", \
+         heEnvVerify(tWire2, tHostPubHex, tHostPubHex, kHeGenesisPrev), "drop:chain-break"
+end heTestLobbyRun
 
 command heTestCryptoRun
    -- on-engine mirror of tools/protocol-kat.py (spec 6 + 7.1 crypto). SKIPs
