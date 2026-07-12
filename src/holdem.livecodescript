@@ -1888,6 +1888,7 @@ end heUISetStatus
 command heUIPromptToAct
    local tSeatNum, tLegalTxt, tLine, tHasCheck, tHasCall, tHasBet, tHasRaise
    local tHasAllin, tCallAmt, tName
+   set the itemDelimiter to comma
    if gGame["phase"] is not "hand" then
       exit heUIPromptToAct
    end if
