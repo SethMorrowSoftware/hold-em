@@ -69,8 +69,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.1"
-constant kHeHarnessV = "8"
+constant kHeVersion = "0.5.2"
+constant kHeHarnessV = "9"
 constant kUIVersion = "4"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -224,6 +224,28 @@ function heHex2BinD pHexTxt
    -- hex String -> Data
    return sxHex2Bin(textEncode(pHexTxt, "ascii"))
 end heHex2BinD
+
+function heIsHex pTxt, pLen
+   -- true iff pTxt is even-length hex (optionally exactly pLen chars). PURE --
+   -- no FFI -- so it can gate sxHex2Bin, which THROWS on malformed input. Every
+   -- hex field lifted off an untrusted wire must pass this before heHex2BinD, or
+   -- one hostile/corrupt frame throws uncaught in the poll loop (house law H4:
+   -- verify-or-drop must never raise). pLen 0 = "any even length".
+   local tLen, tCh
+   put the number of chars of pTxt into tLen
+   if tLen is 0 or (tLen mod 2) is not 0 then
+      return false
+   end if
+   if pLen is not empty and pLen is not 0 and tLen is not pLen then
+      return false
+   end if
+   repeat for each char tCh in pTxt
+      if offset(tCh, "0123456789abcdefABCDEF") is 0 then
+         return false
+      end if
+   end repeat
+   return true
+end heIsHex
 
 -- Identity keys are derived by calling sxSignKeypairFromSeed directly into
 -- plain locals at each site (the proven-safe form -- same as
@@ -445,8 +467,22 @@ function heEnvVerify pWireLine, pFromPubHex, pHostPubHex, pExpectedPrevHex
    -- and logged, no exceptions (including from the host). pFromPubHex is the
    -- admitted pubkey the caller expects for this sender ("" to skip that
    -- check); pExpectedPrevHex is the local chain head ("" to skip).
-   local tA
+   local tA, tFrom, tSenderSig, tHostSig, tBodyHex
    put heEnvWireParse(pWireLine) into tA
+   -- shape-check every hex field BEFORE any decode: heHex2BinD (sxHex2Bin)
+   -- throws on malformed hex, and this path runs on untrusted inbound bytes,
+   -- so a bad frame must become a clean drop, never an uncaught throw (H4).
+   put tA["from"] into tFrom
+   put tA["senderSig"] into tSenderSig
+   put tA["hostSig"] into tHostSig
+   put tA["bodyHex"] into tBodyHex
+   if not heIsHex(tFrom, 64) or not heIsHex(pHostPubHex, 64) \
+         or not heIsHex(tSenderSig, 128) or not heIsHex(tHostSig, 128) then
+      return "drop:malformed"
+   end if
+   if tBodyHex is not empty and not heIsHex(tBodyHex, 0) then
+      return "drop:malformed"
+   end if
    if pFromPubHex is not empty and tA["from"] is not pFromPubHex then
       return "drop:unknown-from"
    end if
@@ -704,7 +740,9 @@ function heAdmitTokenVerify pTokenData, pTableHex
    put item 2 of tTok into tRole
    put item 3 of tTok into tSigHex
    set the itemDelimiter to tSaved
-   if the number of chars of tPubHex is not 64 then
+   -- a stranger's token is untrusted: reject malformed hex before decoding it
+   -- (sxHex2Bin throws) -- 64-char pub and 128-char detached sig (H4)
+   if not heIsHex(tPubHex, 64) or not heIsHex(tSigHex, 128) then
       return ""
    end if
    if heVerifyDetached(heHex2BinD(tSigHex), \
@@ -817,6 +855,12 @@ end heTableInfohash
 
 command heTableCreate
    -- become the host of a fresh table; the 64-hex table code IS the invite.
+   -- online play needs the crypto -- guard so a Sodium-less engine gets a
+   -- friendly status, not a hard throw out of heIdentitySetup (H4/UX)
+   if not heHasSodium() then
+      heUISetStatus "Online tables need SodiumXT installed. You can still play hotseat."
+      exit heTableCreate
+   end if
    -- tear down any prior session first so a re-create starts a clean swarm
    heNetStop
    heIdentitySetup
@@ -851,8 +895,12 @@ end heTableCreate
 command heTableJoin pCodeTxt
    -- join an existing table from its invite code
    local tCode
+   if not heHasSodium() then
+      heUISetStatus "Online tables need SodiumXT installed. You can still play hotseat."
+      exit heTableJoin
+   end if
    put word 1 of pCodeTxt into tCode
-   if the number of chars of tCode is not 64 then
+   if not heIsHex(tCode, 64) then
       heUISetStatus "Invite code must be 64 hex characters."
       exit heTableJoin
    end if
@@ -975,6 +1023,11 @@ command heHostRelay pPeer, pContentAndSig
    put item 7 of pContentAndSig into tSenderSig
    put item 4 of tContent into tFromHex
    set the itemDelimiter to tSaved
+   -- a player packet is untrusted: reject malformed hex before decoding it
+   -- (sxHex2Bin throws) so a corrupt "c" frame cannot kill the host relay (H4)
+   if not heIsHex(tFromHex, 64) or not heIsHex(tSenderSig, 128) then
+      exit heHostRelay
+   end if
    -- verify the sender actually signed this content (host cannot forge content)
    if not heVerifyDetached(heHex2BinD(tSenderSig), textEncode(tContent, "utf-8"), heHex2BinD(tFromHex)) then
       exit heHostRelay
@@ -3572,6 +3625,16 @@ command heTestCryptoRun
          heEnvVerify(tWire, heBin2HexS(tHostPub), heBin2HexS(tPub), kHeGenesisPrev), "drop:unknown-from"
    heTAssert "crypto: verify drops a chain break", \
          heEnvVerify(tWire, heBin2HexS(tPub), heBin2HexS(tPub), kKatChainHead6), "drop:chain-break"
+   -- H4: a malformed (non-hex) field must DROP cleanly, never throw out of the
+   -- poll loop. Corrupt the from-key to non-hex and confirm the verdict.
+   put tWire into tTampered
+   set the itemDelimiter to tab
+   put "zznothexzz" into item 4 of tTampered
+   set the itemDelimiter to comma
+   heTAssert "crypto: verify drops a malformed hex field (no throw)", \
+         heEnvVerify(tTampered, empty, heBin2HexS(tPub), kHeGenesisPrev), "drop:malformed"
+   heTAssert "crypto: heIsHex rejects odd-length and non-hex", \
+         heIsHex("abc", 0) & "," & heIsHex("zz", 0) & "," & heIsHex("ab", 0), "false,false,true"
 
    -- admission token (spec 5): host-role signature pinned, and the verify
    -- roundtrip returns the admitted pubkey for a good token, "" for a wrong
