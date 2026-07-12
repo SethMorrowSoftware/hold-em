@@ -24,5 +24,7 @@ jobs:
         run: python3 tools/evaluator-kat.py
       - name: betting-engine KATs (spec 8.1, 8.3)
         run: python3 tools/betting-kat.py
-      - name: protocol KATs (spec 6, 7.1)
+      - name: shuffle KATs (playable integer deal)
+        run: python3 tools/shuffle-kat.py
+      - name: protocol KATs (spec 6, 7.1 -- Phase 2 crypto deal)
         run: python3 tools/protocol-kat.py

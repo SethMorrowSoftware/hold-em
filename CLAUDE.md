@@ -84,13 +84,32 @@ python3 tools/check-livecodescript.py   # dialect gates, every .livecodescript
 python3 tools/check-docs.py             # smart-quote scan over *.md
 python3 tools/evaluator-kat.py          # spec 8.2 vectors (mirror of heEval7/heRank5)
 python3 tools/betting-kat.py            # spec 8.1/8.3 cases (mirror of heBetApply/heSettleOf)
-python3 tools/protocol-kat.py           # spec 6/7.1: envelopes, chain, Level 0 deal
+python3 tools/shuffle-kat.py            # playable integer deal (mirror of heShuffleDeck)
+python3 tools/protocol-kat.py           # spec 6/7.1 crypto deal (Phase 2 target)
 ```
 
-The same vectors are embedded in `src/holdem-selftest.livecodescript`, so a green
-harness run on-engine plus green KATs in CI pins the xTalk to the mirrors byte-for-
-byte. Keep it that way: game rules, crypto sequencing, and settlement must live in
+The same vectors are embedded in the stack's own self-test (`heRunSelftest` in the
+message box), so a green harness run on-engine plus green KATs in CI pins the xTalk to
+the mirrors. Keep it that way: game rules, shuffle, and settlement must live in
 handlers that take values and return values, with no UI reads inside.
+
+**The single stack.** `src/holdem.livecodescript` is one paste-and-run stack: the
+hotseat game AND its self-test (`heRunSelftest`) and a SodiumXT diagnostic
+(`heProbeSodium`) are folded into it. There is no second stack.
+
+**Binary stays out of the playable path (v0.2.0, the hard-won rule).** Repeated OXT
+passes threw double/binary conversion errors wherever script touched FFI-bridged
+binary (SodiumXT `Data`) through the chunk/arithmetic evaluator — even after copying
+the element to a local (H6). The resolution: the **playable deal uses a pure-integer
+PRNG** (Park-Miller MINSTD: only `+`, `*`, `mod`, every product `< 2^53` so it is
+exact in a double), seeded from `sxRandomUniform` (an *integer* result — no binary
+crosses into script) when SodiumXT is present, and from engine time+`random()` as a
+labelled practice fallback otherwise. Nothing in a played hand calls `sxHash`,
+`sxRandomBytes`, `sxBin2Hex`, `textEncode`, or any `byte`/`byteToNum`/`numToByte`.
+The cryptographic Level 0 deal (commit-reveal keyed-stream, spec 7.1) stays specced
+and KAT-pinned in `tools/protocol-kat.py` as the Phase 2 / value-path target; wire it
+back only behind a confirmed `heProbeSodium` (which tries each `sx*` call in its own
+`try` and names any that throws).
 
 **Do not claim runtime behavior you cannot observe.** Anything visual, timed, socket-,
 or extension-touching gets the phrase "verified statically; needs an OXT pass" and the
@@ -312,9 +331,9 @@ tools/check-livecodescript.py     static gates (carried from the family)
 tools/check-docs.py                docs smart-quote scan
 tools/evaluator-kat.py             spec 8.2 evaluator vectors (CI mirror of heEval7)
 tools/betting-kat.py               spec 8.1/8.3 betting + settlement cases (CI mirror)
-tools/protocol-kat.py              spec 6/7.1 envelope/chain/deal known-answer vectors
-src/holdem.livecodescript          the game: one self-building paste-and-run stack
-src/holdem-selftest.livecodescript the harness (evaluator vectors, protocol asserts,
-                                   adversarial cheater bots from Phase 4)
+tools/shuffle-kat.py               playable integer deal (CI mirror of heShuffleDeck)
+tools/protocol-kat.py              spec 6/7.1 crypto envelope/chain/deal (Phase 2 target)
+src/holdem.livecodescript          the whole thing: game + self-test + sodium probe,
+                                   one self-building paste-and-run stack
 .github/workflows/ci.yml           runs the gates + KATs on every push/PR
 ```
