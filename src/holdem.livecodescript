@@ -2,49 +2,58 @@ script "Holdem"
 /*
 holdem.livecodescript -- serverless no-limit Texas Hold'em for OXT (holde-em).
 
-Phase 1 (hotseat, spec M0) plus the Phase 2c pure seams: the hand evaluator,
-the betting engine with side pots, the Level 0 commit-reveal deal, settlement,
-the transcript fold, and the canonical envelope codec are all here and all
-pure (values in, values out -- house law H5). The UI shell at the bottom is
-self-building in the family style and runs in two modes: "kit" (Box2Dxt Kit
-sprites and chips, needs an atlas configured) and "flat" (plain fields, no
-dependencies), so the game is exercisable before any art lands.
+ONE self-contained, paste-and-run stack: the hotseat game plus its own
+self-test harness (call heRunSelftest in the message box). No second stack,
+no required extensions to be playable.
 
-Every algorithm with a byte-exact contract is pinned by the headless CI KATs
-(tools/evaluator-kat.py, tools/protocol-kat.py) and re-checked on-engine by
-src/holdem-selftest.livecodescript. Change an algorithm here and the KATs
-break loudly -- that is the point.
+v0.2.0 -- binary-free playable path. The first OXT passes hit repeated
+double/binary conversion errors wherever script code touched FFI-bridged
+binary (SodiumXT Data) through the chunk/arithmetic evaluator. This version
+removes that entire class from the playable path:
 
-Everything visual, timed, or extension-touching below is verified statically
-and needs an OXT pass. The pure sections are pinned by the KATs.
+  * The deal's randomness is a pure-INTEGER PRNG (Park-Miller MINSTD: only
+    +, *, and mod, every product < 2^53 so it is exact in a double). It is
+    seeded from sxRandomUniform when SodiumXT is present -- sxRandomUniform
+    returns an integer, so no binary ever crosses into script -- and from
+    engine time+random as a labelled practice fallback otherwise.
+  * The transcript stores plain text; no hashing, hex, or textEncode on the
+    playable path.
+  * Nothing in a played hand calls sxHash / sxRandomBytes / sxBin2Hex.
+
+The cryptographic Level 0 deal (spec 7.1: commit-reveal keyed-stream shuffle,
+end-of-hand audit) is the value-path target and stays specced and KAT-pinned
+in tools/, but it is deferred here until the SodiumXT surface is confirmed on
+this engine -- run heProbeSodium to see exactly which sx* calls work. Wiring
+it back in is a Phase-2 step behind a confirmed probe.
+
+The pure logic -- evaluator, betting engine + side pots, settlement,
+transcript fold -- is values-in/values-out (house law H5) and machine-pinned
+by tools/evaluator-kat.py and tools/betting-kat.py; heRunSelftest re-checks
+the same vectors on-engine. Everything visual is verified statically and
+needs an OXT pass.
 */
 
 --------------------------------------------------------------------------
--- constants (all of them up here: gotcha 29 -- a constant used above its
+-- constants (all up here: gotcha 29 -- a constant used above its
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.1.1"
-constant kUIVersion = "1"
-constant kHeEnvV = "1"
-
--- domain-separated, versioned hash prefixes (spec 16); the KATs pin the bytes
-constant kHeDomainShuf = "HOLDEM-SHUF-v1|"
-constant kHeDomainSeedC = "HOLDEM-SEEDC-v1|"
-constant kHeDomainChain = "HOLDEM-CHAIN-v1|"
-constant kHeDomainSettle = "HOLDEM-SETL-v1|"
-constant kHeDomainSess = "HOLDEM-SESS-v1|"
-constant kHeDomainCard = "HOLDEM-CARD-v1|"
+constant kHeVersion = "0.2.0"
+constant kHeHarnessV = "3"
+constant kUIVersion = "2"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
 constant kHeRankChars = "23456789TJQKA"
 constant kHeSuitChars = "cdhs"
 
--- 2^32 and friends for the rejection-sampled uniform draw
-constant kHeTwo32 = 4294967296
+-- Park-Miller MINSTD: x' = 16807 * x mod (2^31 - 1). 16807 * (2^31-1) is
+-- about 3.6e13, well under 2^53, so every step is exact in a double.
+constant kHeRngMul = 16807
+constant kHeRngMod = 2147483647
+constant kHeRngMax = 2147483646
 
--- table defaults (a signed cfg message overrides these at Phase 2)
+-- table defaults
 constant kHeDefaultSeats = 6
 constant kHeDefaultSB = 1
 constant kHeDefaultBB = 2
@@ -61,7 +70,6 @@ constant kHeBoardDX = 56
 constant kHeCardW = 46
 constant kHeCardH = 64
 constant kHeHudMs = 250
-constant kHeDealStaggerMs = 70
 
 --------------------------------------------------------------------------
 -- script-local state (g prefix per the family convention)
@@ -77,8 +85,7 @@ local gFlipCtxA        -- per-sprite flip context locks (gotcha 19)
 local gAnimBusy
 
 --------------------------------------------------------------------------
--- lifecycle (house law H1: sessions bracket the stack's life; Phase 1 has
--- no native sessions yet, but the brackets are where Phase 2 will put them)
+-- lifecycle (house law H1: sessions bracket the stack's life)
 --------------------------------------------------------------------------
 
 on preOpenStack
@@ -89,7 +96,7 @@ end preOpenStack
 on openStack
    heBuildTable
    heTableNew
-   heUISetStatus "Welcome to holde-em. Press Deal to start a hotseat hand."
+   heUISetStatus "Welcome to holde-em " & kHeVersion & ". Press Deal to start a hotseat hand."
    put true into gHudTickOn
    send "heHudTick" to me in kHeHudMs milliseconds
 end openStack
@@ -103,18 +110,19 @@ on closeStack
          cancel item 1 of tMsgLine
       end if
    end repeat
-   -- Phase 2: btStopPolling / btStopSession land here (H1)
    pass closeStack
 end closeStack
 
 --------------------------------------------------------------------------
--- extension probes (cached; a missing extension is a mode, not an error)
+-- SodiumXT: probe + a per-call diagnostic. The GAME never depends on any
+-- of this; it exists so the deal can draw CSPRNG entropy when available and
+-- so heProbeSodium can pinpoint any FFI-boundary failure on this engine.
 --------------------------------------------------------------------------
 
 function heHasSodium
    if gHasSodiumChk is empty then
       try
-         get sxBin2Hex(textEncode("x", "UTF-8"))
+         get sxRandomUniform(2)
          put "true" into gHasSodiumChk
       catch tProbeErr
          put "false" into gHasSodiumChk
@@ -123,16 +131,44 @@ function heHasSodium
    return gHasSodiumChk is "true"
 end heHasSodium
 
-function heHasKit
-   if gHasKitChk is empty then
-      if there is a stack "box2dxt-kit" then
-         put "true" into gHasKitChk
-      else
-         put "false" into gHasKitChk
-      end if
-   end if
-   return gHasKitChk is "true"
-end heHasKit
+command heProbeSodium
+   -- diagnostic: try each sx* call in its own try and report ok/threw, so a
+   -- double/binary failure names the exact handler. Prints to the message box.
+   local tRpt, tTmp, tData
+   put "SodiumXT probe (holde-em " & kHeVersion & "):" & return into tRpt
+   try
+      put sxRandomUniform(1000) into tTmp
+      put "  sxRandomUniform(1000) -> " & tTmp & "  : ok" & return after tRpt
+   catch tErr
+      put "  sxRandomUniform: THREW: " & tErr & return after tRpt
+   end try
+   try
+      put sxRandomBytes(8) into tData
+      put "  sxRandomBytes(8): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+   catch tErr
+      put "  sxRandomBytes: THREW: " & tErr & return after tRpt
+   end try
+   try
+      put sxBin2Hex(sxRandomBytes(8)) into tTmp
+      put "  sxBin2Hex(sxRandomBytes(8)) -> " & tTmp & "  : ok" & return after tRpt
+   catch tErr
+      put "  sxBin2Hex(sxRandomBytes): THREW: " & tErr & return after tRpt
+   end try
+   try
+      put sxHash(textEncode("holdem", "UTF-8")) into tData
+      put "  sxHash(text): ok (" & the number of bytes of tData & " bytes)" & return after tRpt
+   catch tErr
+      put "  sxHash: THREW: " & tErr & return after tRpt
+   end try
+   try
+      put sxBin2Hex(sxHash(textEncode("holdem", "UTF-8"))) into tTmp
+      put "  sxBin2Hex(sxHash(text)) -> " & tTmp & "  : ok" & return after tRpt
+   catch tErr
+      put "  sxBin2Hex(sxHash): THREW: " & tErr & return after tRpt
+   end try
+   put tRpt
+   return tRpt
+end heProbeSodium
 
 --------------------------------------------------------------------------
 -- small pure utilities
@@ -144,40 +180,6 @@ function heTwoDigits pNum
    end if
    return pNum
 end heTwoDigits
-
-function heBin2Hex pData
-   -- lowercase hex. Prefer the native converter: the OXT chunk evaluator
-   -- has thrown double/binary conversion errors on FFI-bridged binary
-   -- (H6), and sxBin2Hex is proven on-engine (the sodium probe uses it).
-   -- The script loop remains as the no-sodium fallback for engine-built
-   -- binary (textEncode output and the like).
-   local tOut, tPos, tByteVal, tHexPair
-   if heHasSodium() then
-      return toLower(sxBin2Hex(pData))
-   end if
-   put empty into tOut
-   repeat with tPos = 1 to the number of bytes of pData
-      put byteToNum(byte tPos of pData) into tByteVal
-      put toLower(baseConvert(tByteVal, 10, 16)) into tHexPair
-      if the number of chars of tHexPair is 1 then
-         put "0" & tHexPair into tHexPair
-      end if
-      put tHexPair after tOut
-   end repeat
-   return tOut
-end heBin2Hex
-
-function heHex2Bin pHex
-   local tOut, tPos
-   if heHasSodium() then
-      return sxHex2Bin(pHex)
-   end if
-   put empty into tOut
-   repeat with tPos = 1 to the number of chars of pHex step 2
-      put numToByte(baseConvert(char tPos to (tPos + 1) of pHex, 16, 10)) after tOut
-   end repeat
-   return tOut
-end heHex2Bin
 
 function heCountItems pList
    set the itemDelimiter to comma
@@ -197,7 +199,7 @@ function heNextInList pList, pEntry
          if tPos is tCount then
             return item 1 of pList
          end if
-         return item tPos + 1 of pList
+         return item (tPos + 1) of pList
       end if
    end repeat
    return item 1 of pList
@@ -220,12 +222,16 @@ function heRotateAfter pList, pEntry
    return pList
 end heRotateAfter
 
-function heU32BEBytes pNum
-   return numToByte(pNum div 16777216 mod 256) \
-         & numToByte(pNum div 65536 mod 256) \
-         & numToByte(pNum div 256 mod 256) \
-         & numToByte(pNum mod 256)
-end heU32BEBytes
+function heHexId pLen
+   -- a random lowercase-hex id built char by char (no binary, no FFI): a
+   -- display/table handle only, not dealing- or key-related
+   local tOut, tI
+   put empty into tOut
+   repeat pLen times
+      put char (random(16)) of "0123456789abcdef" after tOut
+   end repeat
+   return tOut
+end heHexId
 
 --------------------------------------------------------------------------
 -- cards (contract pinned in tools/evaluator-kat.py)
@@ -247,9 +253,10 @@ function heCardName pIdx
 end heCardName
 
 function heCardIndex pName
-   local tRankVal, tSuitVal
-   put offset(char 1 of pName, kHeRankChars) + 1 into tRankVal
-   put offset(char 2 of pName, kHeSuitChars) into tSuitVal
+   local tRankVal, tSuitVal, tNameTxt
+   put pName into tNameTxt
+   put offset(char 1 of tNameTxt, kHeRankChars) + 1 into tRankVal
+   put offset(char 2 of tNameTxt, kHeSuitChars) into tSuitVal
    return (tRankVal - 2) * 4 + tSuitVal
 end heCardIndex
 
@@ -388,141 +395,67 @@ function heEval7 pSeven
 end heEval7
 
 --------------------------------------------------------------------------
--- crypto seams (every SodiumXT call in the game goes through these; the
--- ABI-shape assumptions live in exactly one place for the OXT pass)
+-- the deal: pure-integer PRNG shuffle (binary-free). Randomness law kept in
+-- spirit -- CSPRNG entropy (sxRandomUniform) seeds it when SodiumXT is
+-- present; engine time+random is a labelled practice fallback only.
 --------------------------------------------------------------------------
 
-function heHashData pData
-   -- sxHash == BLAKE2b-256 unkeyed (equivalence pinned in the KAT header)
-   return sxHash(pData)
-end heHashData
-
-function heSignPubFromSeed pSeedData
-   -- ASSUMPTION for the OXT pass: sxSignKeypairFromSeed returns an array
-   -- with "public" and "secret" keys. The self-test prints what it observes
-   -- if this shape is wrong; fix here and only here.
-   local tPairA
-   put sxSignKeypairFromSeed(pSeedData) into tPairA
-   return tPairA["public"]
-end heSignPubFromSeed
-
-function heSignSecretFromSeed pSeedData
-   local tPairA
-   put sxSignKeypairFromSeed(pSeedData) into tPairA
-   return tPairA["secret"]
-end heSignSecretFromSeed
-
-function heSignDetachedOf pMsgData, pSeedData
-   return sxSignDetached(pMsgData, heSignSecretFromSeed(pSeedData))
-end heSignDetachedOf
-
-function heFingerprintOf pPubData
-   -- short display handle: first 8 hex chars of sxHash(pubkey) (spec 5)
-   return char 1 to 8 of heBin2Hex(heHashData(pPubData))
-end heFingerprintOf
-
-function heRandomSeedData
-   -- dealing randomness law (spec 16): sxRandomBytes or nothing. The
-   -- engine-random fallback exists ONLY so a hotseat table on a machine
-   -- with no SodiumXT still deals; it is labelled practice entropy in the
-   -- UI and never acceptable once anything networked exists.
-   local tOut
+function heFreshPrngState
+   -- returns a MINSTD seed in 1..kHeRngMax
+   local tSeed
+   put 0 into tSeed
    if heHasSodium() then
-      return sxRandomBytes(32)
+      try
+         repeat 3 times
+            put (tSeed * 32768 + (sxRandomUniform(32768) mod 32768)) mod kHeRngMod into tSeed
+         end repeat
+      catch tErr
+         put 0 into tSeed
+      end try
    end if
-   put empty into tOut
-   repeat 32 times
-      put numToByte(random(256) - 1) after tOut
-   end repeat
-   return tOut
-end heRandomSeedData
-
---------------------------------------------------------------------------
--- Level 0 deal: commit-reveal keyed-stream shuffle (spec 7.1, pinned by
--- tools/protocol-kat.py). As of v0.1.1 the whole script side works in
--- HEX TEXT: the OXT chunk evaluator threw double/binary conversion
--- errors on FFI-bridged binary (H6), so seeds and the draw stream travel
--- as hex and raw Data exists only at the sx* boundary. Byte semantics
--- are unchanged -- the KAT-pinned decks and commitments are identical.
---------------------------------------------------------------------------
-
-function heSeedCommitOf pSeedHex
-   -- commitment = H("HOLDEM-SEEDC-v1|" || seed bytes); the seed travels
-   -- script-side as hex and becomes bytes only at the hash boundary
-   return heBin2Hex(heHashData(textEncode(kHeDomainSeedC, "UTF-8") & heHex2Bin(pSeedHex)))
-end heSeedCommitOf
-
-function heXorSeedsA pSeedsHexA, pCount
-   -- XOR of N 32-byte seeds, done entirely in hex text; returns hex
-   local tSeatPos, tPairPos, tAcc, tHexTxt, tOutHex, tPairHex
-   put empty into tOutHex
-   repeat with tPairPos = 1 to 63 step 2
-      put 0 into tAcc
-      repeat with tSeatPos = 1 to pCount
-         put pSeedsHexA[tSeatPos] into tHexTxt
-         put bitXOr(tAcc, baseConvert(char tPairPos to (tPairPos + 1) of tHexTxt, 16, 10)) into tAcc
+   if tSeed <= 0 then
+      -- practice entropy: engine time + random(), non-cryptographic
+      put (the milliseconds) mod kHeRngMod into tSeed
+      repeat 3 times
+         put (tSeed * 131 + random(32768)) mod kHeRngMod into tSeed
       end repeat
-      put toLower(baseConvert(tAcc, 10, 16)) into tPairHex
-      if the number of chars of tPairHex is 1 then
-         put "0" & tPairHex into tPairHex
-      end if
-      put tPairHex after tOutHex
-   end repeat
-   return tOutHex
-end heXorSeedsA
+   end if
+   return (tSeed mod kHeRngMax) + 1
+end heFreshPrngState
 
-function heStreamKeyOf pTableIdData, pHandNum, pXorHex
-   -- H("HOLDEM-SHUF-v1|" || table || "|" || decimal(hand) || "|" || seedsXor)
-   return heHashData(textEncode(kHeDomainShuf, "UTF-8") & pTableIdData \
-         & textEncode("|" & pHandNum & "|", "UTF-8") & heHex2Bin(pXorHex))
-end heStreamKeyOf
+function heRngStep pState
+   return (kHeRngMul * pState) mod kHeRngMod
+end heRngStep
 
-function heStreamBlocks pKeyData, pBlockCount
-   -- the stream is returned as hex text so the draw below only ever
-   -- chunks plain chars (H6)
-   local tOut, tBlockPos
-   put empty into tOut
-   repeat with tBlockPos = 0 to pBlockCount - 1
-      put heBin2Hex(heHashData(pKeyData & heU32BEBytes(tBlockPos))) after tOut
-   end repeat
-   return tOut
-end heStreamBlocks
-
-function heDrawUniform pStreamHex, pOffset, pRangeN
-   -- uniform 1..pRangeN via 32-bit big-endian words read as 8 hex chars,
-   -- rejection sampled (no modulo bias). pOffset is a char position into
-   -- the hex stream; returns "value,nextOffset". The word is assembled
-   -- from two 16-bit halves: baseConvert's 32-bit signedness is not a
-   -- documented contract, and 16-bit halves are unambiguous everywhere.
-   local tLimit, tWordVal
-   put (kHeTwo32 div pRangeN) * pRangeN into tLimit
+function heDrawInt pState, pRangeN
+   -- uniform 1..pRangeN with rejection sampling (no modulo bias); returns
+   -- "value,newState". Pure integer arithmetic, all products < 2^53.
+   local tLimit, tS, tV
+   put (kHeRngMax div pRangeN) * pRangeN into tLimit
+   put pState into tS
    repeat forever
-      if pOffset + 7 > the number of chars of pStreamHex then
-         throw "he-stream-exhausted"
-      end if
-      put baseConvert(char pOffset to (pOffset + 3) of pStreamHex, 16, 10) * 65536 \
-            + baseConvert(char (pOffset + 4) to (pOffset + 7) of pStreamHex, 16, 10) into tWordVal
-      add 8 to pOffset
-      if tWordVal < tLimit then
-         return (tWordVal mod pRangeN) + 1 & comma & pOffset
+      put heRngStep(tS) into tS
+      put tS - 1 into tV
+      if tV < tLimit then
+         return ((tV mod pRangeN) + 1) & comma & tS
       end if
    end repeat
-end heDrawUniform
+end heDrawInt
 
-function heShuffleFromStream pStreamHex
+function heShuffleDeck pState
    -- Fisher-Yates over deck[1..52]; deck 1 is the top, dealt first
-   local tDeckA, tPos, tSwapPos, tDrawPair, tHold, tOut, tOffset, tLoopI
+   local tDeckA, tPos, tSwapPos, tDrawPair, tHold, tOut, tState
    set the itemDelimiter to comma
    repeat with tPos = 1 to 52
       put tPos into tDeckA[tPos]
    end repeat
-   put 1 into tOffset
-   repeat with tLoopI = 52 down to 2
-      put heDrawUniform(pStreamHex, tOffset, tLoopI) into tDrawPair
+   put pState into tState
+   repeat with tPos = 52 down to 2
+      put heDrawInt(tState, tPos) into tDrawPair
       put item 1 of tDrawPair into tSwapPos
-      put item 2 of tDrawPair into tOffset
-      put tDeckA[tLoopI] into tHold
-      put tDeckA[tSwapPos] into tDeckA[tLoopI]
+      put item 2 of tDrawPair into tState
+      put tDeckA[tPos] into tHold
+      put tDeckA[tSwapPos] into tDeckA[tPos]
       put tHold into tDeckA[tSwapPos]
    end repeat
    put empty into tOut
@@ -531,141 +464,42 @@ function heShuffleFromStream pStreamHex
    end repeat
    delete char -1 of tOut
    return tOut
-end heShuffleFromStream
-
-function heDeckFromStreamKey pKeyData
-   -- 16 blocks (1024 hex chars) covers 51 draws with ~77 words of
-   -- rejection slack; the stream is conceptually infinite, so extend on
-   -- the astronomically-unlikely exhaustion rather than fail
-   local tBlockCount, tDeckList
-   put 16 into tBlockCount
-   repeat forever
-      try
-         put heShuffleFromStream(heStreamBlocks(pKeyData, tBlockCount)) into tDeckList
-         return tDeckList
-      catch tShufErr
-         if tShufErr contains "he-stream-exhausted" and tBlockCount < 256 then
-            put tBlockCount * 2 into tBlockCount
-         else
-            throw tShufErr
-         end if
-      end try
-   end repeat
-end heDeckFromStreamKey
+end heShuffleDeck
 
 function heDealAssign pDeckList, pOccupiedList, pButtonSeat
    -- fixed public consumption order (spec 7.3, adopted at every level):
    -- one card per occupied seat starting left of the button, two rounds,
    -- then burn, flop x3, burn, turn, burn, river
-   local tOrder, tPos, tSeatNum, tOutA, tRound
+   local tOrder, tPos, tSeatNum, tOutA, tRound, tHoleTxt
    set the itemDelimiter to comma
    put heRotateAfter(pOccupiedList, pButtonSeat) into tOrder
    put 0 into tPos
    repeat with tRound = 1 to 2
       repeat for each item tSeatNum in tOrder
          add 1 to tPos
-         if tOutA["holesBy"][tSeatNum] is empty then
+         put tOutA["holesBy"][tSeatNum] into tHoleTxt
+         if tHoleTxt is empty then
             put item tPos of pDeckList into tOutA["holesBy"][tSeatNum]
          else
-            put comma & item tPos of pDeckList after tOutA["holesBy"][tSeatNum]
+            put tHoleTxt & comma & item tPos of pDeckList into tOutA["holesBy"][tSeatNum]
          end if
       end repeat
    end repeat
    put item (tPos + 1) of pDeckList into tOutA["burnsList"]
    put item (tPos + 2) to (tPos + 4) of pDeckList into tOutA["flopList"]
-   put comma & item (tPos + 5) of pDeckList after tOutA["burnsList"]
+   put tOutA["burnsList"] & comma & item (tPos + 5) of pDeckList into tOutA["burnsList"]
    put item (tPos + 6) of pDeckList into tOutA["turnIx"]
-   put comma & item (tPos + 7) of pDeckList after tOutA["burnsList"]
+   put tOutA["burnsList"] & comma & item (tPos + 7) of pDeckList into tOutA["burnsList"]
    put item (tPos + 8) of pDeckList into tOutA["riverIx"]
    return tOutA
 end heDealAssign
-
-function heAuditHand pTableIdData, pHandNum, pSeedsHexA, pCommitsA, pCount, pDealA, pOccupiedList, pButtonSeat
-   -- end-of-hand audit (spec 7.1 step 5): recompute everything from the
-   -- revealed seeds (hex, per H6) and name the first failing step.
-   -- Returns "pass" or "fail:<step>". Needs SodiumXT (hashing).
-   local tSeatPos, tKeyData, tDeckList, tCheckA, tSeatNum
-   set the itemDelimiter to comma
-   repeat with tSeatPos = 1 to pCount
-      if heSeedCommitOf(pSeedsHexA[tSeatPos]) is not pCommitsA[tSeatPos] then
-         return "fail:commit-mismatch-position-" & tSeatPos
-      end if
-   end repeat
-   put heStreamKeyOf(pTableIdData, pHandNum, heXorSeedsA(pSeedsHexA, pCount)) into tKeyData
-   put heDeckFromStreamKey(tKeyData) into tDeckList
-   put heDealAssign(tDeckList, pOccupiedList, pButtonSeat) into tCheckA
-   repeat for each item tSeatNum in pOccupiedList
-      if tCheckA["holesBy"][tSeatNum] is not pDealA["holesBy"][tSeatNum] then
-         return "fail:hole-mismatch-seat-" & tSeatNum
-      end if
-   end repeat
-   if tCheckA["flopList"] is not pDealA["flopList"] then
-      return "fail:flop-mismatch"
-   end if
-   if tCheckA["turnIx"] is not pDealA["turnIx"] then
-      return "fail:turn-mismatch"
-   end if
-   if tCheckA["riverIx"] is not pDealA["riverIx"] then
-      return "fail:river-mismatch"
-   end if
-   return "pass"
-end heAuditHand
-
---------------------------------------------------------------------------
--- canonical envelope + hash chain (spec 6, layered signatures; byte-pinned
--- by tools/protocol-kat.py). A sender cannot know seq/prev under a relay
--- that assigns ordering, so the sender signs the content line and the host
--- signs the sequenced envelope:
---   contentLine = v TAB tableHex TAB hand TAB fromHex TAB type TAB bodyHex
---   envLine     = contentLine TAB senderSigHex TAB seq TAB prevHex
---   wire        = envLine TAB hostSigHex
---   chainHead   = sxHash("HOLDEM-CHAIN-v1|" || wire); genesis prev = 32 zero bytes
---------------------------------------------------------------------------
-
-function heEnvContentLine pTableHex, pHandNum, pFromTxt, pTypeTxt, pBodyTxt
-   return kHeEnvV & tab & pTableHex & tab & pHandNum & tab & pFromTxt \
-         & tab & pTypeTxt & tab & heBin2Hex(textEncode(pBodyTxt, "UTF-8"))
-end heEnvContentLine
-
-function heEnvParse pContentLine
-   local tOutA
-   set the itemDelimiter to tab
-   put item 1 of pContentLine into tOutA["v"]
-   put item 2 of pContentLine into tOutA["table"]
-   put item 3 of pContentLine into tOutA["hand"]
-   put item 4 of pContentLine into tOutA["from"]
-   put item 5 of pContentLine into tOutA["type"]
-   put textDecode(heHex2Bin(item 6 of pContentLine), "UTF-8") into tOutA["body"]
-   return tOutA
-end heEnvParse
-
-function heWireBuild pContentLine, pSenderSeedData, pSeqNum, pPrevHex, pHostSeedData
-   -- Phase 2 sending path and the on-engine KAT both use this
-   local tSenderSig, tEnvLine, tHostSig
-   put heBin2Hex(heSignDetachedOf(textEncode(pContentLine, "UTF-8"), pSenderSeedData)) into tSenderSig
-   put pContentLine & tab & tSenderSig & tab & pSeqNum & tab & pPrevHex into tEnvLine
-   put heBin2Hex(heSignDetachedOf(textEncode(tEnvLine, "UTF-8"), pHostSeedData)) into tHostSig
-   return tEnvLine & tab & tHostSig
-end heWireBuild
-
-function heChainNextOf pWireLine
-   return heHashData(textEncode(kHeDomainChain & pWireLine, "UTF-8"))
-end heChainNextOf
-
-function heSettleHashOf pDeltasCSV, pChainHeadData
-   return heBin2Hex(heHashData(textEncode(kHeDomainSettle & pDeltasCSV & "|", "UTF-8") & pChainHeadData))
-end heSettleHashOf
 
 --------------------------------------------------------------------------
 -- betting engine (spec 8.1) -- a pure state machine over transcript-shaped
 -- messages. State travels as an array; heBetApply returns the next state
 -- with "err" set (state otherwise unchanged) on any illegal message, and
 -- "note" carrying events the shell reacts to ("advance:flop", "runout",
--- "showdown", "foldwin:3").
---
--- State keys: sb bb occ buttonSeat street phase toAct betCur raiseFull
--- aggressor sdFirst err note, and per seat: stackBy streetBy handBy
--- foldedBy allinBy actedBy. "actedBy" means "has acted since the last FULL
+-- "showdown", "foldwin:3"). "actedBy" means "has acted since the last FULL
 -- raise" -- the flag that makes under-raise all-ins not reopen betting.
 --------------------------------------------------------------------------
 
@@ -770,12 +604,23 @@ function heBetPay pStateA, pSeatNum, pAmount
    return tStateA
 end heBetPay
 
+function heBetFirstInHandAfter pStateA, pAfterSeat
+   local tOrder, tSeatNum
+   set the itemDelimiter to comma
+   put heRotateAfter(pStateA["occ"], pAfterSeat) into tOrder
+   repeat for each item tSeatNum in tOrder
+      if pStateA["foldedBy"][tSeatNum] is "false" then
+         return tSeatNum
+      end if
+   end repeat
+   return 0
+end heBetFirstInHandAfter
+
 function heBetCloseStreet pStateA
    -- action closed: reset street bookkeeping and advance, or hand over
-   local tStateA, tSeatNum, tInHand
+   local tStateA, tSeatNum
    set the itemDelimiter to comma
    put pStateA into tStateA
-   put heBetInHandList(tStateA) into tInHand
    -- remember who shows first if this closes the final betting round
    if tStateA["aggressor"] > 0 then
       put tStateA["aggressor"] into tStateA["sdFirst"]
@@ -796,8 +641,7 @@ function heBetCloseStreet pStateA
       return tStateA
    end if
    if heBetLiveCount(tStateA) <= 1 then
-      -- nobody left who can bet: the board runs out with no more action;
-      -- board messages advance the street from here (fold-determinism)
+      -- nobody left who can bet: the board runs out with no more action
       put "runout" into tStateA["phase"]
       put 0 into tStateA["toAct"]
       put "runout" & return after tStateA["note"]
@@ -820,18 +664,6 @@ function heBetCloseStreet pStateA
    return tStateA
 end heBetCloseStreet
 
-function heBetFirstInHandAfter pStateA, pAfterSeat
-   local tOrder, tSeatNum
-   set the itemDelimiter to comma
-   put heRotateAfter(pStateA["occ"], pAfterSeat) into tOrder
-   repeat for each item tSeatNum in tOrder
-      if pStateA["foldedBy"][tSeatNum] is "false" then
-         return tSeatNum
-      end if
-   end repeat
-   return 0
-end heBetFirstInHandAfter
-
 function heBetAfterAction pStateA, pSeatNum
    -- find the next actor after pSeatNum, or close the street
    local tStateA, tNextSeat
@@ -845,8 +677,7 @@ function heBetAfterAction pStateA, pSeatNum
 end heBetAfterAction
 
 function heBetApply pStateA, pMsgType, pSeatNum, pAmount
-   -- THE transition function: every blind, action, and board message --
-   -- live play and transcript replay both come through here (plan 1b)
+   -- THE transition function: every blind, action, and board message
    local tStateA, tOwe, tPay, tTargetAmt, tIncrement, tSeatNum, tIsAllin
    local tVerb, tAmt
    set the itemDelimiter to comma
@@ -918,7 +749,6 @@ function heBetApply pStateA, pMsgType, pSeatNum, pAmount
          return tStateA
 
       case "act"
-         -- fall through to the verb handling below this switch
          break
 
       default
@@ -1102,13 +932,10 @@ end heShowdownOrderOf
 -- settlement (spec 8.3) -- deltas are a pure function of the transcript.
 -- Layered side pots: each distinct all-in level is its own pot, awarded
 -- independently; the odd chip goes to the first winner clockwise from the
--- button (pinned here, tested in the harness).
+-- button (pinned in tools/betting-kat.py).
 --------------------------------------------------------------------------
 
 function heSettleOf pStateA, pRanksA
-   -- pRanksA[seat] = heEval7 packed string for every unfolded seat (may be
-   -- empty when only one seat remains). Returns deltasA[seat] plus a
-   -- "note" key of human-readable pot lines.
    local tDeltasA, tSeatNum, tLevelsList, tLevelVal, tPrevLevel, tLayerAmt
    local tEligibleList, tBestRank, tWinnersList, tShare, tRemainder, tOrder
    local tContrib, tWinCount, tNoteTxt
@@ -1148,8 +975,6 @@ function heSettleOf pStateA, pRanksA
       end repeat
       delete char -1 of tEligibleList
       if tEligibleList is empty then
-         -- defensively unreachable (the max committed seat can never have
-         -- folded facing nothing); return the layer to its contributors
          repeat for each item tSeatNum in pStateA["occ"]
             put min(pStateA["handBy"][tSeatNum], tLevelVal) - tPrevLevel into tContrib
             if tContrib > 0 then
@@ -1198,30 +1023,39 @@ function heSettleOf pStateA, pRanksA
 end heSettleOf
 
 --------------------------------------------------------------------------
--- transcript (spec 6) -- hotseat actions are appended to a local log and
--- folded, exactly as network messages will be (the Phase 2 seam, plan 1b).
--- Hotseat content lines are unsigned; Phase 2 wraps them in heWireBuild.
+-- transcript -- plain-text bodies, no hashing/hex/binary. Hotseat actions
+-- are appended to a local log and folded, exactly as network messages will
+-- be (the Phase 2 seam). The signed canonical envelope is a Phase 2 item
+-- (its bytes are specced + KAT-pinned in tools/protocol-kat.py).
 --------------------------------------------------------------------------
 
+function heLogLine pHandNum, pFromTxt, pTypeTxt, pBodyTxt
+   -- tab-delimited; body is plain text (never contains a tab)
+   return pHandNum & tab & pFromTxt & tab & pTypeTxt & tab & pBodyTxt
+end heLogLine
+
+function heLogField pLine, pIdx
+   local tSaved, tOut
+   put the itemDelimiter into tSaved
+   set the itemDelimiter to tab
+   put item pIdx of pLine into tOut
+   set the itemDelimiter to tSaved
+   return tOut
+end heLogField
+
 command heLogAppend pTypeTxt, pFromTxt, pBodyTxt
-   local tContentLine
-   put heEnvContentLine(gGame["tableHex"], gGame["handNum"], pFromTxt, pTypeTxt, pBodyTxt) into tContentLine
-   put tContentLine & return after gGame["log"]
-   if heHasSodium() then
-      put heChainNextOf(tContentLine) into gGame["chainHeadData"]
-   end if
+   put heLogLine(gGame["handNum"], pFromTxt, pTypeTxt, pBodyTxt) & return after gGame["log"]
 end heLogAppend
 
 function heFoldTranscript pLogTxt
-   -- pure fold: replay a transcript from nothing and RE-DERIVE everything
-   -- (engine states, showdown ranks, settlements); logged settle lines are
-   -- verified against the recomputation, so replay is also an audit.
-   -- Returns: "stacksBy" (array), "handNum", "trace" (per-hand deltas
-   -- lines), "errors" (lines).
-   local tOutA, tEnvA, tLogLine, tBodyA, tStateA, tHaveHand, tSeatNum
-   local tHolesA, tBoardList, tRanksA, tDeltasA, tDeltasTxt, tSevenList
-   local tOccList, tButtonSeat, tSB, tBB, tHandNum, tSeedsHexA, tCommitsA
-   local tVerb, tAmt, tCardTxt, tPos, tOneCard, tFromTxt, tStacksTxt
+   -- pure fold: replay a transcript and RE-DERIVE everything (engine state,
+   -- showdown ranks, settlements); logged settle lines are verified against
+   -- the recomputation, so replay is also an audit. Returns "stacksBy"
+   -- (array), "handNum", "trace" (per-hand deltas lines), "errors" (lines).
+   local tOutA, tLogLine, tType, tBodyTxt, tBodyA, tStateA, tHaveHand
+   local tSeatNum, tHolesA, tBoardList, tRanksA, tDeltasA, tDeltasTxt
+   local tSevenList, tOccList, tButtonSeat, tSB, tBB, tFromTxt, tStacksTxt
+   local tPos, tCardTxt, tOneCard
    set the itemDelimiter to comma
    put 0 into tOutA["handNum"]
    put empty into tOutA["trace"]
@@ -1233,13 +1067,14 @@ function heFoldTranscript pLogTxt
       if tLogLine is empty then
          next repeat
       end if
-      put heEnvParse(tLogLine) into tEnvA
+      put heLogField(tLogLine, 3) into tType
+      put heLogField(tLogLine, 4) into tBodyTxt
       set the itemDelimiter to comma
 
-      switch tEnvA["type"]
+      switch tType
 
          case "cfg"
-            put tEnvA["body"] into tBodyA
+            put tBodyTxt into tBodyA
             split tBodyA by comma and "="
             put tBodyA["sb"] into tSB
             put tBodyA["bb"] into tBB
@@ -1255,29 +1090,22 @@ function heFoldTranscript pLogTxt
             end repeat
             break
 
-         case "seedCommit"
-            if tEnvA["hand"] > tOutA["handNum"] then
-               -- first message of a new hand: open it (button rotates among
-               -- seats that still have chips; hand 1 uses the cfg button)
-               put tEnvA["hand"] into tHandNum
-               put tHandNum into tOutA["handNum"]
-               if tHandNum > 1 then
-                  put heFoldNextButton(tOutA, tOccList, tButtonSeat) into tButtonSeat
-               end if
-               put heFoldOccNow(tOutA, tOccList) into tOccList
-               put heBetNewHand(tSB, tBB, tOutA["stacksBy"], tOccList, tButtonSeat) into tStateA
-               put "true" into tHaveHand
-               put empty into tHolesA
-               put empty into tBoardList
-               put empty into tRanksA
-               put empty into tSeedsHexA
-               put empty into tCommitsA
-            end if
-            put tEnvA["body"] into tCommitsA[tEnvA["from"]]
+         case "handStart"
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put tBodyA["seats"] into tOccList
+            replace "|" with comma in tOccList
+            put tBodyA["button"] into tButtonSeat
+            put heBetNewHand(tSB, tBB, tOutA["stacksBy"], tOccList, tButtonSeat) into tStateA
+            put "true" into tHaveHand
+            put empty into tHolesA
+            put empty into tBoardList
+            put empty into tRanksA
+            put heLogField(tLogLine, 1) into tOutA["handNum"]
             break
 
          case "holeDeliver"
-            put tEnvA["body"] into tBodyA
+            put tBodyTxt into tBodyA
             split tBodyA by comma and "="
             put tBodyA["cards"] into tCardTxt
             replace "|" with comma in tCardTxt
@@ -1286,7 +1114,7 @@ function heFoldTranscript pLogTxt
             break
 
          case "board"
-            put tEnvA["body"] into tBodyA
+            put tBodyTxt into tBodyA
             split tBodyA by comma and "="
             put tBodyA["cards"] into tCardTxt
             replace "|" with comma in tCardTxt
@@ -1294,7 +1122,7 @@ function heFoldTranscript pLogTxt
                if tBoardList is empty then
                   put heCardIndex(tOneCard) into tBoardList
                else
-                  put comma & heCardIndex(tOneCard) after tBoardList
+                  put tBoardList & comma & heCardIndex(tOneCard) into tBoardList
                end if
             end repeat
             put heBetApply(tStateA, "board", 0, 0) into tStateA
@@ -1307,37 +1135,30 @@ function heFoldTranscript pLogTxt
                put "action-before-hand" & return after tOutA["errors"]
                next repeat
             end if
-            put tEnvA["body"] into tBodyA
+            put tBodyTxt into tBodyA
             split tBodyA by comma and "="
-            put tEnvA["from"] into tFromTxt
+            put heLogField(tLogLine, 2) into tFromTxt
             put char 5 to -1 of tFromTxt into tSeatNum
-            if tEnvA["type"] is "act" then
+            if tType is "act" then
                put heBetApply(tStateA, "act", tSeatNum, tBodyA["verb"] & comma & tBodyA["amount"]) into tStateA
             else
-               put heBetApply(tStateA, tEnvA["type"], tSeatNum, tBodyA["amount"]) into tStateA
+               put heBetApply(tStateA, tType, tSeatNum, tBodyA["amount"]) into tStateA
             end if
             if tStateA["err"] is not empty then
                put "engine-rejected:" & tStateA["err"] & return after tOutA["errors"]
             end if
             break
 
-         case "seedReveal"
-            put tEnvA["body"] into tBodyA
-            split tBodyA by comma and "="
-            put tBodyA["seed"] into tSeedsHexA[tBodyA["seat"]]
-            break
-
          case "settle"
-            -- recompute the settlement and verify the logged one matches
-            put tEnvA["body"] into tBodyA
+            put tBodyTxt into tBodyA
             split tBodyA by comma and "="
             put empty into tRanksA
-            repeat for each item tSeatNum in heBetInHandList(tStateA)
-               if heCountItems(heBetInHandList(tStateA)) > 1 then
+            if heCountItems(heBetInHandList(tStateA)) > 1 then
+               repeat for each item tSeatNum in heBetInHandList(tStateA)
                   put tHolesA[tSeatNum] & comma & tBoardList into tSevenList
                   put heEval7(tSevenList) into tRanksA[tSeatNum]
-               end if
-            end repeat
+               end repeat
+            end if
             put heSettleOf(tStateA, tRanksA) into tDeltasA
             put empty into tDeltasTxt
             repeat for each item tSeatNum in tStateA["occ"]
@@ -1345,17 +1166,16 @@ function heFoldTranscript pLogTxt
             end repeat
             delete char -1 of tDeltasTxt
             if tBodyA["deltas"] is not tDeltasTxt then
-               put "settle-mismatch-hand-" & tEnvA["hand"] & ":logged=" & tBodyA["deltas"] \
+               put "settle-mismatch-hand-" & heLogField(tLogLine, 1) & ":logged=" & tBodyA["deltas"] \
                      & ":computed=" & tDeltasTxt & return after tOutA["errors"]
             end if
             repeat for each item tSeatNum in tStateA["occ"]
                add tDeltasA[tSeatNum] to tOutA["stacksBy"][tSeatNum]
             end repeat
-            put "hand " & tEnvA["hand"] & ": " & tDeltasTxt & return after tOutA["trace"]
+            put "hand " & heLogField(tLogLine, 1) & ": " & tDeltasTxt & return after tOutA["trace"]
             put "false" into tHaveHand
             break
 
-         case "audit"
          case "chat"
             break
 
@@ -1364,35 +1184,9 @@ function heFoldTranscript pLogTxt
    return tOutA
 end heFoldTranscript
 
-function heFoldNextButton pOutA, pOccList, pPrevButton
-   -- the button moves to the next seat that still has chips
-   local tOrder, tSeatNum
-   set the itemDelimiter to comma
-   put heRotateAfter(pOccList, pPrevButton) into tOrder
-   repeat for each item tSeatNum in tOrder
-      if pOutA["stacksBy"][tSeatNum] > 0 then
-         return tSeatNum
-      end if
-   end repeat
-   return pPrevButton
-end heFoldNextButton
-
-function heFoldOccNow pOutA, pOccList
-   local tOut, tSeatNum
-   set the itemDelimiter to comma
-   put empty into tOut
-   repeat for each item tSeatNum in pOccList
-      if pOutA["stacksBy"][tSeatNum] > 0 then
-         put tSeatNum & comma after tOut
-      end if
-   end repeat
-   delete char -1 of tOut
-   return tOut
-end heFoldOccNow
-
 --------------------------------------------------------------------------
--- hotseat shell -- the impure layer: owns gGame, appends to the log FIRST
--- through the engine (only accepted messages are logged), reacts to notes
+-- hotseat shell -- the impure layer: owns gGame, appends to the log through
+-- the engine (only accepted messages are logged), reacts to notes
 --------------------------------------------------------------------------
 
 command heTableNew
@@ -1404,20 +1198,11 @@ command heTableNew
    put 0 into gGame["buttonSeat"]
    put "idle" into gGame["phase"]
    put empty into gGame["log"]
-   put empty into gGame["chainHeadData"]
-   put 0 into gGame["level"]
    repeat with tSeatNum = 1 to kHeDefaultSeats
       put kHeDefaultStack into gGame["stacksBy"][tSeatNum]
    end repeat
-   if heHasSodium() then
-      put sxRandomBytes(32) into gGame["tableIdData"]
-   else
-      put heRandomSeedData() into gGame["tableIdData"]
-   end if
-   put heBin2Hex(gGame["tableIdData"]) into gGame["tableHex"]
-   -- cfg is message zero (spec 6)
-   put 0 into gGame["handNum"]
-   heLogAppend "cfg", "seat0", heCfgBody()
+   put heHexId(16) into gGame["tableId"]
+   heLogAppend "cfg", "table", heCfgBody()
    heHudMark
 end heTableNew
 
@@ -1431,7 +1216,7 @@ function heCfgBody
    end repeat
    delete char -1 of tSeatsTxt
    delete char -1 of tStacksTxt
-   return "v=1,level=" & gGame["level"] & ",sb=" & gGame["sb"] & ",bb=" & gGame["bb"] \
+   return "sb=" & gGame["sb"] & ",bb=" & gGame["bb"] \
          & ",seats=" & tSeatsTxt & ",stacks=" & tStacksTxt & ",button=1"
 end heCfgBody
 
@@ -1447,16 +1232,28 @@ function heSeatsAlive
    return tOut
 end heSeatsAlive
 
+function heNextAliveAfter pSeatNum
+   local tTry
+   put pSeatNum into tTry
+   repeat kHeDefaultSeats times
+      put tTry mod kHeDefaultSeats + 1 into tTry
+      if gGame["stacksBy"][tTry] > 0 then
+         return tTry
+      end if
+   end repeat
+   return pSeatNum
+end heNextAliveAfter
+
 command heHandStart
-   local tOccList, tSeatNum, tSeedsA, tCommitsA, tXorHex, tKeyData, tPos
-   local tDeckList, tDealA, tHoleNames, tCount, tSeatPos, tHolePair
+   local tOccList, tSeatNum, tDeckList, tDealA, tHolePair, tHoleNames
+   local tSeatsTxt
    set the itemDelimiter to comma
    if gGame["phase"] is "hand" then
       exit heHandStart
    end if
    put heSeatsAlive() into tOccList
    if heCountItems(tOccList) < 2 then
-      heUISetStatus "Game over -- one stack left. Press Deal for a fresh table."
+      heUISetStatus "Game over -- one stack left. Starting a fresh table."
       heTableNew
       exit heHandStart
    end if
@@ -1469,51 +1266,22 @@ command heHandStart
    put tOccList into gGame["occ"]
    put "hand" into gGame["phase"]
 
-   -- Level 0 deal, step 1-3 (spec 7.1): commit, (locally) share, shuffle.
-   -- In hotseat every seat is this machine, so the sealed-box hop is a
-   -- no-op; the commit-reveal code path still runs for real so the audit
-   -- audits something real. Seeds travel as hex (H6); fixedSeedsA (the
-   -- harness seam) holds hex too.
-   put 0 into tPos
-   repeat for each item tSeatNum in tOccList
-      add 1 to tPos
-      if gGame["fixedSeedsA"][tSeatNum] is not empty then
-         put gGame["fixedSeedsA"][tSeatNum] into tSeedsA[tPos]
-      else
-         put heBin2Hex(heRandomSeedData()) into tSeedsA[tPos]
-      end if
-      if heHasSodium() then
-         put heSeedCommitOf(tSeedsA[tPos]) into tCommitsA[tPos]
-      else
-         put "nocrypto" into tCommitsA[tPos]
-      end if
-      heLogAppend "seedCommit", "seat" & tSeatNum, tCommitsA[tPos]
-   end repeat
-   put heCountItems(tOccList) into tCount
-   if heHasSodium() then
-      put heXorSeedsA(tSeedsA, tCount) into tXorHex
-      put heStreamKeyOf(gGame["tableIdData"], gGame["handNum"], tXorHex) into tKeyData
-      put heDeckFromStreamKey(tKeyData) into tDeckList
-   else
-      -- practice-entropy fallback: still a uniform Fisher-Yates, loudly
-      -- non-cryptographic (see heRandomSeedData)
-      put heShuffleFromStream(hePracticeStream()) into tDeckList
-   end if
+   put tOccList into tSeatsTxt
+   replace comma with "|" in tSeatsTxt
+   heLogAppend "handStart", "table", "seats=" & tSeatsTxt & ",button=" & gGame["buttonSeat"]
+
+   -- deal from the integer PRNG (binary-free); CSPRNG-seeded when possible
+   put heShuffleDeck(heFreshPrngState()) into tDeckList
    put heDealAssign(tDeckList, tOccList, gGame["buttonSeat"]) into tDealA
    put tDeckList into tDealA["deckList"]
-   put tCount into tDealA["seatCount"]
-   repeat with tSeatPos = 1 to tCount
-      put tSeedsA[tSeatPos] into tDealA["seedsA"][tSeatPos]
-      put tCommitsA[tSeatPos] into tDealA["commitsA"][tSeatPos]
-   end repeat
+   put heCountItems(tOccList) into tDealA["seatCount"]
    put tDealA into gGame["deal"]
 
-   -- step 4: hole delivery (hotseat: plain body; Phase 2 seals per seat)
+   -- hole delivery (hotseat shows all; Phase 2 seals per seat)
    repeat for each item tSeatNum in tOccList
       put tDealA["holesBy"][tSeatNum] into tHolePair
-      put heCardName(item 1 of tHolePair) & "|" \
-            & heCardName(item 2 of tHolePair) into tHoleNames
-      heLogAppend "holeDeliver", "seat" & gGame["buttonSeat"], "seat=" & tSeatNum & ",cards=" & tHoleNames
+      put heCardName(item 1 of tHolePair) & "|" & heCardName(item 2 of tHolePair) into tHoleNames
+      heLogAppend "holeDeliver", "table", "seat=" & tSeatNum & ",cards=" & tHoleNames
    end repeat
 
    -- blinds through the engine, then the table is live
@@ -1525,32 +1293,9 @@ command heHandStart
    heUIPromptToAct
 end heHandStart
 
-function heNextAliveAfter pSeatNum
-   local tSeatNum, tTry
-   put pSeatNum into tTry
-   repeat kHeDefaultSeats times
-      put tTry mod kHeDefaultSeats + 1 into tTry
-      if gGame["stacksBy"][tTry] > 0 then
-         return tTry
-      end if
-   end repeat
-   return pSeatNum
-end heNextAliveAfter
-
-function hePracticeStream
-   -- 1024 hex chars = the same 512 stream bytes, already in the hex form
-   -- the draw consumes (H6); practice entropy only, never networked
-   local tOut
-   put empty into tOut
-   repeat 1024 times
-      put char random(16) of "0123456789abcdef" after tOut
-   end repeat
-   return tOut
-end hePracticeStream
-
 command heEngineDo pMsgType, pSeatNum, pAmount
    -- one gate for every state transition: apply, then log ONLY if accepted
-   local tStateA, tBodyTxt, tVerb
+   local tStateA, tVerb
    put heBetApply(gGame["state"], pMsgType, pSeatNum, pAmount) into tStateA
    if tStateA["err"] is not empty then
       heUISetStatus "Rejected: " & tStateA["err"]
@@ -1584,6 +1329,7 @@ command heReactToNotes
    local tNoteLine, tNotesTxt
    put gGame["state"]["note"] into tNotesTxt
    repeat for each line tNoteLine in tNotesTxt
+      set the itemDelimiter to comma
       switch item 1 of tNoteLine
          case "advance:flop"
             heDealBoard "flop"
@@ -1628,7 +1374,7 @@ command heDealBoard pStreetName
       put heCardName(tIdx) & "|" after tCardsTxt
    end repeat
    delete char -1 of tCardsTxt
-   heLogAppend "board", "seat" & gGame["buttonSeat"], "street=" & pStreetName & ",cards=" & tCardsTxt
+   heLogAppend "board", "table", "street=" & pStreetName & ",cards=" & tCardsTxt
    heUIShowBoardStreet pStreetName, tIdxList
    heHudMark
 end heDealBoard
@@ -1661,10 +1407,9 @@ command heRunoutBoards
 end heRunoutBoards
 
 command heHandShowdown
-   -- settle, reveal seeds, audit, receipt line, schedule the next hand
+   -- settle, receipt line, schedule the next hand
    local tStateA, tRanksA, tSeatNum, tSevenList, tDeltasA, tDeltasTxt
-   local tDealA, tInHandList, tAuditTxt, tBoardIdxList, tSettleBody, tSeatPos
-   local tOccList
+   local tDealA, tInHandList, tBoardIdxList
    set the itemDelimiter to comma
    put gGame["state"] into tStateA
    put gGame["deal"] into tDealA
@@ -1687,32 +1432,10 @@ command heHandShowdown
       add tDeltasA[tSeatNum] to gGame["stacksBy"][tSeatNum]
    end repeat
    delete char -1 of tDeltasTxt
-
-   -- step 5 (spec 7.1): reveal, audit, and log the result (seeds are hex)
-   put tStateA["occ"] into tOccList
-   repeat with tSeatPos = 1 to tDealA["seatCount"]
-      put item tSeatPos of tOccList into tSeatNum
-      heLogAppend "seedReveal", "seat" & tSeatNum, \
-            "seat=" & tSeatNum & ",seed=" & tDealA["seedsA"][tSeatPos]
-   end repeat
-   if heHasSodium() then
-      put heAuditHand(gGame["tableIdData"], gGame["handNum"], tDealA["seedsA"], \
-            tDealA["commitsA"], tDealA["seatCount"], tDealA, tStateA["occ"], \
-            tStateA["buttonSeat"]) into tAuditTxt
-   else
-      put "skipped-no-sodium" into tAuditTxt
-   end if
-   heLogAppend "audit", "seat" & gGame["buttonSeat"], "result=" & tAuditTxt
-
-   put "deltas=" & tDeltasTxt into tSettleBody
-   if heHasSodium() then
-      put ",hash=" & heSettleHashOf(tDeltasTxt, gGame["chainHeadData"]) after tSettleBody
-   end if
-   heLogAppend "settle", "seat" & gGame["buttonSeat"], tSettleBody
+   heLogAppend "settle", "table", "deltas=" & tDeltasTxt
 
    put "between" into gGame["phase"]
-   heUISetStatus "Hand " & gGame["handNum"] & " settled: " & tDeltasTxt \
-         & ". Audit: " & tAuditTxt
+   heUISetStatus "Hand " & gGame["handNum"] & " settled: " & tDeltasTxt
    heHudMark
    send "heNextHandTick" to me in kHeNextHandDelayMs milliseconds
 end heHandShowdown
@@ -1728,17 +1451,24 @@ on heNextHandTick
 end heNextHandTick
 
 --------------------------------------------------------------------------
--- UI: self-building chrome (family pattern -- script-only stacks carry no
--- controls, so everything is created at open and tagged with kUIVersion).
--- Two modes: "kit" needs Box2Dxt Kit + an atlas path in the stack custom
--- property uHeAtlasPath; "flat" is pure fields and always works.
--- ALL of this section: verified statically; needs an OXT pass.
+-- UI: self-building chrome (family pattern). Two modes: "kit" needs Box2Dxt
+-- Kit + an atlas path in uHeAtlasPath; "flat" is pure fields and always
+-- works. All verified statically; needs an OXT pass.
 --------------------------------------------------------------------------
+
+function heHasKit
+   if gHasKitChk is empty then
+      if there is a stack "box2dxt-kit" then
+         put "true" into gHasKitChk
+      else
+         put "false" into gHasKitChk
+      end if
+   end if
+   return gHasKitChk is "true"
+end heHasKit
 
 command heBuildTable
    local tSeatNum, tSpotTxt, tSpotX, tSpotY, tPos
-   -- create targets the defaultStack, which is not guaranteed to be us
-   -- during openStack in a multi-stack IDE session
    set the defaultStack to the short name of this stack
    if there is a graphic "heFelt" and the uHeUIVersion of this stack is kUIVersion then
       exit heBuildTable
@@ -1754,7 +1484,6 @@ command heBuildTable
    set the backgroundColor of graphic "heFelt" to "20,90,50"
    set the opaque of graphic "heFelt" to true
 
-   -- six seat plates: name + stack + two hole-card slots each
    repeat with tSeatNum = 1 to kHeDefaultSeats
       set the itemDelimiter to ";"
       put item tSeatNum of kHeSeatSpots into tSpotTxt
@@ -1763,18 +1492,17 @@ command heBuildTable
       put item 2 of tSpotTxt into tSpotY
       create field ("heSeatName" & tSeatNum)
       set the rect of field ("heSeatName" & tSeatNum) to \
-            tSpotX - 55 & comma & tSpotY - 12 & comma & tSpotX + 55 & comma & tSpotY + 8
+            (tSpotX - 55) & comma & (tSpotY - 12) & comma & (tSpotX + 55) & comma & (tSpotY + 8)
       set the text of field ("heSeatName" & tSeatNum) to "Seat " & tSeatNum
       set the lockText of field ("heSeatName" & tSeatNum) to true
       create field ("heSeatStack" & tSeatNum)
       set the rect of field ("heSeatStack" & tSeatNum) to \
-            tSpotX - 55 & comma & tSpotY + 8 & comma & tSpotX + 55 & comma & tSpotY + 28
+            (tSpotX - 55) & comma & (tSpotY + 8) & comma & (tSpotX + 55) & comma & (tSpotY + 28)
       set the lockText of field ("heSeatStack" & tSeatNum) to true
       heMakeCardSlot "heHole" & tSeatNum & "a", tSpotX - 26, tSpotY - 46
       heMakeCardSlot "heHole" & tSeatNum & "b", tSpotX + 26, tSpotY - 46
    end repeat
 
-   -- board slots
    repeat with tPos = 1 to 5
       heMakeCardSlot "heBoard" & tPos, kHeBoardX0 + (tPos - 1) * kHeBoardDX, kHeBoardY
    end repeat
@@ -1820,8 +1548,8 @@ end heWipeChrome
 command heMakeCardSlot pSlotName, pCenterX, pCenterY
    create field pSlotName
    set the rect of field pSlotName to \
-         pCenterX - kHeCardW div 2 & comma & pCenterY - kHeCardH div 2 & comma \
-         & pCenterX + kHeCardW div 2 & comma & pCenterY + kHeCardH div 2
+         (pCenterX - kHeCardW div 2) & comma & (pCenterY - kHeCardH div 2) & comma \
+         & (pCenterX + kHeCardW div 2) & comma & (pCenterY + kHeCardH div 2)
    set the lockText of field pSlotName to true
    set the textAlign of field pSlotName to "center"
    set the textSize of field pSlotName to 16
@@ -1832,13 +1560,11 @@ end heMakeCardSlot
 
 command heMakeActionButton pBtnName, pLabelTxt, pLeftX
    create button pBtnName
-   set the rect of button pBtnName to pLeftX & ",584" & comma & pLeftX + 76 & ",616"
+   set the rect of button pBtnName to pLeftX & ",584" & comma & (pLeftX + 76) & ",616"
    set the label of button pBtnName to pLabelTxt
 end heMakeActionButton
 
 command heKitTryInit
-   -- kit mode is strictly additive: no atlas, no kit, no problem -- flat
-   -- mode keeps the game playable. Pool-at-build + pre-warm per playbook.
    local tIdx
    put "flat" into gUIMode
    put 0 into gAnimBusy
@@ -1854,8 +1580,6 @@ command heKitTryInit
    try
       start using stack "box2dxt-kit"
       b2kSheetLoadAtlas "heCards", the uHeAtlasPath of this stack
-      -- pre-warm every face that can appear (the ~250 ms lazy-slice hitch
-      -- landing on the river flip is the one unforgivable jank)
       repeat with tIdx = 1 to 52
          b2kSheetEnsureIcon "heCards", heCardName(tIdx)
       end repeat
@@ -1867,7 +1591,6 @@ command heKitTryInit
 end heKitTryInit
 
 on mouseUp
-   -- one dispatcher, no per-control scripts (message path does the work)
    local tWho, tSeatNum, tAmt
    put the short name of the target into tWho
    if tWho is "heBtnDeal" then
@@ -1939,7 +1662,6 @@ command heHudMark
 end heHudMark
 
 on heHudTick
-   -- HUD refresh at 4 Hz max, and only on change (playbook law)
    if gHudTickOn is not true then
       exit heHudTick
    end if
@@ -1951,18 +1673,17 @@ on heHudTick
 end heHudTick
 
 command heHudRefresh
-   local tSeatNum, tPotAmt, tSpotTxt, tSpotX, tSpotY
+   local tSeatNum, tPotAmt, tSpotTxt, tSpotX, tSpotY, tHandBy
    if there is not a field "hePot" then
       exit heHudRefresh
    end if
    put 0 into tPotAmt
    repeat with tSeatNum = 1 to kHeDefaultSeats
-      if gGame["state"]["handBy"][tSeatNum] is a number then
-         add gGame["state"]["handBy"][tSeatNum] to tPotAmt
-      end if
+      put heHandByOf(tSeatNum) into tHandBy
+      add tHandBy to tPotAmt
       if gGame["stacksBy"][tSeatNum] is a number then
-         set the text of field ("heSeatStack" & tSeatNum) to gGame["stacksBy"][tSeatNum] - \
-               heHandByOf(tSeatNum) & " chips"
+         set the text of field ("heSeatStack" & tSeatNum) to \
+               (gGame["stacksBy"][tSeatNum] - tHandBy) & " chips"
       end if
    end repeat
    set the text of field "hePot" to "Pot: " & tPotAmt
@@ -1972,7 +1693,7 @@ command heHudRefresh
       set the itemDelimiter to comma
       put item 1 of tSpotTxt into tSpotX
       put item 2 of tSpotTxt into tSpotY
-      set the loc of graphic "heDealerDisc" to tSpotX + 66 & comma & tSpotY - 20
+      set the loc of graphic "heDealerDisc" to (tSpotX + 66) & comma & (tSpotY - 20)
    end if
 end heHudRefresh
 
@@ -1988,7 +1709,6 @@ command heUIHandStart
    heUIClearCards
    put gGame["deal"] into tDealA
    set the itemDelimiter to comma
-   -- hotseat shows every hole face-up; staggered slides in kit mode
    repeat for each item tSeatNum in gGame["occ"]
       heUIShowHole tSeatNum, tDealA["holesBy"][tSeatNum]
    end repeat
@@ -1996,17 +1716,16 @@ command heUIHandStart
 end heUIHandStart
 
 command heUIShowHole pSeatNum, pIdxPair
-   local tSlotName
+   local tSlotName, tPair
    set the itemDelimiter to comma
+   put pIdxPair into tPair
    put "heHole" & pSeatNum & "a" into tSlotName
-   heUIShowCardIn tSlotName, item 1 of pIdxPair
+   heUIShowCardIn tSlotName, item 1 of tPair
    put "heHole" & pSeatNum & "b" into tSlotName
-   heUIShowCardIn tSlotName, item 2 of pIdxPair
+   heUIShowCardIn tSlotName, item 2 of tPair
 end heUIShowHole
 
 command heUIShowCardIn pSlotName, pIdx
-   -- flat mode: face text in the slot field; kit mode: sprite frame swap +
-   -- squash-flip is layered on during the OXT pass (gotchas 19/23/27)
    if there is not a field pSlotName then
       exit heUIShowCardIn
    end if
@@ -2065,19 +1784,409 @@ command heUIClearCards
 end heUIClearCards
 
 on b2kFrame
-   -- idle cost is one compare (playbook); kit-mode animations land here
-   -- during the OXT pass
    if gAnimBusy > 0 then
-      -- reserved: deal-slide / flip chaining bookkeeping
+      -- reserved: deal-slide / flip chaining bookkeeping (OXT pass)
    end if
 end b2kFrame
 
 on b2kSpriteOnFinish pSpriteId
-   -- one-shots fire for whoever started them (gotcha 19): every flip
-   -- sequence must gate on its own context lock before chaining
    if gFlipCtxA[pSpriteId] is empty then
       exit b2kSpriteOnFinish
    end if
-   -- reserved: face swap + edge->flat second half of the squash flip
    put empty into gFlipCtxA[pSpriteId]
 end b2kSpriteOnFinish
+
+--------------------------------------------------------------------------
+-- self-test harness (folded in -- run heRunSelftest in the message box).
+-- Self-diagnosing asserts print what was OBSERVED. kHeHarnessV is in the
+-- header; bump it on every engine-behavior change.
+--------------------------------------------------------------------------
+
+local gRpt, gPassN, gFailN, gSkipN
+
+constant kKatSeed1Deck = "8h,4d,6s,Qd,2c,2d,6d,7d,Ad,Jd,8d,5c,5d,Ts,Tc,7c,8c,Ac,3c,Js,6c,Ah,9d,Jh,2h,As,9s,Kc,8s,4c,Qc,5h,Th,7s,2s,Kh,5s,Qh,9c,4s,Jc,3d,Kd,9h,3s,Qs,3h,Td,Ks,7h,6h,4h"
+
+command heRunSelftest
+   put empty into gRpt
+   put 0 into gPassN
+   put 0 into gFailN
+   put 0 into gSkipN
+   put "holde-em self-test  stack v" & kHeVersion & "  harness v" & kHeHarnessV \
+         & return & return after gRpt
+   heTestEvaluatorRun
+   heTestBettingRun
+   heTestShuffleRun
+   heTestFoldRun
+   put return & heProbeSodium() after gRpt
+   put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
+         & return after gRpt
+   if gFailN > 0 then
+      put "RESULT: FAILED" & return after gRpt
+   else
+      put "RESULT: green" & return after gRpt
+   end if
+   put gRpt
+   return gRpt
+end heRunSelftest
+
+command heTAssert pLabel, pObserved, pExpected
+   if pObserved is pExpected then
+      add 1 to gPassN
+      put "PASS  " & pLabel & return after gRpt
+   else
+      add 1 to gFailN
+      put "FAIL  " & pLabel & return after gRpt
+      put "      observed: " & pObserved & return after gRpt
+      put "      expected: " & pExpected & return after gRpt
+   end if
+end heTAssert
+
+command heTContains pLabel, pObserved, pNeedle
+   if pObserved contains pNeedle then
+      add 1 to gPassN
+      put "PASS  " & pLabel & return after gRpt
+   else
+      add 1 to gFailN
+      put "FAIL  " & pLabel & return after gRpt
+      put "      observed: " & pObserved & return after gRpt
+      put "      expected to contain: " & pNeedle & return after gRpt
+   end if
+end heTContains
+
+function heTIdxOf pNamesTxt
+   local tOut, tNameTxt, tNames
+   set the itemDelimiter to comma
+   put pNamesTxt into tNames
+   replace comma with space in tNames
+   put empty into tOut
+   repeat for each word tNameTxt in tNames
+      put heCardIndex(tNameTxt) & comma after tOut
+   end repeat
+   delete char -1 of tOut
+   return tOut
+end heTIdxOf
+
+function heTNamesOf pIdxList
+   local tOut, tIdx
+   set the itemDelimiter to comma
+   put empty into tOut
+   repeat for each item tIdx in pIdxList
+      put heCardName(tIdx) & comma after tOut
+   end repeat
+   delete char -1 of tOut
+   return tOut
+end heTNamesOf
+
+function heTVectors
+   local tVecs
+   put empty into tVecs
+   put "As Ks Qs Js Ts 2c 3d|081400000000|royal flush" & return after tVecs
+   put "9h 8h 7h 6h 5h Ad Kc|080900000000|straight flush 9 high" & return after tVecs
+   put "Ah 2h 3h 4h 5h Kd Qc|080500000000|wheel straight flush high=5" & return after tVecs
+   put "Ah 2h 3h 4h 5h Kh Qh|080500000000|steel wheel not outranked by flush" & return after tVecs
+   put "Qc Qd Qh Qs Ad 2c 3c|071214000000|quads with best kicker" & return after tVecs
+   put "8c 8d 8h 8s Kd 2c 2d|070813000000|quads on board, kicker decides" & return after tVecs
+   put "Ac Ad Ah Kc Kd Kh Qs|061413000000|boat over boat: two trips" & return after tVecs
+   put "2c 2d 2h 3c 3d Ah Kh|060203000000|boat: low trips high pair" & return after tVecs
+   put "9h 8h 6h 5h 2h 7c Td|050908060502|flush beats mixed straight" & return after tVecs
+   put "Ah Qh Th 8h 6h 4h 2h|051412100806|flush best five of seven suited" & return after tVecs
+   put "As Kd Qh Js Tc 2c 3d|041400000000|broadway straight" & return after tVecs
+   put "As Kd Qh Js Tc 4h 5s|041400000000|board plays: same broadway" & return after tVecs
+   put "Ad 2c 3h 4s 5d Kc Qh|040500000000|wheel straight mixed suits" & return after tVecs
+   put "2c 3d 4h 5s 6c 7d 8h|040800000000|seven-card run picks best high" & return after tVecs
+   put "8c 7d 6h 5s 4c 8d 4d|040800000000|straight through paired board" & return after tVecs
+   put "Ac Kd Qh Js 9c 2d 3h|001413121109|A-K-Q-J-9 is no straight" & return after tVecs
+   put "Ac Ad Ah Kc Qd 9s 2c|031413120000|trips with two kickers" & return after tVecs
+   put "Ac Ad Kc Kd Qc Qd 2h|021413120000|two pair from three pairs" & return after tVecs
+   put "9c 9d 8c 8d 2h 2s Ac|020908140000|two pair lone ace outkicks" & return after tVecs
+   put "Jc Jd 4c 4d 9h 8s Ah|021104140000|plain two pair ace kicker" & return after tVecs
+   put "Ac Ad Kc Qd 9s 5h 2c|011413120900|one pair three kickers" & return after tVecs
+   put "7c 7d 7h 4c 4d 4h As|060704000000|full house from two trips low" & return after tVecs
+   put "2c 2d 2h 2s Ac 7d 5h|070214000000|quads of deuces ace kicker" & return after tVecs
+   put "Kh Jh Th 9h 8h 7h 2c|081100000000|six-card flush hides a J-high SF" & return after tVecs
+   return tVecs
+end heTVectors
+
+command heTestEvaluatorRun
+   local tVecLine, tExpect, tLabel, tIdxList, tBase, tPermLines, tPermLine
+   local tPermuted, tPos, tResA, tPairI, tPairJ, tBad, tVecCount, tA, tBv
+   put "-- 1. evaluator (spec 8.2)" & return after gRpt
+   repeat for each line tVecLine in heTVectors()
+      set the itemDelimiter to "|"
+      put item 2 of tVecLine into tExpect
+      put item 3 of tVecLine into tLabel
+      put heTIdxOf(item 1 of tVecLine) into tIdxList
+      heTAssert "eval: " & tLabel, heEval7(tIdxList), tExpect
+   end repeat
+
+   put "7,6,5,4,3,2,1" & return & "4,5,6,7,1,2,3" & return \
+         & "2,4,6,1,3,5,7" & return & "5,1,7,3,6,2,4" into tPermLines
+   put 0 into tBad
+   repeat for each line tVecLine in heTVectors()
+      set the itemDelimiter to "|"
+      put heTIdxOf(item 1 of tVecLine) into tIdxList
+      set the itemDelimiter to comma
+      put heEval7(tIdxList) into tBase
+      repeat for each line tPermLine in tPermLines
+         put empty into tPermuted
+         repeat for each item tPos in tPermLine
+            put item tPos of tIdxList & comma after tPermuted
+         end repeat
+         delete char -1 of tPermuted
+         if heEval7(tPermuted) is not tBase then
+            add 1 to tBad
+         end if
+      end repeat
+   end repeat
+   heTAssert "eval: order independence (24 hands x 4 permutations)", tBad, 0
+
+   put 0 into tPos
+   repeat for each line tVecLine in heTVectors()
+      set the itemDelimiter to "|"
+      add 1 to tPos
+      put heEval7(heTIdxOf(item 1 of tVecLine)) into tResA[tPos]
+   end repeat
+   put tPos into tVecCount
+   put 0 into tBad
+   repeat with tPairI = 1 to tVecCount - 1
+      repeat with tPairJ = tPairI + 1 to tVecCount
+         put tResA[tPairI] > tResA[tPairJ] into tA
+         put tResA[tPairJ] > tResA[tPairI] into tBv
+         if tResA[tPairI] is tResA[tPairJ] then
+            if tA or tBv then
+               add 1 to tBad
+            end if
+         else
+            if tA is tBv then
+               add 1 to tBad
+            end if
+         end if
+      end repeat
+   end repeat
+   heTAssert "eval: antisymmetry over all vector pairs", tBad, 0
+end heTestEvaluatorRun
+
+function heTNewHand pSB, pBB, pStacksList, pOccList, pButtonSeat
+   local tStacksA, tPos, tSeatNum
+   set the itemDelimiter to comma
+   put 0 into tPos
+   repeat for each item tSeatNum in pOccList
+      add 1 to tPos
+      put item tPos of pStacksList into tStacksA[tSeatNum]
+   end repeat
+   return heBetNewHand(pSB, pBB, tStacksA, pOccList, pButtonSeat)
+end heTNewHand
+
+function heTBlinds pStateA
+   local tStateA
+   put heBetApply(pStateA, "bidSB", pStateA["sbSeat"], \
+         min(pStateA["sb"], pStateA["stackBy"][pStateA["sbSeat"]])) into tStateA
+   put heBetApply(tStateA, "bidBB", tStateA["bbSeat"], \
+         min(tStateA["bb"], tStateA["stackBy"][tStateA["bbSeat"]])) into tStateA
+   return tStateA
+end heTBlinds
+
+function heTAct pStateA, pSeatNum, pVerbAmt, pExpectErr, pLabel
+   local tStateA
+   put heBetApply(pStateA, "act", pSeatNum, pVerbAmt) into tStateA
+   heTAssert pLabel, tStateA["err"], pExpectErr
+   if tStateA["err"] is empty then
+      return tStateA
+   end if
+   return pStateA
+end heTAct
+
+function heTDeltasTxt pDeltasA, pOccList
+   local tOut, tSeatNum
+   set the itemDelimiter to comma
+   put empty into tOut
+   repeat for each item tSeatNum in pOccList
+      put tSeatNum & ":" & pDeltasA[tSeatNum] & "|" after tOut
+   end repeat
+   delete char -1 of tOut
+   return tOut
+end heTDeltasTxt
+
+command heTestBettingRun
+   local tStateA, tDeltasA, tRanksA
+   put return & "-- 2. betting engine (spec 8.1) + settlement (8.3)" & return after gRpt
+   set the itemDelimiter to comma
+
+   put heTBlinds(heTNewHand(1, 2, "100,100,100", "1,2,3", 1)) into tStateA
+   heTAssert "bet: preflop first to act is left of BB", tStateA["toAct"], 1
+   put heTAct(tStateA, 1, "raise,3", "raise-below-minimum", "bet: raise under min rejected") into tStateA
+   put heTAct(tStateA, 1, "raise,4", empty, "bet: min raise accepted") into tStateA
+   put heTAct(tStateA, 2, "raise,5", "raise-below-minimum", "bet: re-raise under min rejected") into tStateA
+   put heTAct(tStateA, 2, "raise,6", empty, "bet: re-raise at min accepted") into tStateA
+   heTAssert "bet: raiseFull tracks the full raise", tStateA["raiseFull"], 2
+
+   put heTBlinds(heTNewHand(1, 2, "100,13,100", "1,2,3", 1)) into tStateA
+   put heTAct(tStateA, 1, "call,2", empty, "bet: limp accepted") into tStateA
+   put heTAct(tStateA, 2, "call,1", empty, "bet: sb completes") into tStateA
+   put heTAct(tStateA, 3, "check,0", empty, "bet: bb checks option") into tStateA
+   heTAssert "bet: flop reached", tStateA["street"], "flop"
+   put heTAct(tStateA, 2, "check,0", empty, "bet: flop check") into tStateA
+   put heTAct(tStateA, 3, "bet,10", empty, "bet: flop bet 10") into tStateA
+   put heTAct(tStateA, 1, "call,10", empty, "bet: flop call") into tStateA
+   put heTAct(tStateA, 2, "allin,11", empty, "bet: under-raise all-in accepted") into tStateA
+   heTAssert "bet: raiseFull stays 10 after under-raise", tStateA["raiseFull"], 10
+   put heTAct(tStateA, 3, "raise,25", "raise-not-reopened", "bet: bettor cannot re-raise under-raise") into tStateA
+   put heTAct(tStateA, 3, "call,1", empty, "bet: bettor calls the extra") into tStateA
+   put heTAct(tStateA, 1, "call,1", empty, "bet: caller calls the extra") into tStateA
+   heTAssert "bet: street closes to turn", tStateA["street"], "turn"
+
+   put heTBlinds(heTNewHand(1, 2, "100,50,20", "1,2,3", 1)) into tStateA
+   put heTAct(tStateA, 1, "allin,100", empty, "pot: open shove") into tStateA
+   put heTAct(tStateA, 2, "allin,50", empty, "pot: short call-allin") into tStateA
+   put heTAct(tStateA, 3, "allin,20", empty, "pot: shorter call-allin") into tStateA
+   heTAssert "pot: hand runs out", tStateA["phase"], "runout"
+   put heBetApply(tStateA, "board", 0, 0) into tStateA
+   put heBetApply(tStateA, "board", 0, 0) into tStateA
+   put heBetApply(tStateA, "board", 0, 0) into tStateA
+   heTAssert "pot: runout reaches showdown", tStateA["phase"], "showdown"
+   put empty into tRanksA
+   put "011413120900" into tRanksA[1]
+   put "021104140000" into tRanksA[2]
+   put "031413120000" into tRanksA[3]
+   put heSettleOf(tStateA, tRanksA) into tDeltasA
+   heTAssert "pot: main 60 to s3, side 60 to s2, 50 back to s1", \
+         heTDeltasTxt(tDeltasA, tStateA["occ"]), "1:-50|2:10|3:40"
+
+   put heTNewHand(1, 2, "100,100", "2,5", 2) into tStateA
+   heTAssert "hu: button posts SB", tStateA["sbSeat"], 2
+   heTAssert "hu: other seat posts BB", tStateA["bbSeat"], 5
+   put heTBlinds(tStateA) into tStateA
+   heTAssert "hu: button acts first preflop", tStateA["toAct"], 2
+   put heTAct(tStateA, 2, "call,1", empty, "hu: button completes") into tStateA
+   put heTAct(tStateA, 5, "check,0", empty, "hu: bb checks") into tStateA
+   heTAssert "hu: non-button acts first postflop", tStateA["toAct"], 5
+
+   put heTBlinds(heTNewHand(1, 2, "100,100", "1,2", 1)) into tStateA
+   put heTAct(tStateA, 1, "raise,6", empty, "fw: open raise") into tStateA
+   put heTAct(tStateA, 2, "fold,0", empty, "fw: fold") into tStateA
+   heTAssert "fw: fold ends the hand", tStateA["phase"], "handdone"
+   put empty into tRanksA
+   put heSettleOf(tStateA, tRanksA) into tDeltasA
+   heTAssert "fw: uncalled raise returned", heTDeltasTxt(tDeltasA, tStateA["occ"]), "1:2|2:-2"
+
+   put heTBlinds(heTNewHand(1, 2, "100,100,100", "1,2,3", 1)) into tStateA
+   put heTAct(tStateA, 1, "call,2", empty, "split: limp") into tStateA
+   put heTAct(tStateA, 2, "call,1", empty, "split: sb completes") into tStateA
+   put heTAct(tStateA, 3, "check,0", empty, "split: bb checks") into tStateA
+   put heTAct(tStateA, 2, "bet,9", empty, "split: flop bet") into tStateA
+   put heTAct(tStateA, 3, "call,9", empty, "split: flop call 1") into tStateA
+   put heTAct(tStateA, 1, "call,9", empty, "split: flop call 2") into tStateA
+   put heTAct(tStateA, 2, "check,0", empty, "split: turn check 1") into tStateA
+   put heTAct(tStateA, 3, "check,0", empty, "split: turn check 2") into tStateA
+   put heTAct(tStateA, 1, "check,0", empty, "split: turn check 3") into tStateA
+   put heTAct(tStateA, 2, "check,0", empty, "split: river check") into tStateA
+   put heTAct(tStateA, 3, "bet,2", empty, "split: river bet") into tStateA
+   put heTAct(tStateA, 1, "call,2", empty, "split: river call 1") into tStateA
+   put heTAct(tStateA, 2, "call,2", empty, "split: river call 2") into tStateA
+   heTAssert "split: river aggressor shows first", heShowdownOrderOf(tStateA), "3,1,2"
+   put empty into tRanksA
+   put "041400000000" into tRanksA[1]
+   put "041400000000" into tRanksA[2]
+   put "011413120900" into tRanksA[3]
+   put heSettleOf(tStateA, tRanksA) into tDeltasA
+   heTAssert "split: odd chip to first winner after button", \
+         heTDeltasTxt(tDeltasA, tStateA["occ"]), "1:6|2:7|3:-13"
+
+   put heTNewHand(1, 2, "1,2", "4,6", 4) into tStateA
+   put heBetApply(tStateA, "bidSB", 4, 1) into tStateA
+   heTAssert "blind: short SB posts all-in", tStateA["allinBy"][4], "true"
+   put heBetApply(tStateA, "bidBB", 6, 2) into tStateA
+   heTAssert "blind: both blinds all-in -> runout", tStateA["phase"], "runout"
+end heTestBettingRun
+
+command heTestShuffleRun
+   local tDeckList, tDealA, tPos, tSeenA, tDup, tSecond
+   put return & "-- 3. integer shuffle (binary-free deal)" & return after gRpt
+
+   -- draw bounds: every draw is within 1..n
+   heTAssert "draw: minstd step is deterministic", heRngStep(1), 16807
+   heTAssert "draw: uniform in range returns value,state", item 1 of heDrawInt(1, 52) is a number, "true"
+
+   -- pinned deck for a fixed seed (mirrored in tools; MINSTD from seed 1)
+   put heShuffleDeck(1) into tDeckList
+   heTAssert "shuffle: seed 1 matches the pinned deck", heTNamesOf(tDeckList), kKatSeed1Deck
+
+   -- permutation property: all 52 present, none twice
+   put 0 into tDup
+   repeat with tPos = 1 to 52
+      if tSeenA[item tPos of tDeckList] is "true" then
+         add 1 to tDup
+      end if
+      put "true" into tSeenA[item tPos of tDeckList]
+   end repeat
+   heTAssert "shuffle: seed 1 deck is a permutation of 52", (tDup is 0) and (the number of items of tDeckList is 52), "true"
+
+   -- determinism: same seed -> same deck
+   put heShuffleDeck(20260712) into tSecond
+   heTAssert "shuffle: same seed reproduces the deck", heShuffleDeck(20260712), tSecond
+
+   -- deal assignment on the pinned deck (3 seats, button 1 -> order 2,3,1)
+   put heDealAssign(tDeckList, "1,2,3", 1) into tDealA
+   heTAssert "deal: seat 1 gets cards 3 and 6 off the top", \
+         heTNamesOf(tDealA["holesBy"][1]), (heCardName(item 3 of tDeckList)) & comma & (heCardName(item 6 of tDeckList))
+   heTAssert "deal: flop is deck 8-10 after two rounds + burn", \
+         heTNamesOf(tDealA["flopList"]), \
+         (heCardName(item 8 of tDeckList)) & comma & (heCardName(item 9 of tDeckList)) & comma & (heCardName(item 10 of tDeckList))
+end heTestShuffleRun
+
+function heTKatLog pTamper
+   -- canned hotseat session, plain-text transcript (binary-free): holes
+   -- s1=3d5d s2=Ac5h s3=KcKh, board 3h2h5c4hTc; folds to 442/394/364
+   local tLog
+   put empty into tLog
+   put heLogLine(0, "table", "cfg", "sb=1,bb=2,seats=1|2|3,stacks=400|400|400,button=1") & return after tLog
+   put heLogLine(1, "table", "handStart", "seats=1|2|3,button=1") & return after tLog
+   put heLogLine(1, "table", "holeDeliver", "seat=1,cards=3d|5d") & return after tLog
+   put heLogLine(1, "table", "holeDeliver", "seat=2,cards=Ac|5h") & return after tLog
+   put heLogLine(1, "table", "holeDeliver", "seat=3,cards=Kc|Kh") & return after tLog
+   put heLogLine(1, "seat2", "bidSB", "amount=1") & return after tLog
+   put heLogLine(1, "seat3", "bidBB", "amount=2") & return after tLog
+   put heLogLine(1, "seat1", "act", "verb=raise,amount=6") & return after tLog
+   put heLogLine(1, "seat2", "act", "verb=call,amount=5") & return after tLog
+   if pTamper is "badact" then
+      put heLogLine(1, "seat3", "act", "verb=call,amount=7") & return after tLog
+   end if
+   put heLogLine(1, "seat3", "act", "verb=call,amount=4") & return after tLog
+   put heLogLine(1, "table", "board", "street=flop,cards=3h|2h|5c") & return after tLog
+   put heLogLine(1, "seat2", "act", "verb=check,amount=0") & return after tLog
+   put heLogLine(1, "seat3", "act", "verb=bet,amount=10") & return after tLog
+   put heLogLine(1, "seat1", "act", "verb=call,amount=10") & return after tLog
+   put heLogLine(1, "seat2", "act", "verb=fold,amount=0") & return after tLog
+   put heLogLine(1, "table", "board", "street=turn,cards=4h") & return after tLog
+   put heLogLine(1, "seat3", "act", "verb=check,amount=0") & return after tLog
+   put heLogLine(1, "seat1", "act", "verb=check,amount=0") & return after tLog
+   put heLogLine(1, "table", "board", "street=river,cards=Tc") & return after tLog
+   put heLogLine(1, "seat3", "act", "verb=bet,amount=20") & return after tLog
+   put heLogLine(1, "seat1", "act", "verb=call,amount=20") & return after tLog
+   if pTamper is "settle" then
+      put heLogLine(1, "table", "settle", "deltas=1:52|2:-16|3:-36") & return after tLog
+   else
+      put heLogLine(1, "table", "settle", "deltas=1:42|2:-6|3:-36") & return after tLog
+   end if
+   return tLog
+end heTKatLog
+
+function heTFoldTxt pFoldA
+   return pFoldA["stacksBy"][1] & "/" & pFoldA["stacksBy"][2] & "/" & pFoldA["stacksBy"][3] \
+         & " hand=" & pFoldA["handNum"] & " errs=[" & pFoldA["errors"] & "]"
+end heTFoldTxt
+
+command heTestFoldRun
+   local tFoldA, tFoldB
+   put return & "-- 4. transcript fold: determinism + replay-as-audit" & return after gRpt
+   put heFoldTranscript(heTKatLog(empty)) into tFoldA
+   heTAssert "fold: canned session settles to the pinned stacks", \
+         heTFoldTxt(tFoldA), "442/394/364 hand=1 errs=[]"
+   put heFoldTranscript(heTKatLog(empty)) into tFoldB
+   heTAssert "fold: folding twice is identical", heTFoldTxt(tFoldB), heTFoldTxt(tFoldA)
+   heTContains "fold: per-hand trace recorded", tFoldA["trace"], "hand 1: 1:42|2:-6|3:-36"
+   put heFoldTranscript(heTKatLog("settle")) into tFoldA
+   heTContains "fold: tampered settle line is caught", tFoldA["errors"], "settle-mismatch"
+   put heFoldTranscript(heTKatLog("badact")) into tFoldA
+   heTContains "fold: wrong-amount action rejected on replay", tFoldA["errors"], "engine-rejected"
+end heTestFoldRun

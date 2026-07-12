@@ -18,14 +18,15 @@ Built by composing the OXT extension family:
 
 ## Status
 
-**Phase 1 logic landed; first OXT pass pending.** The pure game logic — hand
-evaluator, betting engine with side pots, Level 0 commit-reveal deal, settlement,
-transcript fold — is written (`src/holdem.livecodescript`), mirrored in headless
-Python KATs that run in CI (`tools/*-kat.py`), and carried on-engine by the self-test
-harness (`src/holdem-selftest.livecodescript`). The table UI self-builds in a
-dependency-free flat mode, with the Box2Dxt Kit mode scaffolded for the art pass.
-Nothing here has run in OXT yet: every on-engine behavior is "verified statically;
-needs an OXT pass".
+**Phase 1 hotseat, one paste-and-run stack.** `src/holdem.livecodescript` is the whole
+thing — the hotseat game, its self-test (`heRunSelftest` in the message box), and a
+SodiumXT diagnostic (`heProbeSodium`) — in a single self-building stack with no
+required extensions to be playable. The pure logic (hand evaluator, betting engine
+with side pots, settlement, transcript fold) is mirrored in headless Python KATs that
+run in CI (`tools/*-kat.py`). The deal is a pure-integer PRNG shuffle so the playable
+path never touches FFI binary; the cryptographic Level 0 deal (spec 7.1) is the Phase 2
+target, kept specced and KAT-pinned. Everything visual is "verified statically; needs
+an OXT pass".
 
 - **[holdem-spec.md](holdem-spec.md)** — the design contract: threat model, the
   three-level deal protocol ladder, the transcript, settlement receipts, and the honest

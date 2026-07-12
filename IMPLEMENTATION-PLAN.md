@@ -40,13 +40,25 @@ Everything runs locally, six seats on one machine, zero networking. This phase i
 where all visual iteration happens and where the pure logic gets pinned. Build order
 inside the phase matters:
 
-**Status:** 1a/1b/1c and the pure halves of 1e are written and machine-pinned (CI
-KATs green; the xTalk carries the same vectors for the on-engine run). 1d exists as
-the self-building chrome in two modes — a dependency-free flat mode and the Kit mode
-scaffold (atlas loading, pre-warm, gated frame loop); the animation polish (deal
-slides, squash flips, chip tosses) is deliberately left for the first OXT pass since
-none of it can be verified statically. Everything below stays "verified statically;
-needs an OXT pass" until the user runs the harness and plays hands in OXT.
+**Status:** 1a/1b and the pure halves of 1e are written and machine-pinned (CI KATs
+green; the stack's own `heRunSelftest` carries the same vectors for the on-engine
+run). 1d exists as the self-building chrome in two modes — a dependency-free flat mode
+and the Kit mode scaffold (atlas loading, pre-warm, gated frame loop); animation
+polish is left for the OXT pass. Everything below stays "verified statically; needs an
+OXT pass" until the user runs the harness and plays hands in OXT.
+
+**As-built deal (v0.2.0, a code-wins decision).** 1c was originally the Level 0
+commit-reveal keyed-stream deal (spec 7.1). Repeated OXT passes threw double/binary
+conversion errors wherever script code touched FFI-bridged SodiumXT `Data` through the
+chunk/arithmetic evaluator — persisting even after the H6 copy-to-local fix. So the
+**playable deal is now a pure-integer PRNG shuffle** (Park-Miller MINSTD, seeded from
+`sxRandomUniform` when present — an integer result, no binary in script — else engine
+time+`random()`, labelled practice), pinned by `tools/shuffle-kat.py`. This unblocks a
+playable, demoable M0 without depending on the fragile FFI-binary path. The
+cryptographic Level 0 deal stays specced and KAT-pinned (`tools/protocol-kat.py`) and
+moves to **Phase 2**, to be wired only behind a confirmed `heProbeSodium` (the stack's
+per-`sx*`-call diagnostic). Everything is one paste-and-run stack now — the separate
+self-test stack was folded into `src/holdem.livecodescript`.
 
 - **1a. Hand evaluator** (spec 8.2) — first code written, pure function, pinned by
   known-answer vectors in the harness AND mirrored in `tools/` so CI runs them
