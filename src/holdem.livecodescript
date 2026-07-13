@@ -35,7 +35,9 @@ states, pot display, quick-bet buttons, suit-glyph cards) and a
 dead-button-aware blind schedule (the big blind always advances to the next
 live seat, so eliminations never double- or skip-charge a blind -- TDA rule
 10). The math (side pots, chip conservation, min-raise, PRNG, evaluator) is
-verified sound by property tests over tens of thousands of configs.
+verified sound by tools/logic-fuzz.py, which checks the evaluator EXHAUSTIVELY
+(all 2,598,960 five-card hands) and fuzzes settlement + whole games against
+independently-written references (not the KAT mirrors) over ~90k configs.
 
 v0.2.0 -- binary-free playable path. The first OXT passes hit repeated
 double/binary conversion errors wherever script code touched FFI-bridged
@@ -69,9 +71,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.0"
-constant kHeHarnessV = "7"
-constant kUIVersion = "4"
+constant kHeVersion = "0.5.6"
+constant kHeHarnessV = "12"
+constant kUIVersion = "5"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -224,6 +226,28 @@ function heHex2BinD pHexTxt
    -- hex String -> Data
    return sxHex2Bin(textEncode(pHexTxt, "ascii"))
 end heHex2BinD
+
+function heIsHex pTxt, pLen
+   -- true iff pTxt is even-length hex (optionally exactly pLen chars). PURE --
+   -- no FFI -- so it can gate sxHex2Bin, which THROWS on malformed input. Every
+   -- hex field lifted off an untrusted wire must pass this before heHex2BinD, or
+   -- one hostile/corrupt frame throws uncaught in the poll loop (house law H4:
+   -- verify-or-drop must never raise). pLen 0 = "any even length".
+   local tLen, tCh
+   put the number of chars of pTxt into tLen
+   if tLen is 0 or (tLen mod 2) is not 0 then
+      return false
+   end if
+   if pLen is not empty and pLen is not 0 and tLen is not pLen then
+      return false
+   end if
+   repeat for each char tCh in pTxt
+      if offset(tCh, "0123456789abcdefABCDEF") is 0 then
+         return false
+      end if
+   end repeat
+   return true
+end heIsHex
 
 -- Identity keys are derived by calling sxSignKeypairFromSeed directly into
 -- plain locals at each site (the proven-safe form -- same as
@@ -445,8 +469,22 @@ function heEnvVerify pWireLine, pFromPubHex, pHostPubHex, pExpectedPrevHex
    -- and logged, no exceptions (including from the host). pFromPubHex is the
    -- admitted pubkey the caller expects for this sender ("" to skip that
    -- check); pExpectedPrevHex is the local chain head ("" to skip).
-   local tA
+   local tA, tFrom, tSenderSig, tHostSig, tBodyHex
    put heEnvWireParse(pWireLine) into tA
+   -- shape-check every hex field BEFORE any decode: heHex2BinD (sxHex2Bin)
+   -- throws on malformed hex, and this path runs on untrusted inbound bytes,
+   -- so a bad frame must become a clean drop, never an uncaught throw (H4).
+   put tA["from"] into tFrom
+   put tA["senderSig"] into tSenderSig
+   put tA["hostSig"] into tHostSig
+   put tA["bodyHex"] into tBodyHex
+   if not heIsHex(tFrom, 64) or not heIsHex(pHostPubHex, 64) \
+         or not heIsHex(tSenderSig, 128) or not heIsHex(tHostSig, 128) then
+      return "drop:malformed"
+   end if
+   if tBodyHex is not empty and not heIsHex(tBodyHex, 0) then
+      return "drop:malformed"
+   end if
    if pFromPubHex is not empty and tA["from"] is not pFromPubHex then
       return "drop:unknown-from"
    end if
@@ -704,7 +742,9 @@ function heAdmitTokenVerify pTokenData, pTableHex
    put item 2 of tTok into tRole
    put item 3 of tTok into tSigHex
    set the itemDelimiter to tSaved
-   if the number of chars of tPubHex is not 64 then
+   -- a stranger's token is untrusted: reject malformed hex before decoding it
+   -- (sxHex2Bin throws) -- 64-char pub and 128-char detached sig (H4)
+   if not heIsHex(tPubHex, 64) or not heIsHex(tSigHex, 128) then
       return ""
    end if
    if heVerifyDetached(heHex2BinD(tSigHex), \
@@ -817,6 +857,12 @@ end heTableInfohash
 
 command heTableCreate
    -- become the host of a fresh table; the 64-hex table code IS the invite.
+   -- online play needs the crypto -- guard so a Sodium-less engine gets a
+   -- friendly status, not a hard throw out of heIdentitySetup (H4/UX)
+   if not heHasSodium() then
+      heUISetStatus "Online tables need SodiumXT installed. You can still play hotseat."
+      exit heTableCreate
+   end if
    -- tear down any prior session first so a re-create starts a clean swarm
    heNetStop
    heIdentitySetup
@@ -837,6 +883,7 @@ command heTableCreate
    put empty into gGame["roleByPub"]
    put empty into gGame["log"]
    put empty into gGame["netLog"]
+   put 0 into gGame["syncCooldown"]
    -- the host must admit ITSELF so heHostRelay accepts the host's own actions
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "host" into gGame["roleByPub"][gGame["idPubHex"]]
@@ -851,8 +898,12 @@ end heTableCreate
 command heTableJoin pCodeTxt
    -- join an existing table from its invite code
    local tCode
+   if not heHasSodium() then
+      heUISetStatus "Online tables need SodiumXT installed. You can still play hotseat."
+      exit heTableJoin
+   end if
    put word 1 of pCodeTxt into tCode
-   if the number of chars of tCode is not 64 then
+   if not heIsHex(tCode, 64) then
       heUISetStatus "Invite code must be 64 hex characters."
       exit heTableJoin
    end if
@@ -871,6 +922,7 @@ command heTableJoin pCodeTxt
    put empty into gGame["roleByPub"]
    put empty into gGame["log"]
    put empty into gGame["netLog"]
+   put 0 into gGame["syncCooldown"]
    -- admit ourselves as a player so the local roster shows our own seat
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "player" into gGame["roleByPub"][gGame["idPubHex"]]
@@ -885,6 +937,10 @@ on heNetPollTick
    local tEvents, tEv
    if gGame["online"] is not "true" then
       exit heNetPollTick
+   end if
+   -- age the resync debounce one tick (heNetRequestSync sets it to 8)
+   if gGame["syncCooldown"] > 0 then
+      subtract 1 from gGame["syncCooldown"]
    end if
    put btRp1Poll(gGame["session"]) into tEvents
    repeat for each element tEv in tEvents
@@ -909,7 +965,7 @@ end heNetOnRp1
 command heNetOnHandshake pPeer, pTokenData
    -- admit-or-drop (spec 5): a peer whose token does not verify against this
    -- table is ignored, before any game message is accepted from it
-   local tPubHex, tRoleTxt, tIsNew
+   local tPubHex, tRoleTxt, tIsNew, tOldPeer, tReconnect
    put heAdmitTokenVerify(pTokenData, gGame["tableIdHex"]) into tPubHex
    if tPubHex is empty then
       put "drop   handshake from an unadmitted peer" & return after gGame["netLog"]
@@ -918,6 +974,10 @@ command heNetOnHandshake pPeer, pTokenData
    end if
    put heAdmitTokenRole(pTokenData) into tRoleTxt
    put (gGame["admittedA"][tPubHex] is not "true") into tIsNew
+   -- a known key handshaking on a NEW peer handle is a reconnect: it needs the
+   -- transcript replayed too, not just first-time joiners (spec 9)
+   put gGame["peerByPub"][tPubHex] into tOldPeer
+   put (tOldPeer is not empty and tOldPeer is not pPeer) into tReconnect
    put tPubHex into gGame["peerPubA"][pPeer]
    put pPeer into gGame["peerByPub"][tPubHex]
    put "true" into gGame["admittedA"][tPubHex]
@@ -932,11 +992,13 @@ command heNetOnHandshake pPeer, pTokenData
    if tIsNew then
       put "+peer  " & char 1 to 12 of tPubHex & "  (" & tRoleTxt & ")" & return after gGame["netLog"]
    end if
-   -- host: catch a new peer up on the whole transcript (spec 9 replay), then
-   -- re-sign and broadcast the roster so every client's presence agrees
-   if gGame["isHost"] is "true" and tIsNew then
+   -- host: catch a peer up on the whole transcript (spec 9 replay) on first
+   -- join OR reconnect, then re-sign and broadcast the roster so presence agrees
+   if gGame["isHost"] is "true" and (tIsNew or tReconnect) then
       heNetReplayLogTo pPeer
-      heHostEmitRoster
+      if tIsNew then
+         heHostEmitRoster
+      end if
    end if
    heLobbyRefresh
 end heNetOnHandshake
@@ -944,7 +1006,7 @@ end heNetOnHandshake
 command heNetOnMessage pPeer, pPayloadData
    -- payload kinds (tab-framed): "c" = a player's signed content line to the
    -- host; "w" = a host-relayed sequenced wire to everyone. Verify-or-drop.
-   local tPayload, tKind, tRest, tSaved
+   local tPayload, tKind, tRest, tSaved, tPeerPub
    put textDecode(pPayloadData, "utf-8") into tPayload
    put the itemDelimiter into tSaved
    set the itemDelimiter to tab
@@ -959,6 +1021,17 @@ command heNetOnMessage pPeer, pPayloadData
          break
       case "w"
          heNetIngestWire tRest
+         break
+      case "s?"
+         -- a peer asks us (the host) to replay the transcript so it can catch
+         -- up from a chain gap (spec 9). Only honor it from an admitted,
+         -- connected peer, so an unknown socket cannot trigger a replay.
+         put gGame["peerPubA"][pPeer] into tPeerPub
+         if gGame["isHost"] is "true" and tPeerPub is not empty then
+            put "sync!  replaying transcript to " & char 1 to 8 of tPeerPub & return after gGame["netLog"]
+            heNetReplayLogTo pPeer
+            heLobbyRefresh
+         end if
          break
    end switch
 end heNetOnMessage
@@ -975,6 +1048,11 @@ command heHostRelay pPeer, pContentAndSig
    put item 7 of pContentAndSig into tSenderSig
    put item 4 of tContent into tFromHex
    set the itemDelimiter to tSaved
+   -- a player packet is untrusted: reject malformed hex before decoding it
+   -- (sxHex2Bin throws) so a corrupt "c" frame cannot kill the host relay (H4)
+   if not heIsHex(tFromHex, 64) or not heIsHex(tSenderSig, 128) then
+      exit heHostRelay
+   end if
    -- verify the sender actually signed this content (host cannot forge content)
    if not heVerifyDetached(heHex2BinD(tSenderSig), textEncode(tContent, "utf-8"), heHex2BinD(tFromHex)) then
       exit heHostRelay
@@ -998,6 +1076,13 @@ command heNetIngestWire pWire
    if tVerdict is not "ok" then
       -- drop and log; a bad/replayed/reordered message is not an exception
       put tVerdict && char 1 to 24 of pWire & return after gGame["netLog"]
+      -- a chain break means we missed a wire (rp1 is lossy/reorders): ask the
+      -- host to replay the transcript so we catch up, instead of wedging here
+      -- forever (spec 9). Debounced in heNetRequestSync. Other drops are real
+      -- rejections and must NOT trigger a resync.
+      if tVerdict is "drop:chain-break" then
+         heNetRequestSync
+      end if
       heLobbyRefresh
       exit heNetIngestWire
    end if
@@ -1040,6 +1125,25 @@ command heNetSendToHost pPayloadTxt
    end if
    get btRp1Send(gGame["session"], tHostPeer, textEncode(pPayloadTxt, "utf-8"))
 end heNetSendToHost
+
+command heNetRequestSync
+   -- recover from a chain gap: ask the host to replay the transcript (spec 9)
+   -- instead of wedging on drop:chain-break forever. Debounced by a tick
+   -- cooldown so a burst of dropped wires -- or a lost request -- re-asks at
+   -- most once every ~2 s, never floods the host. The host never self-syncs.
+   if gGame["isHost"] is "true" then
+      exit heNetRequestSync
+   end if
+   if gGame["syncCooldown"] > 0 then
+      exit heNetRequestSync
+   end if
+   if gGame["hostPubHex"] is empty then
+      exit heNetRequestSync
+   end if
+   put 8 into gGame["syncCooldown"]
+   put "sync?  requested transcript replay (chain gap)" & return after gGame["netLog"]
+   heNetSendToHost "s?"
+end heNetRequestSync
 
 command heNetBroadcast pPayloadTxt
    -- host sends to every admitted peer (star topology, spec 4)
@@ -1279,8 +1383,12 @@ function heRank5 pFive
       return "08" & heTwoDigits(tHighStraight) & "00000000"
    end if
 
-   -- histogram: sort groups by (count, rank) descending; LiveCode's sort is
-   -- stable, so sorting by rank first then by count yields the two-key order
+   -- histogram: sort groups by (count, rank) descending in ONE pass with a
+   -- composite key (count * 100 + rank; rank <= 14 < 100, so count dominates
+   -- and rank breaks ties). A single sort means correctness does not depend on
+   -- LiveCode's sort being stable -- the ranking is provable from the code
+   -- alone (evaluator category frequencies + order-isomorphism are pinned in
+   -- tools/logic-fuzz.py).
    repeat with tPos = 1 to 5
       put item tPos of tRankList into tRankVal
       if tCountA[tRankVal] is empty then
@@ -1293,8 +1401,7 @@ function heRank5 pFive
       put tCountA[tRankVal] & comma & tRankVal & return after tGroupLines
    end repeat
    delete char -1 of tGroupLines
-   sort lines of tGroupLines numeric descending by item 2 of each
-   sort lines of tGroupLines numeric descending by item 1 of each
+   sort lines of tGroupLines numeric descending by (item 1 of each * 100 + item 2 of each)
    put empty into tSizes
    put empty into tGRanks
    repeat for each line tOut in tGroupLines
@@ -2025,10 +2132,12 @@ function heFoldTranscript pLogTxt
    local tSeatNum, tHolesA, tBoardList, tRanksA, tDeltasA, tDeltasTxt
    local tSevenList, tOccList, tButtonSeat, tSB, tBB, tFromTxt, tStacksTxt
    local tPos, tCardTxt, tOneCard
+   local tHistLine, tBoardNames, tPotTotal, tWinnersTxt, tShownTxt, tHolePair, tAuditPart
    set the itemDelimiter to comma
    put 0 into tOutA["handNum"]
    put empty into tOutA["trace"]
    put empty into tOutA["errors"]
+   put empty into tOutA["history"]
    put "false" into tHaveHand
    put empty into tBoardList
 
@@ -2142,6 +2251,45 @@ function heFoldTranscript pLogTxt
                add tDeltasA[tSeatNum] to tOutA["stacksBy"][tSeatNum]
             end repeat
             put "hand " & heLogField(tLogLine, 1) & ": " & tDeltasTxt & return after tOutA["trace"]
+            -- auditable hand-history line, folded from the transcript (which IS
+            -- the record). "settle-verified" means the logged payout equalled the
+            -- independent recomputation on this replay -- the audit, per hand.
+            put empty into tBoardNames
+            repeat for each item tOneCard in tBoardList
+               put heCardName(tOneCard) & space after tBoardNames
+            end repeat
+            put 0 into tPotTotal
+            put empty into tWinnersTxt
+            put empty into tShownTxt
+            repeat for each item tSeatNum in tStateA["occ"]
+               add tStateA["handBy"][tSeatNum] to tPotTotal
+               if tDeltasA[tSeatNum] > 0 then
+                  put tSeatNum & comma after tWinnersTxt
+               end if
+               if tRanksA[tSeatNum] is not empty then
+                  put tHolesA[tSeatNum] into tHolePair
+                  put tSeatNum & "=" & heCardName(item 1 of tHolePair) && heCardName(item 2 of tHolePair) \
+                        && heHandLabel(tRanksA[tSeatNum]) & ", " after tShownTxt
+               end if
+            end repeat
+            if tWinnersTxt is not empty then
+               delete char -1 of tWinnersTxt
+            end if
+            if tShownTxt is not empty then
+               delete char -2 to -1 of tShownTxt
+            end if
+            put "hand " & heLogField(tLogLine, 1) & ": board " & word 1 to -1 of tBoardNames \
+                  & "; pot " & tPotTotal & "; winner seat " & tWinnersTxt into tHistLine
+            if tShownTxt is not empty then
+               put "; showdown " & tShownTxt after tHistLine
+            end if
+            put "; deltas " & tDeltasTxt into tAuditPart
+            if tBodyA["deltas"] is tDeltasTxt then
+               put tAuditPart & "; settle-verified" after tHistLine
+            else
+               put tAuditPart & "; settle-MISMATCH" after tHistLine
+            end if
+            put tHistLine & return after tOutA["history"]
             put "false" into tHaveHand
             break
 
@@ -2451,7 +2599,7 @@ command heBuildTable
 
    -- header + pot
    create field "heHeader"
-   set the rect of field "heHeader" to "40,10,984,38"
+   set the rect of field "heHeader" to "40,10,884,38"
    set the lockText of field "heHeader" to true
    set the textAlign of field "heHeader" to "center"
    set the textSize of field "heHeader" to 15
@@ -2552,8 +2700,12 @@ command heBuildTable
    heMakeActionButton "heBtnPot", "Pot", 768
    heMakeActionButton "heBtnDeal", "Deal", 848
    heMakeActionButton "heBtnOnline", "Lobby", 928
+   create button "heBtnHistory"
+   set the rect of button "heBtnHistory" to "892,8,980,36"
+   set the label of button "heBtnHistory" to "History"
 
    heBuildLobby
+   heBuildHistory
    heKitTryInit
    unlock screen
 end heBuildTable
@@ -2622,6 +2774,7 @@ command heBuildLobby
 end heBuildLobby
 
 command heLobbyShow
+   heHistHide
    heLobbySetVisible true
    heLobbyRefresh
 end heLobbyShow
@@ -2722,6 +2875,106 @@ command heLobbyRefresh
    end if
    set the text of field "heLobbyNet" to tNet
 end heLobbyRefresh
+
+command heBuildHistory
+   -- the hand-history overlay: the folded, re-verified transcript. Built
+   -- hidden; heHistShow/heHistHide toggle it. NEEDS AN OXT PASS.
+   create graphic "heHistBg"
+   set the style of graphic "heHistBg" to "roundrect"
+   set the roundRadius of graphic "heHistBg" to 16
+   set the rect of graphic "heHistBg" to "192,84,832,556"
+   set the backgroundColor of graphic "heHistBg" to "20,26,24"
+   set the borderColor of graphic "heHistBg" to kHeGoldColor
+   set the borderWidth of graphic "heHistBg" to 2
+   set the opaque of graphic "heHistBg" to true
+
+   heMakeLabel "heHistTitle", "212,94,812,124", \
+         "hand history -- replayed from the transcript & re-verified", kHeGoldColor, 15
+   heMakeLabel "heHistAudit", "212,128,812,150", "", kHeWhite, 12
+
+   create field "heHistList"
+   set the rect of field "heHistList" to "212,158,812,502"
+   set the lockText of field "heHistList" to true
+   set the textSize of field "heHistList" to 12
+   set the opaque of field "heHistList" to true
+   set the backgroundColor of field "heHistList" to "14,18,16"
+   set the textColor of field "heHistList" to kHeWhite
+   set the borderWidth of field "heHistList" to 0
+
+   create button "heBtnHistVerify"
+   set the rect of button "heBtnHistVerify" to "212,510,352,544"
+   set the label of button "heBtnHistVerify" to "Re-verify"
+   create button "heBtnHistExport"
+   set the rect of button "heBtnHistExport" to "360,510,540,544"
+   set the label of button "heBtnHistExport" to "Copy transcript"
+   create button "heBtnHistClose"
+   set the rect of button "heBtnHistClose" to "712,510,812,544"
+   set the label of button "heBtnHistClose" to "Close"
+
+   heHistHide
+end heBuildHistory
+
+command heHistShow
+   heLobbyHide
+   heHistSetVisible true
+   heHistRefresh
+end heHistShow
+
+command heHistHide
+   heHistSetVisible false
+end heHistHide
+
+command heHistSetVisible pOn
+   local tFields, tButtons, tNm
+   if there is a graphic "heHistBg" then
+      set the visible of graphic "heHistBg" to pOn
+   end if
+   put "heHistTitle,heHistAudit,heHistList" into tFields
+   put "heBtnHistVerify,heBtnHistExport,heBtnHistClose" into tButtons
+   set the itemDelimiter to comma
+   repeat for each item tNm in tFields
+      if there is a field tNm then
+         set the visible of field tNm to pOn
+      end if
+   end repeat
+   repeat for each item tNm in tButtons
+      if there is a button tNm then
+         set the visible of button tNm to pOn
+      end if
+   end repeat
+end heHistSetVisible
+
+function heHistVisible
+   if there is a graphic "heHistBg" then
+      return the visible of graphic "heHistBg"
+   end if
+   return false
+end heHistVisible
+
+command heHistRefresh
+   -- fold the current transcript and show the per-hand history plus the audit
+   -- verdict. The fold RE-DERIVES every settlement and compares it to the
+   -- logged one, so an all-verified transcript is the legitimacy proof.
+   local tFold, tHistTxt, tErrs, tAuditTxt
+   if not (there is a field "heHistList") then
+      exit heHistRefresh
+   end if
+   put heFoldTranscript(gGame["log"]) into tFold
+   put tFold["history"] into tHistTxt
+   put tFold["errors"] into tErrs
+   if tHistTxt is empty then
+      put "No completed hands yet. Play a hand (Deal), then re-open History." into tHistTxt
+   end if
+   set the text of field "heHistList" to tHistTxt
+   if tErrs is empty then
+      put "AUDIT PASSED -- every hand's settlement matched the independent replay." into tAuditTxt
+      set the textColor of field "heHistAudit" to "150,220,150"
+   else
+      put "AUDIT FAILED -- " & line 1 of tErrs into tAuditTxt
+      set the textColor of field "heHistAudit" to kHeRed
+   end if
+   set the text of field "heHistAudit" to tAuditTxt
+end heHistRefresh
 
 command heMakeLabel pName, pRect, pText, pColor, pSize
    create field pName
@@ -2848,9 +3101,22 @@ on mouseUp
          heLobbyHide
          heUISetStatus "Back to hotseat. Press Deal to play, or Lobby to go online."
          exit mouseUp
+      case "heBtnHistory"
+         heHistShow
+         exit mouseUp
+      case "heBtnHistVerify"
+         heHistRefresh
+         exit mouseUp
+      case "heBtnHistExport"
+         set the clipboardData["text"] to gGame["log"]
+         heUISetStatus "Signed transcript copied -- the portable, replayable proof of every hand."
+         exit mouseUp
+      case "heBtnHistClose"
+         heHistHide
+         exit mouseUp
    end switch
-   -- while the lobby overlay is up, the table/action buttons are inert
-   if heLobbyVisible() then
+   -- while an overlay is up, the table/action buttons are inert
+   if heLobbyVisible() or heHistVisible() then
       exit mouseUp
    end if
    if tWho is "heBtnDeal" then
@@ -3333,6 +3599,21 @@ constant kKatSeed3 = "e848bf12b0bf2708b52c20053ef674e603e7f3a3c7092533dc92e1b082
 constant kKatCommit1 = "7623721b5a6372fa974ed62f558fce9992259eb2a834ece7bcea66bce970c0e3"
 constant kKatCommit2 = "83726c97707155ba2e81f0e5f673dd9e10dfde06e1c8f643bdd8539403aace51"
 constant kKatCommit3 = "5f043c34bfb7a626581eb8653c88503a5a8524c9b47bdc2e09e37780005e0308"
+-- keyed-stream deal vectors (spec 7.1) -- these were dropped from the block
+-- when the lobby constants were added, which silently broke heTestDealRun
+-- (undeclared names evaluate to their own text, then heHex2BinD throws). The
+-- full set is emitted by tools/protocol-kat.py --gen-xtalk; keep it complete.
+constant kKatSeedsXor = "73e2b09387940cf29398389f4d4fef74987ffac3c369b68cb522ded044cb00b8"
+constant kKatStreamKey = "e4d91a49ee23982afb804fd386cbd3d2df6370ae0a743b0f461325b94818e40f"
+constant kKatDeck = "Ks,4d,3c,Tc,9h,8c,Jd,4h,2c,6d,9d,Th,3d,9s,5s,3h,Qc,2h,9c,8h,7c,Js,7s,2d,6s,Ac,8s,As,Kh,2s,Ah,5h,Jh,Jc,4c,7h,6c,8d,Ad,Kd,Qs,Kc,6h,Qd,7d,5d,Qh,Ts,5c,3s,4s,Td"
+constant kKatHole1 = "3c,8c"
+constant kKatHole2 = "Ks,Tc"
+constant kKatHole3 = "4d,9h"
+constant kKatFlop = "4h,2c,6d"
+constant kKatTurn = "Th"
+constant kKatRiver = "9s"
+constant kKatSynthStream = "8eaba859db2f1a2a3bce5e381fc1afa1339dc9b7a8a1bbc550277e756dabdffcf7390d23167268d1523ac24f71f476cd47cd1fcd31cfa7ec51ef45c7853978859f7a10230ff86f287f1ead8ec6ac797f6f3d3a1eb75bcb435b5f491b81077775b47c0dcf3cc1d1c8f329c4e1cdae9c6e21f3825454f5c04a21fde75572ef04e25e36672b9e4ce78b4333da7090746ff00b8e32e7ad161f033523cb6f5ba2b10af1a1ebf6c815e54e4fe5efed623198c302732bf6e40ed8856a89e15d78f564614531b8f684aa727e51ea968727a22eb6e14bd588d502b2637bd73d59a8518eaf7a2311d555dd86147e83af7f1e9ef7c9baf253b851bbb48abecdea0b27f90761a67fb810022c6eae480866f19839deb884a4ec819be41bcb605df7dd1ee2efcdaab49eef76d4a98b6be858d3324ac616f2b1f58fc9a1749a6164e2a0e276d62d1815d6a042c78b82f3b0d1ff78852cf8778ba3e127411f0121775056de9e5f8e4253f98b54e627e74cf8c2a38c83edd7d6272de4eb6bd645ebcae1f1701bda866beadc5968e757a8f902e2be46933346dcb794676fd609e14f67d20432796eb492a0c86910f10e51c5c02e5a9fa95f407283b3d0abfb8357cc5f94fe4416b5984eb07e046975e1c15edece5c9e80fd6de3d43d6831a310fe9d74e0c5bb9e438da44bffd728a284795046da833ffb8fdd16128b7fdee7ef76e434e035c7471d52"
+constant kKatSynthDeck = "Ac,Kc,3d,5h,Kh,5d,Qc,3h,2h,5c,8c,4h,4d,Tc,7h,Qs,6c,Ts,6h,7d,Th,6s,Kd,3c,Jc,9s,4c,Ah,5s,2d,8s,As,2s,Ad,9d,Qh,8d,Jh,Qd,Jd,2c,6d,7s,Ks,7c,Js,8h,3s,4s,9h,9c,Td"
 constant kKatIdSeed1 = "629a089485b96c24fef651012c8deae57aa438a7a11c81f3e6a99b5e22f83b38"
 constant kKatIdSeed2 = "fa645b9f3778a3b162514e3a00436568aef46b726e10ef563c94e73b2c2cb448"
 constant kKatIdSeed3 = "7833fb1675dbb196e2222ad6f93ff30aacd313faf7a7818078e30a47f6890083"
@@ -3451,8 +3732,8 @@ command heTestLobbyRun
    -- then a roster (seq 2) once a player (idSeed2) has joined; a late joiner
    -- replays both from genesis and must land on kKatLobbyHead2. This checks
    -- the exact wires the transport carries, with no network. SKIPs w/o SodiumXT.
-   local tPub, tSec, tHostPubHex, tContent, tWire1, tWire2, tHead1, tHead2
-   local tMembers, tMembersRev, tRoster
+   local tPub, tSec, tHostPubHex, tContent, tWire1, tWire2, tWire3, tHead1, tHead2, tHead3
+   local tMembers, tMembersRev, tRoster, tClientHead, tVerdict
    put return & "-- 8. Online lobby: signed presence + transcript replay (spec 9)" & return after gRpt
    if not heHasSodium() then
       heTSkip "lobby: signed presence + replay", "SodiumXT not installed"
@@ -3486,6 +3767,31 @@ command heTestLobbyRun
    -- out-of-order replay is a chain break: the roster cannot land before the cfg
    heTAssert "lobby: roster before cfg is a chain break", \
          heEnvVerify(tWire2, tHostPubHex, tHostPubHex, kHeGenesisPrev), "drop:chain-break"
+
+   -- resync recovery (spec 9): a client that ingested w1 then MISSED w2 wedges
+   -- on w3 (drop:chain-break) -- but a full-log replay recovers it. Replayed w1
+   -- drops (already have it), w2 lands on head1, w3 on head2: head reaches head3.
+   -- This pins the recovery logic heNetRequestSync/heNetReplayLogTo rely on.
+   put heEnvContentLine(kKatTableHex, 0, tHostPubHex, "roster", tRoster) into tContent
+   put heWireBuild(tContent, tSec, 3, tHead2, tSec) into tWire3
+   put heChainNextHex(tWire3) into tHead3
+   put tHead1 into tClientHead
+   -- w3 arrives with w2 still missing -> chain break, head does not move
+   heTAssert "resync: gapped client drops the ahead-of-gap wire", \
+         heEnvVerify(tWire3, tHostPubHex, tHostPubHex, tClientHead), "drop:chain-break"
+   -- host replays the whole log; step the client head exactly as ingest would
+   put heEnvVerify(tWire1, tHostPubHex, tHostPubHex, tClientHead) into tVerdict
+   heTAssert "resync: replayed already-seen wire drops cleanly", tVerdict, "drop:chain-break"
+   put heEnvVerify(tWire2, tHostPubHex, tHostPubHex, tClientHead) into tVerdict
+   if tVerdict is "ok" then
+      put heChainNextHex(tWire2) into tClientHead
+   end if
+   heTAssert "resync: missing wire now applies", tVerdict, "ok"
+   put heEnvVerify(tWire3, tHostPubHex, tHostPubHex, tClientHead) into tVerdict
+   if tVerdict is "ok" then
+      put heChainNextHex(tWire3) into tClientHead
+   end if
+   heTAssert "resync: client recovers to the current chain head", tClientHead, tHead3
 end heTestLobbyRun
 
 command heTestCryptoRun
@@ -3557,6 +3863,16 @@ command heTestCryptoRun
          heEnvVerify(tWire, heBin2HexS(tHostPub), heBin2HexS(tPub), kHeGenesisPrev), "drop:unknown-from"
    heTAssert "crypto: verify drops a chain break", \
          heEnvVerify(tWire, heBin2HexS(tPub), heBin2HexS(tPub), kKatChainHead6), "drop:chain-break"
+   -- H4: a malformed (non-hex) field must DROP cleanly, never throw out of the
+   -- poll loop. Corrupt the from-key to non-hex and confirm the verdict.
+   put tWire into tTampered
+   set the itemDelimiter to tab
+   put "zznothexzz" into item 4 of tTampered
+   set the itemDelimiter to comma
+   heTAssert "crypto: verify drops a malformed hex field (no throw)", \
+         heEnvVerify(tTampered, empty, heBin2HexS(tPub), kHeGenesisPrev), "drop:malformed"
+   heTAssert "crypto: heIsHex rejects odd-length and non-hex", \
+         heIsHex("abc", 0) & "," & heIsHex("zz", 0) & "," & heIsHex("ab", 0), "false,false,true"
 
    -- admission token (spec 5): host-role signature pinned, and the verify
    -- roundtrip returns the admitted pubkey for a good token, "" for a wrong
@@ -3624,6 +3940,8 @@ function heTVectors
    put "7c 7d 7h 4c 4d 4h As|060704000000|full house from two trips low" & return after tVecs
    put "2c 2d 2h 2s Ac 7d 5h|070214000000|quads of deuces ace kicker" & return after tVecs
    put "Kh Jh Th 9h 8h 7h 2c|081100000000|six-card flush hides a J-high SF" & return after tVecs
+   put "2c 3d 4h 5s 6c Ac Kd|040600000000|6-high straight chosen over the wheel" & return after tVecs
+   put "Ac Ad Ah Kc Kd Qc Qd|061413000000|boat picks the higher of two pairs" & return after tVecs
    return tVecs
 end heTVectors
 
@@ -3886,6 +4204,15 @@ command heTestShuffleRun
    heTAssert "deal: flop is deck 8-10 after two rounds + burn", \
          heTNamesOf(tDealA["flopList"]), \
          (heCardName(item 8 of tDeckList)) & comma & (heCardName(item 9 of tDeckList)) & comma & (heCardName(item 10 of tDeckList))
+
+   -- keyed-stream shuffle CORE, cross-checked WITHOUT SodiumXT: feed the fixed
+   -- synthetic hex stream (tools/protocol-kat.py SYNTH_STREAM) straight through
+   -- the rejection-sampling draw + Fisher-Yates and compare to the pinned deck.
+   -- This pins heDrawUniform (modulo-bias/off-by-one) + heShuffleFromStreamHex
+   -- on every engine, even one with no crypto installed (that is exactly why
+   -- SYNTH_STREAM exists -- it needs no hashing).
+   heTAssert "shuffle: synthetic keyed-stream deck (no crypto)", \
+         heTNamesOf(heShuffleFromStreamHex(kKatSynthStream)), kKatSynthDeck
 end heTestShuffleRun
 
 function heTKatLog pTamper
@@ -3939,6 +4266,12 @@ command heTestFoldRun
    put heFoldTranscript(heTKatLog(empty)) into tFoldB
    heTAssert "fold: folding twice is identical", heTFoldTxt(tFoldB), heTFoldTxt(tFoldA)
    heTContains "fold: per-hand trace recorded", tFoldA["trace"], "hand 1: 1:42|2:-6|3:-36"
+   heTContains "history: board, pot, and winner recorded", tFoldA["history"], \
+         "hand 1: board 3h 2h 5c 4h Tc; pot 78; winner seat 1"
+   heTContains "history: showdown names the winning hand", tFoldA["history"], "1=3d 5d two pair"
+   heTContains "history: settlement marked verified on replay", tFoldA["history"], "settle-verified"
+   put heFoldTranscript(heTKatLog("settle")) into tFoldA
+   heTContains "history: tampered settle shows MISMATCH not verified", tFoldA["history"], "settle-MISMATCH"
    put heFoldTranscript(heTKatLog("settle")) into tFoldA
    heTContains "fold: tampered settle line is caught", tFoldA["errors"], "settle-mismatch"
    put heFoldTranscript(heTKatLog("badact")) into tFoldA

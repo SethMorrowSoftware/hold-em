@@ -350,6 +350,16 @@ receipts. **A future value layer must consume receipts and nothing but receipts*
   since your last `ckpt`, fold the log, resume. Hole cards at L2 need no re-delivery —
   the chain values are in the transcript; the player recomputes with their own scalar.
   (L0/L1: the dealer re-sends the sealed `holeDeliver` on request.)
+- **Mid-stream gap recovery** (as-built, M1): rp1 is a ~1 s, lossy, possibly-reordering
+  transport, so a client can miss a wire without disconnecting. Any wire whose `prev`
+  does not match the local chain head is dropped (verify-or-drop) — and a `chain-break`
+  drop (as distinct from a bad signature or unknown sender) triggers an unsigned `s?`
+  resync control message to the host, debounced so it re-asks at most ~once/2 s. The
+  host replays its signed wire log to the requester (also automatically on any
+  reconnect handshake); a full replay is safe for a mid-stream client because wires
+  at or below its head simply re-drop as `chain-break` and it resumes from its head
+  forward. `s?` is a transport control message, not a transcript type, and is honored
+  only from an already-admitted, connected peer.
 - **Timeout in betting**: auto check/fold, seat goes to sit-out after (config) misses.
 - **Timeout in dealing** (L2): void-and-audit (7.3). A player who habitually
   "disconnects" when the flop looks bad voids hands but never sees that flop — aborting

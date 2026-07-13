@@ -86,9 +86,21 @@ python3 tools/evaluator-kat.py          # spec 8.2 vectors (mirror of heEval7/he
 python3 tools/betting-kat.py            # spec 8.1/8.3 cases (mirror of heBetApply/heSettleOf)
 python3 tools/shuffle-kat.py            # playable integer deal (mirror of heShuffleDeck)
 python3 tools/protocol-kat.py           # spec 6/7.1 crypto deal (Phase 2 target)
+python3 tools/logic-fuzz.py             # INDEPENDENT-reference fuzz (rules, not the port)
 ```
 
-The same vectors are embedded in the stack's own self-test (`heRunSelftest` in the
+The KATs above are *mirrors* — ported line-for-line from the xTalk so a green KAT plus a
+green on-engine harness pins the two together. That proves "the port matches the engine",
+not "the rules are right": a bug living in both the xTalk and its twin passes unseen.
+`tools/logic-fuzz.py` closes that hole — it drives the same mirror functions but checks
+them against a SECOND, independently-written evaluator and side-pot settlement (plus
+whole-game invariants: chip conservation, no negative stacks, termination). It runs the
+evaluator EXHAUSTIVELY (all 2,598,960 five-card hands → exactly 7462 classes) and fuzzes
+settlement/games over ~90k configs with fixed seeds (~30 s; `--full` does the exhaustive
+order-isomorphism, `--quick` a 5 s smoke). This is the committed backing for any
+"verified sound by property tests" claim — do not make that claim without it.
+
+The KAT vectors are also embedded in the stack's own self-test (`heRunSelftest` in the
 message box), so a green harness run on-engine plus green KATs in CI pins the xTalk to
 the mirrors. Keep it that way: game rules, shuffle, and settlement must live in
 handlers that take values and return values, with no UI reads inside.

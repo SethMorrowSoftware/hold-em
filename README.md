@@ -28,6 +28,12 @@ controls. The deal is a pure-integer PRNG shuffle so the playable path never tou
 binary; the cryptographic Level 0 deal (spec 7.1) is KAT-pinned and drives the online
 path.
 
+A **History** panel shows every completed hand — board, pot, winner, the named showdown
+hands, and per-seat deltas — folded straight from the transcript and **re-verified on the
+spot**: the fold re-derives each settlement and compares it to the logged payout, so an
+all-green audit is the legitimacy proof, and "Copy transcript" exports the raw, replayable
+record. The fold is independently pinned in CI (`tools/fold-kat.py`).
+
 With **SodiumXT + TorrentXT** installed, the stack opens on an **online lobby**: Create a
 table (its 64-hex code is the invite) or Join one, and peers meet over the BitTorrent
 DHT. Every peer admits-or-drops others at handshake against a signed session token; the
@@ -40,13 +46,15 @@ wires are machine-pinned in `tools/protocol-kat.py` and re-checked on-engine by
 machines, one code). Online betting/dealing orchestration builds on this confirmed
 transport next.
 
-The math is **verified sound**: side-pot settlement, chip conservation, and min-raise
-rules were property-tested against an independent reference across 60k+ configs and
-thousands of full games (zero defects); the PRNG shuffle is uniform; the evaluator is
-cross-checked against a clean-room implementation over 200k+ hands. Blind scheduling
-uses a dead-button-aware rule (the big blind always advances to the next live seat, so
-eliminations never double- or skip-charge a blind). All of this runs headless in CI
-(`tools/*-kat.py`). Everything visual is "verified statically; needs an OXT pass".
+The math is **verified sound** by `tools/logic-fuzz.py`, which checks the committed logic
+against *independently-written* references (not the line-for-line KAT mirrors): the
+evaluator is verified **exhaustively** over all 2,598,960 five-card hands (exactly 7462
+equivalence classes, order-isomorphic to a second evaluator), and side-pot settlement and
+whole games (chip conservation, no negative stacks, termination) are fuzzed over ~90k
+random configs with fixed seeds — zero defects. Blind scheduling uses a dead-button-aware
+rule (the big blind always advances to the next live seat, so eliminations never double-
+or skip-charge a blind). All of this runs headless in CI (`tools/*-kat.py` +
+`tools/logic-fuzz.py`). Everything visual is "verified statically; needs an OXT pass".
 
 - **[holdem-spec.md](holdem-spec.md)** — the design contract: threat model, the
   three-level deal protocol ladder, the transcript, settlement receipts, and the honest
