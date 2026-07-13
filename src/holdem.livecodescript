@@ -71,8 +71,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.4"
-constant kHeHarnessV = "11"
+constant kHeVersion = "0.5.5"
+constant kHeHarnessV = "12"
 constant kUIVersion = "4"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -2132,10 +2132,12 @@ function heFoldTranscript pLogTxt
    local tSeatNum, tHolesA, tBoardList, tRanksA, tDeltasA, tDeltasTxt
    local tSevenList, tOccList, tButtonSeat, tSB, tBB, tFromTxt, tStacksTxt
    local tPos, tCardTxt, tOneCard
+   local tHistLine, tBoardNames, tPotTotal, tWinnersTxt, tShownTxt, tHolePair, tAuditPart
    set the itemDelimiter to comma
    put 0 into tOutA["handNum"]
    put empty into tOutA["trace"]
    put empty into tOutA["errors"]
+   put empty into tOutA["history"]
    put "false" into tHaveHand
    put empty into tBoardList
 
@@ -2249,6 +2251,45 @@ function heFoldTranscript pLogTxt
                add tDeltasA[tSeatNum] to tOutA["stacksBy"][tSeatNum]
             end repeat
             put "hand " & heLogField(tLogLine, 1) & ": " & tDeltasTxt & return after tOutA["trace"]
+            -- auditable hand-history line, folded from the transcript (which IS
+            -- the record). "settle-verified" means the logged payout equalled the
+            -- independent recomputation on this replay -- the audit, per hand.
+            put empty into tBoardNames
+            repeat for each item tOneCard in tBoardList
+               put heCardName(tOneCard) & space after tBoardNames
+            end repeat
+            put 0 into tPotTotal
+            put empty into tWinnersTxt
+            put empty into tShownTxt
+            repeat for each item tSeatNum in tStateA["occ"]
+               add tStateA["handBy"][tSeatNum] to tPotTotal
+               if tDeltasA[tSeatNum] > 0 then
+                  put tSeatNum & comma after tWinnersTxt
+               end if
+               if tRanksA[tSeatNum] is not empty then
+                  put tHolesA[tSeatNum] into tHolePair
+                  put tSeatNum & "=" & heCardName(item 1 of tHolePair) && heCardName(item 2 of tHolePair) \
+                        && heHandLabel(tRanksA[tSeatNum]) & ", " after tShownTxt
+               end if
+            end repeat
+            if tWinnersTxt is not empty then
+               delete char -1 of tWinnersTxt
+            end if
+            if tShownTxt is not empty then
+               delete char -2 to -1 of tShownTxt
+            end if
+            put "hand " & heLogField(tLogLine, 1) & ": board " & word 1 to -1 of tBoardNames \
+                  & "; pot " & tPotTotal & "; winner seat " & tWinnersTxt into tHistLine
+            if tShownTxt is not empty then
+               put "; showdown " & tShownTxt after tHistLine
+            end if
+            put "; deltas " & tDeltasTxt into tAuditPart
+            if tBodyA["deltas"] is tDeltasTxt then
+               put tAuditPart & "; settle-verified" after tHistLine
+            else
+               put tAuditPart & "; settle-MISMATCH" after tHistLine
+            end if
+            put tHistLine & return after tOutA["history"]
             put "false" into tHaveHand
             break
 
@@ -4107,6 +4148,12 @@ command heTestFoldRun
    put heFoldTranscript(heTKatLog(empty)) into tFoldB
    heTAssert "fold: folding twice is identical", heTFoldTxt(tFoldB), heTFoldTxt(tFoldA)
    heTContains "fold: per-hand trace recorded", tFoldA["trace"], "hand 1: 1:42|2:-6|3:-36"
+   heTContains "history: board, pot, and winner recorded", tFoldA["history"], \
+         "hand 1: board 3h 2h 5c 4h Tc; pot 78; winner seat 1"
+   heTContains "history: showdown names the winning hand", tFoldA["history"], "1=3d 5d two pair"
+   heTContains "history: settlement marked verified on replay", tFoldA["history"], "settle-verified"
+   put heFoldTranscript(heTKatLog("settle")) into tFoldA
+   heTContains "history: tampered settle shows MISMATCH not verified", tFoldA["history"], "settle-MISMATCH"
    put heFoldTranscript(heTKatLog("settle")) into tFoldA
    heTContains "fold: tampered settle line is caught", tFoldA["errors"], "settle-mismatch"
    put heFoldTranscript(heTKatLog("badact")) into tFoldA
