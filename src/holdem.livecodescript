@@ -86,7 +86,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.6"
+constant kHeVersion = "0.5.7"
 constant kHeHarnessV = "12"
 constant kUIVersion = "5"
 
@@ -476,6 +476,13 @@ function heEnvWireParse pWireLine
 end heEnvWireParse
 
 function heEnvBodyText pBodyHex
+   -- an empty body is empty text; a malformed (non-hex) body drops to empty
+   -- rather than throwing in sxHex2Bin. heEnvVerify lets an empty bodyHex pass,
+   -- so this is the last guard before a host-crafted body reaches the decoder
+   -- (H4: inbound bytes are untrusted, verify-or-drop must never raise).
+   if pBodyHex is empty or not heIsHex(pBodyHex, 0) then
+      return ""
+   end if
    return textDecode(heHex2BinD(pBodyHex), "utf-8")
 end heEnvBodyText
 
