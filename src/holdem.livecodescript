@@ -71,8 +71,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.3"
-constant kHeHarnessV = "10"
+constant kHeVersion = "0.5.4"
+constant kHeHarnessV = "11"
 constant kUIVersion = "4"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -1383,8 +1383,12 @@ function heRank5 pFive
       return "08" & heTwoDigits(tHighStraight) & "00000000"
    end if
 
-   -- histogram: sort groups by (count, rank) descending; LiveCode's sort is
-   -- stable, so sorting by rank first then by count yields the two-key order
+   -- histogram: sort groups by (count, rank) descending in ONE pass with a
+   -- composite key (count * 100 + rank; rank <= 14 < 100, so count dominates
+   -- and rank breaks ties). A single sort means correctness does not depend on
+   -- LiveCode's sort being stable -- the ranking is provable from the code
+   -- alone (evaluator category frequencies + order-isomorphism are pinned in
+   -- tools/logic-fuzz.py).
    repeat with tPos = 1 to 5
       put item tPos of tRankList into tRankVal
       if tCountA[tRankVal] is empty then
@@ -1397,8 +1401,7 @@ function heRank5 pFive
       put tCountA[tRankVal] & comma & tRankVal & return after tGroupLines
    end repeat
    delete char -1 of tGroupLines
-   sort lines of tGroupLines numeric descending by item 2 of each
-   sort lines of tGroupLines numeric descending by item 1 of each
+   sort lines of tGroupLines numeric descending by (item 1 of each * 100 + item 2 of each)
    put empty into tSizes
    put empty into tGRanks
    repeat for each line tOut in tGroupLines
@@ -3778,6 +3781,8 @@ function heTVectors
    put "7c 7d 7h 4c 4d 4h As|060704000000|full house from two trips low" & return after tVecs
    put "2c 2d 2h 2s Ac 7d 5h|070214000000|quads of deuces ace kicker" & return after tVecs
    put "Kh Jh Th 9h 8h 7h 2c|081100000000|six-card flush hides a J-high SF" & return after tVecs
+   put "2c 3d 4h 5s 6c Ac Kd|040600000000|6-high straight chosen over the wheel" & return after tVecs
+   put "Ac Ad Ah Kc Kd Qc Qd|061413000000|boat picks the higher of two pairs" & return after tVecs
    return tVecs
 end heTVectors
 

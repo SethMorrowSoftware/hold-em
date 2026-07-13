@@ -101,16 +101,38 @@ def indep_rank5(cards):
     return (0,) + high
 
 
-def _order_iso(hands):
-    """Over the given hands, the mirror rank5 and the independent rank5 must
-    induce the SAME order: a well-defined mapping (mirror key -> a single indep
-    key) that is strictly monotonic. Returns (ok, tie_splits, monotonic,
-    mirror_classes, indep_classes)."""
+# The mathematically-known frequency of each 5-card category over all C(52,5)
+# hands (category index matches rank5's leading field: 8=straight flush down to
+# 0=high card). If the categorizer draws ANY boundary wrong, some count is off
+# and the total stops summing to 2,598,960. This is the textbook proof of
+# correctness -- independent of any second implementation.
+KNOWN_5CARD_FREQ = {
+    8: 40,        # straight flush (incl. royal)
+    7: 624,       # four of a kind
+    6: 3744,      # full house
+    5: 5108,      # flush (excl. straight flush)
+    4: 10200,     # straight (excl. straight flush)
+    3: 54912,     # three of a kind
+    2: 123552,    # two pair
+    1: 1098240,   # one pair
+    0: 1302540,   # high card
+}
+
+
+def indep_eval7(cards):
+    """Independent best-5-of-7 (the reference's rank5 over all 21 subsets)."""
+    return max(indep_rank5(c) for c in itertools.combinations(cards, 5))
+
+
+def _order_iso(hands, mirror_fn, indep_fn):
+    """Over the given hands, the mirror and independent evaluators must induce
+    the SAME order: a well-defined mapping (mirror key -> a single indep key)
+    that is strictly monotonic. Returns (ok, tie_splits, monotonic, classes)."""
     mirror_to_indep = {}
     tie_splits = 0
     for combo in hands:
-        mk = tuple(ev.rank5(combo))
-        ik = indep_rank5(combo)
+        mk = tuple(mirror_fn(combo))
+        ik = indep_fn(combo)
         if mk in mirror_to_indep:
             if mirror_to_indep[mk] != ik:
                 tie_splits += 1
@@ -122,40 +144,56 @@ def _order_iso(hands):
     mkeys = sorted(mirror_to_indep)
     ikeys = [mirror_to_indep[k] for k in mkeys]
     monotonic = all(ikeys[i] < ikeys[i + 1] for i in range(len(ikeys) - 1))
-    return (tie_splits == 0 and monotonic, tie_splits, monotonic,
-            len(mkeys), len(set(mirror_to_indep.values())))
+    return tie_splits == 0 and monotonic, tie_splits, monotonic, len(mkeys)
 
 
 def check_evaluator(mode):
-    """Two complementary checks:
-      * STRUCTURE (exhaustive, cheap with the mirror alone): every one of the
-        2,598,960 five-card hands maps to exactly 7462 distinct rank values --
-        the known count of 5-card equivalence classes. A collision or an
-        over-split changes the count.
+    """Three complementary proofs of the hand ranking:
+      * FREQUENCY (exhaustive, cheap): over all 2,598,960 five-card hands, the
+        count in each category must EXACTLY equal its known combinatorial value
+        (40 straight flushes, 624 quads, ... 1,302,540 high cards). A wrong
+        category boundary breaks a count -- a proof that needs no second impl.
+      * STRUCTURE: exactly 7462 distinct rank values (the known class count).
       * ORDER + INDEPENDENCE: the mirror and an independently-written evaluator
-        induce the same strict total order. mode 'full' does this EXHAUSTIVELY
-        (all hands, ~80 s); default does it on a large random sample (fast) --
-        the exhaustive structure check already pins the class partition, so the
-        sample only has to confirm the ordering."""
+        induce the same strict total order, at 5 cards AND at 7 (best-of-21).
+        mode 'full' runs the 5-card order check EXHAUSTIVELY (~80 s); default
+        uses a large random sample -- the exhaustive frequency+structure pass
+        already pins the partition, so the sample only confirms the ordering."""
     ok = True
     distinct = set()
+    freq = {c: 0 for c in KNOWN_5CARD_FREQ}
     for combo in itertools.combinations(range(1, 53), 5):
-        distinct.add(tuple(ev.rank5(combo)))
+        vec = tuple(ev.rank5(combo))
+        distinct.add(vec)
+        freq[vec[0]] += 1
     classes = len(distinct)
+    freq_ok = (freq == KNOWN_5CARD_FREQ)
+    print("  evaluator frequency: category counts %s known distribution"
+          % ("MATCH" if freq_ok else "DIFFER -> %r" % freq))
     print("  evaluator structure: %d distinct classes (expect 7462)" % classes)
-    ok = ok and (classes == 7462)
+    ok = ok and freq_ok and (classes == 7462)
 
     if mode == "full":
-        hands = itertools.combinations(range(1, 53), 5)
+        hands5 = itertools.combinations(range(1, 53), 5)
         label = "exhaustive"
     else:
         rng = random.Random(31)
-        hands = [tuple(rng.sample(range(1, 53), 5)) for _ in range(150000)]
+        hands5 = [tuple(rng.sample(range(1, 53), 5)) for _ in range(150000)]
         label = "150k-sample"
-    iso_ok, ties, mono, mclasses, iclasses = _order_iso(hands)
-    print("  evaluator order (%s vs independent ref): tie-splits %d, "
-          "monotonic %s, indep-classes %d" % (label, ties, mono, iclasses))
-    return ok and iso_ok
+    iso_ok, ties, mono, _ = _order_iso(hands5, ev.rank5, indep_rank5)
+    print("  evaluator 5-card order (%s vs independent ref): tie-splits %d, "
+          "monotonic %s" % (label, ties, mono))
+    ok = ok and iso_ok
+
+    # 7-card best-of-21: the same order-isomorphism against an independent
+    # best-of-21, so heEval7 (not just heRank5) is pinned to the rules.
+    rng7 = random.Random(53)
+    n7 = 4000 if mode == "full" else 12000
+    hands7 = [tuple(rng7.sample(range(1, 53), 7)) for _ in range(n7)]
+    iso7_ok, ties7, mono7, _ = _order_iso(hands7, ev.evaluate7, indep_eval7)
+    print("  evaluator 7-card order (%dk-sample vs independent best-of-21): "
+          "tie-splits %d, monotonic %s" % (n7 // 1000, ties7, mono7))
+    return ok and iso7_ok
 
 
 # --------------------------------------------------------------------------

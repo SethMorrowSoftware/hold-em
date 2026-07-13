@@ -154,6 +154,9 @@ VECTORS = [
     ("full house from two trips low", "7c 7d 7h 4c 4d 4h As", "060704000000"),
     ("quads of deuces ace kicker", "2c 2d 2h 2s Ac 7d 5h", "070214000000"),
     ("six-card flush hides a J-high SF", "Kh Jh Th 9h 8h 7h 2c", "081100000000"),
+    # tie-break edge cases the audit flagged as untested:
+    ("6-high straight chosen over the wheel", "2c 3d 4h 5s 6c Ac Kd", "040600000000"),
+    ("boat picks the higher of two pairs", "Ac Ad Ah Kc Kd Qc Qd", "061413000000"),
 ]
 
 # Fixed permutations for the order-independence property (no randomness in a
