@@ -39,6 +39,7 @@ def _load(name, rel):
 
 bk = _load("bkat", "tools/betting-kat.py")
 ev = _load("evkat", "tools/evaluator-kat.py")
+pk = _load("pkat", "tools/protocol-kat.py")   # deal machinery (spec 7.1)
 
 CATEGORY = {8: "straight flush", 7: "four of a kind", 6: "full house",
             5: "flush", 4: "straight", 3: "three of a kind", 2: "two pair",
@@ -158,6 +159,100 @@ def independent_fold(tx):
             "history": history, "errors": errors}
 
 
+# --------------------------------------------------------------------------
+# Level 0 committed-deal audit from a transcript (spec 7.1). Mirrors the xTalk
+# heAuditDealsFromLog / heAuditDealLog: re-derive the deck from the REVEALED
+# seeds in the transcript and confirm the committed shuffle produced exactly
+# the cards that were dealt. Proves the transcript carries everything needed to
+# prove the deal was not stacked -- and that a tampered seed is caught.
+# --------------------------------------------------------------------------
+
+def build_level0_transcript(tamper=""):
+    table = pk.TABLE
+    hand = 1
+    occ = [1, 2, 3]
+    button = 1
+    seeds = list(pk.DEAL_SEEDS)
+    commits = [pk.seed_commit(s) for s in seeds]
+    deck = pk.shuffle_from_stream(pk.stream_bytes(pk.stream_key(table, hand, pk.xor_seeds(seeds)), 16))
+    holes, flop, turn, river, _ = pk.assign_deal(deck, occ, button)
+    L = []
+    L.append((0, "table", "cfg", "sb=1,bb=2,seats=1|2|3,stacks=400|400|400,button=1"))
+    L.append((1, "table", "handStart", "seats=1|2|3,button=1"))
+    L.append((1, "table", "dealLevel", "level=0,table=%s,count=3" % table.hex()))
+    for i, c in enumerate(commits, 1):
+        L.append((1, "seat%d" % occ[i - 1], "seedCommit", "pos=%d,commit=%s" % (i, c.hex())))
+    revealed = [s.hex() for s in seeds]
+    if tamper == "seed":                                  # flip a bit of a revealed seed
+        revealed[1] = "%064x" % (int(revealed[1], 16) ^ 1)
+    for i, sd in enumerate(revealed, 1):
+        L.append((1, "seat%d" % occ[i - 1], "seedReveal", "pos=%d,seed=%s" % (i, sd)))
+    for s in occ:
+        L.append((1, "table", "holeDeliver",
+                  "seat=%d,cards=%s|%s" % (s, pk.card_name(holes[s][0]), pk.card_name(holes[s][1]))))
+    L.append((1, "table", "board", "street=flop,cards=%s|%s|%s"
+              % tuple(pk.card_name(c) for c in flop)))
+    L.append((1, "table", "board", "street=turn,cards=%s" % pk.card_name(turn)))
+    L.append((1, "table", "board", "street=river,cards=%s" % pk.card_name(river)))
+    L.append((1, "table", "settle", "deltas=1:0|2:0|3:0"))
+    return L
+
+
+def _audit_one_deal(table, hand, seeds, commits, count, occ, button, holes, board):
+    for pos in range(1, count + 1):
+        if pk.seed_commit(bytes.fromhex(seeds[pos])).hex() != commits[pos]:
+            return "fail:commit-mismatch-position-%d" % pos
+    xr = pk.xor_seeds([bytes.fromhex(seeds[p]) for p in range(1, count + 1)])
+    deck = pk.shuffle_from_stream(pk.stream_bytes(pk.stream_key(table, hand, xr), 16))
+    ch_holes, ch_flop, ch_turn, ch_river, _ = pk.assign_deal(deck, occ, button)
+    for s in occ:
+        if ch_holes[s] != holes[s]:
+            return "fail:hole-mismatch-seat-%d" % s
+    if len(board) >= 3 and board[0:3] != ch_flop:
+        return "fail:flop-mismatch"
+    if len(board) >= 4 and board[3] != ch_turn:
+        return "fail:turn-mismatch"
+    if len(board) >= 5 and board[4] != ch_river:
+        return "fail:river-mismatch"
+    return "pass"
+
+
+def audit_deals_from_log(tx):
+    seeds, commits, holes, board = {}, {}, {}, []
+    table, count, occ, button, hand, level0 = None, 0, [], 0, 0, False
+    verified, total, lines = 0, 0, []
+    for h, frm, typ, body in tx:
+        d = dict(p.split("=", 1) for p in body.split(",")) if body else {}
+        if typ == "handStart":
+            occ = [int(x) for x in d["seats"].split("|")]
+            button = int(d["button"])
+            hand = h
+            level0, seeds, commits, holes, board = False, {}, {}, {}, []
+        elif typ == "dealLevel":
+            level0 = True
+            table = bytes.fromhex(d["table"])
+            count = int(d["count"])
+        elif typ == "seedCommit":
+            commits[int(d["pos"])] = d["commit"]
+        elif typ == "seedReveal":
+            seeds[int(d["pos"])] = d["seed"]
+        elif typ == "holeDeliver":
+            c = d["cards"].split("|")
+            holes[int(d["seat"])] = [ev.card_index(c[0]), ev.card_index(c[1])]
+        elif typ == "board":
+            for c in d["cards"].split("|"):
+                board.append(ev.card_index(c))
+        elif typ == "settle" and level0:
+            total += 1
+            v = _audit_one_deal(table, hand, seeds, commits, count, occ, button, holes, board)
+            if v == "pass":
+                verified += 1
+                lines.append("hand %d: deal-verified" % hand)
+            else:
+                lines.append("hand %d: deal-FAILED %s" % (hand, v))
+    return verified, total, lines
+
+
 def main():
     fails = 0
 
@@ -196,6 +291,15 @@ def main():
     bad = independent_fold(transcript("badact"))
     contains("illegal action rejected on replay",
              " ".join(bad["errors"]), "engine-rejected")
+
+    # Level 0 committed-deal audit from the transcript
+    v, t, lines = audit_deals_from_log(build_level0_transcript())
+    check("deal audit: honest Level 0 deal verifies (1/1)", (v, t), (1, 1))
+    contains("deal audit: hand marked deal-verified", " ".join(lines), "deal-verified")
+    v2, t2, lines2 = audit_deals_from_log(build_level0_transcript("seed"))
+    check("deal audit: tampered seed fails (0/1)", (v2, t2), (0, 1))
+    contains("deal audit: tampered seed named commit-mismatch",
+             " ".join(lines2), "commit-mismatch")
 
     print()
     if fails:
