@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.6.2"
-constant kHeHarnessV = "15"
+constant kHeVersion = "0.6.3"
+constant kHeHarnessV = "16"
 constant kUIVersion = "5"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -3866,6 +3866,7 @@ command heRunSelftest
    heTestFoldRun
    heTestCryptoRun
    heTestDealRun
+   heTestDealOrderRun
    heTestLobbyRun
    heTestNetSim
    put return & heProbeSodium() after gRpt
@@ -3985,6 +3986,57 @@ command heTestDealRun
    put heAuditDealsFromLog(tDealLog) into tAuditOut
    heTContains "deal: audit-from-transcript catches a tampered seed", tAuditOut, "deal-FAILED"
 end heTestDealRun
+
+function heTIdentityDeck
+   -- deck 1..52 where each card's value IS its position, so a deal signature
+   -- reads the card->seat mapping directly
+   local tOut, tI
+   put empty into tOut
+   repeat with tI = 1 to 52
+      put tI & comma after tOut
+   end repeat
+   delete char -1 of tOut
+   return tOut
+end heTIdentityDeck
+
+function heTDealSig pDeckList, pOccList, pButton
+   -- "seat=h1-h2;... flop=f-f-f turn=t river=r" from heDealAssign, matching
+   -- tools/protocol-kat.py deal_signature over the identity deck (all chunks
+   -- are of plain locals -- H6-safe)
+   local tDealA, tSeatNum, tHole, tOut, tFlop
+   set the itemDelimiter to comma
+   put heDealAssign(pDeckList, pOccList, pButton) into tDealA
+   put empty into tOut
+   repeat for each item tSeatNum in pOccList
+      put tDealA["holesBy"][tSeatNum] into tHole
+      put tSeatNum & "=" & (item 1 of tHole) & "-" & (item 2 of tHole) & ";" after tOut
+   end repeat
+   delete char -1 of tOut
+   put tDealA["flopList"] into tFlop
+   put tOut & " flop=" & (item 1 of tFlop) & "-" & (item 2 of tFlop) & "-" & (item 3 of tFlop) \
+         & " turn=" & tDealA["turnIx"] & " river=" & tDealA["riverIx"] into tOut
+   return tOut
+end heTDealSig
+
+command heTestDealOrderRun
+   -- pin the card->seat deal mapping (spec 7.1) for configs the main deal KAT
+   -- never covers: button not first, non-contiguous seats, heads-up, full ring.
+   -- On-engine mirror of tools/protocol-kat.py deal_orders (identity deck).
+   local tDeck
+   put return & "-- 12. deal order: card->seat mapping across seat configs" & return after gRpt
+   put heTIdentityDeck() into tDeck
+   heTAssert "deal-order: 3-handed, button 3 (button not first)", \
+         heTDealSig(tDeck, "1,2,3", 3), "1=1-4;2=2-5;3=3-6 flop=8-9-10 turn=12 river=14"
+   heTAssert "deal-order: non-contiguous seats 2,4,6 button 4", \
+         heTDealSig(tDeck, "2,4,6", 4), "2=2-5;4=3-6;6=1-4 flop=8-9-10 turn=12 river=14"
+   heTAssert "deal-order: heads-up 1,2 button 1", \
+         heTDealSig(tDeck, "1,2", 1), "1=2-4;2=1-3 flop=6-7-8 turn=10 river=12"
+   heTAssert "deal-order: heads-up non-contiguous 3,5 button 5", \
+         heTDealSig(tDeck, "3,5", 5), "3=1-3;5=2-4 flop=6-7-8 turn=10 river=12"
+   heTAssert "deal-order: full ring 1-6 button 4", \
+         heTDealSig(tDeck, "1,2,3,4,5,6", 4), \
+         "1=3-9;2=4-10;3=5-11;4=6-12;5=1-7;6=2-8 flop=14-15-16 turn=18 river=20"
+end heTestDealOrderRun
 
 command heTestLobbyRun
    -- on-engine mirror of the online lobby's signed-presence + reconnect path

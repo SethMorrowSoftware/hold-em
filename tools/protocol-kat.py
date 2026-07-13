@@ -255,6 +255,22 @@ def assign_deal(deck, occupied, button):
     return holes, flop, turn, river, burns
 
 
+# Deal-order breadth: over the IDENTITY deck (1..52), the card->seat mapping is
+# just the deal positions, so these signatures pin the wrap-around logic for
+# button-not-first, non-contiguous seats, and heads-up -- configs the main deal
+# KAT (occ 1,2,3 button 1) never exercises. The xTalk heDealAssign must
+# reproduce each on-engine (heTestDealOrderRun).
+IDENT_DECK = list(range(1, 53))
+DEAL_ORDER_CFGS = ["1,2,3|3", "2,4,6|4", "1,2|1", "3,5|5", "1,2,3,4,5,6|4"]
+
+
+def deal_signature(deck, occ_txt, button):
+    occ = [int(x) for x in occ_txt.split(",")]
+    holes, flop, turn, river, _ = assign_deal(deck, occ, int(button))
+    sig = ";".join("%d=%d-%d" % (s, holes[s][0], holes[s][1]) for s in occ)
+    return sig + " flop=%d-%d-%d turn=%d river=%d" % (flop[0], flop[1], flop[2], turn, river)
+
+
 # --------------------------------------------------------------------------
 # Canonical envelope + chain (spec 6, layered signatures)
 # --------------------------------------------------------------------------
@@ -343,6 +359,8 @@ def compute_all():
     out["turn"] = card_name(turn)
     out["river"] = card_name(river)
     out["burns"] = ",".join(card_name(c) for c in burns)
+    out["deal_orders"] = {cfg: deal_signature(IDENT_DECK, *cfg.split("|"))
+                          for cfg in DEAL_ORDER_CFGS}
 
     out["synth_stream"] = SYNTH_STREAM.hex()
     out["synth_deck"] = ",".join(card_name(c) for c in shuffle_from_stream(SYNTH_STREAM))
@@ -413,6 +431,13 @@ PINNED = {
   "83726c97707155ba2e81f0e5f673dd9e10dfde06e1c8f643bdd8539403aace51",
   "5f043c34bfb7a626581eb8653c88503a5a8524c9b47bdc2e09e37780005e0308"
  ],
+ "deal_orders": {
+  "1,2,3,4,5,6|4": "1=3-9;2=4-10;3=5-11;4=6-12;5=1-7;6=2-8 flop=14-15-16 turn=18 river=20",
+  "1,2,3|3": "1=1-4;2=2-5;3=3-6 flop=8-9-10 turn=12 river=14",
+  "1,2|1": "1=2-4;2=1-3 flop=6-7-8 turn=10 river=12",
+  "2,4,6|4": "2=2-5;4=3-6;6=1-4 flop=8-9-10 turn=12 river=14",
+  "3,5|5": "3=1-3;5=2-4 flop=6-7-8 turn=10 river=12"
+ },
  "deal_seeds": [
   "6c10d2dcff41a1a7e8bd9c7530052c7eb91b91808ee5d935e5f56098539eea3c",
   "f7badd5dc86a8a5dce0984ef43bcb7ec228398e08a854a8a8c455ff895dc8a49",
