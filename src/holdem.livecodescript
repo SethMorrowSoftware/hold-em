@@ -71,9 +71,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.5"
+constant kHeVersion = "0.5.6"
 constant kHeHarnessV = "12"
-constant kUIVersion = "4"
+constant kUIVersion = "5"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -2599,7 +2599,7 @@ command heBuildTable
 
    -- header + pot
    create field "heHeader"
-   set the rect of field "heHeader" to "40,10,984,38"
+   set the rect of field "heHeader" to "40,10,884,38"
    set the lockText of field "heHeader" to true
    set the textAlign of field "heHeader" to "center"
    set the textSize of field "heHeader" to 15
@@ -2700,8 +2700,12 @@ command heBuildTable
    heMakeActionButton "heBtnPot", "Pot", 768
    heMakeActionButton "heBtnDeal", "Deal", 848
    heMakeActionButton "heBtnOnline", "Lobby", 928
+   create button "heBtnHistory"
+   set the rect of button "heBtnHistory" to "892,8,980,36"
+   set the label of button "heBtnHistory" to "History"
 
    heBuildLobby
+   heBuildHistory
    heKitTryInit
    unlock screen
 end heBuildTable
@@ -2770,6 +2774,7 @@ command heBuildLobby
 end heBuildLobby
 
 command heLobbyShow
+   heHistHide
    heLobbySetVisible true
    heLobbyRefresh
 end heLobbyShow
@@ -2870,6 +2875,106 @@ command heLobbyRefresh
    end if
    set the text of field "heLobbyNet" to tNet
 end heLobbyRefresh
+
+command heBuildHistory
+   -- the hand-history overlay: the folded, re-verified transcript. Built
+   -- hidden; heHistShow/heHistHide toggle it. NEEDS AN OXT PASS.
+   create graphic "heHistBg"
+   set the style of graphic "heHistBg" to "roundrect"
+   set the roundRadius of graphic "heHistBg" to 16
+   set the rect of graphic "heHistBg" to "192,84,832,556"
+   set the backgroundColor of graphic "heHistBg" to "20,26,24"
+   set the borderColor of graphic "heHistBg" to kHeGoldColor
+   set the borderWidth of graphic "heHistBg" to 2
+   set the opaque of graphic "heHistBg" to true
+
+   heMakeLabel "heHistTitle", "212,94,812,124", \
+         "hand history -- replayed from the transcript & re-verified", kHeGoldColor, 15
+   heMakeLabel "heHistAudit", "212,128,812,150", "", kHeWhite, 12
+
+   create field "heHistList"
+   set the rect of field "heHistList" to "212,158,812,502"
+   set the lockText of field "heHistList" to true
+   set the textSize of field "heHistList" to 12
+   set the opaque of field "heHistList" to true
+   set the backgroundColor of field "heHistList" to "14,18,16"
+   set the textColor of field "heHistList" to kHeWhite
+   set the borderWidth of field "heHistList" to 0
+
+   create button "heBtnHistVerify"
+   set the rect of button "heBtnHistVerify" to "212,510,352,544"
+   set the label of button "heBtnHistVerify" to "Re-verify"
+   create button "heBtnHistExport"
+   set the rect of button "heBtnHistExport" to "360,510,540,544"
+   set the label of button "heBtnHistExport" to "Copy transcript"
+   create button "heBtnHistClose"
+   set the rect of button "heBtnHistClose" to "712,510,812,544"
+   set the label of button "heBtnHistClose" to "Close"
+
+   heHistHide
+end heBuildHistory
+
+command heHistShow
+   heLobbyHide
+   heHistSetVisible true
+   heHistRefresh
+end heHistShow
+
+command heHistHide
+   heHistSetVisible false
+end heHistHide
+
+command heHistSetVisible pOn
+   local tFields, tButtons, tNm
+   if there is a graphic "heHistBg" then
+      set the visible of graphic "heHistBg" to pOn
+   end if
+   put "heHistTitle,heHistAudit,heHistList" into tFields
+   put "heBtnHistVerify,heBtnHistExport,heBtnHistClose" into tButtons
+   set the itemDelimiter to comma
+   repeat for each item tNm in tFields
+      if there is a field tNm then
+         set the visible of field tNm to pOn
+      end if
+   end repeat
+   repeat for each item tNm in tButtons
+      if there is a button tNm then
+         set the visible of button tNm to pOn
+      end if
+   end repeat
+end heHistSetVisible
+
+function heHistVisible
+   if there is a graphic "heHistBg" then
+      return the visible of graphic "heHistBg"
+   end if
+   return false
+end heHistVisible
+
+command heHistRefresh
+   -- fold the current transcript and show the per-hand history plus the audit
+   -- verdict. The fold RE-DERIVES every settlement and compares it to the
+   -- logged one, so an all-verified transcript is the legitimacy proof.
+   local tFold, tHistTxt, tErrs, tAuditTxt
+   if not (there is a field "heHistList") then
+      exit heHistRefresh
+   end if
+   put heFoldTranscript(gGame["log"]) into tFold
+   put tFold["history"] into tHistTxt
+   put tFold["errors"] into tErrs
+   if tHistTxt is empty then
+      put "No completed hands yet. Play a hand (Deal), then re-open History." into tHistTxt
+   end if
+   set the text of field "heHistList" to tHistTxt
+   if tErrs is empty then
+      put "AUDIT PASSED -- every hand's settlement matched the independent replay." into tAuditTxt
+      set the textColor of field "heHistAudit" to "150,220,150"
+   else
+      put "AUDIT FAILED -- " & line 1 of tErrs into tAuditTxt
+      set the textColor of field "heHistAudit" to kHeRed
+   end if
+   set the text of field "heHistAudit" to tAuditTxt
+end heHistRefresh
 
 command heMakeLabel pName, pRect, pText, pColor, pSize
    create field pName
@@ -2996,9 +3101,22 @@ on mouseUp
          heLobbyHide
          heUISetStatus "Back to hotseat. Press Deal to play, or Lobby to go online."
          exit mouseUp
+      case "heBtnHistory"
+         heHistShow
+         exit mouseUp
+      case "heBtnHistVerify"
+         heHistRefresh
+         exit mouseUp
+      case "heBtnHistExport"
+         set the clipboardData["text"] to gGame["log"]
+         heUISetStatus "Signed transcript copied -- the portable, replayable proof of every hand."
+         exit mouseUp
+      case "heBtnHistClose"
+         heHistHide
+         exit mouseUp
    end switch
-   -- while the lobby overlay is up, the table/action buttons are inert
-   if heLobbyVisible() then
+   -- while an overlay is up, the table/action buttons are inert
+   if heLobbyVisible() or heHistVisible() then
       exit mouseUp
    end if
    if tWho is "heBtnDeal" then

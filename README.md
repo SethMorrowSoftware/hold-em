@@ -28,6 +28,12 @@ controls. The deal is a pure-integer PRNG shuffle so the playable path never tou
 binary; the cryptographic Level 0 deal (spec 7.1) is KAT-pinned and drives the online
 path.
 
+A **History** panel shows every completed hand — board, pot, winner, the named showdown
+hands, and per-seat deltas — folded straight from the transcript and **re-verified on the
+spot**: the fold re-derives each settlement and compares it to the logged payout, so an
+all-green audit is the legitimacy proof, and "Copy transcript" exports the raw, replayable
+record. The fold is independently pinned in CI (`tools/fold-kat.py`).
+
 With **SodiumXT + TorrentXT** installed, the stack opens on an **online lobby**: Create a
 table (its 64-hex code is the invite) or Join one, and peers meet over the BitTorrent
 DHT. Every peer admits-or-drops others at handshake against a signed session token; the
