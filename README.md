@@ -25,9 +25,10 @@ self-test (`heRunSelftest` in the message box), and SodiumXT/TorrentXT diagnosti
 extensions to be playable hotseat. The table shows per-seat names, chip totals, bets in
 front, dealer/blind badges, and fold/all-in/acting/winner states, with quick-bet
 controls. A **Settings** panel lets the host configure the table — **opening chips, small/
-big blind, ante, player count (2-6), a rising blind schedule** (turning the table into a
-tournament), and **deal speed** (fast/normal/slow) — and Apply starts a fresh table on the
-new config. The betting engine handles antes as dead money (into the pot, never the street
+big blind, ante, player count (2-6), the blind schedule, and deal speed** (fast/normal/slow)
+— and Apply starts a fresh table on the new config. Blinds can stay **fixed** (a cash game),
+**rise by hands played** (every N hands), or **rise on a timer** (every M minutes) — turning
+the table into a tournament — with the interval the host's to set. The betting engine handles antes as dead money (into the pot, never the street
 bet, so a seat still owes the full blind) and side pots layer over them; the blind schedule
 raises the stakes every N hands. All of that is machine-verified: antes and the level
 schedule are pinned in `tools/betting-kat.py`, re-checked on-engine (`heTestAnteRun` /
