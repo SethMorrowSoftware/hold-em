@@ -310,6 +310,64 @@ def check_undeclared_kconsts(text):
     return errors
 
 
+HANDLER_DECL = re.compile(r"^\s*(?:command|function|on|getprop|setprop)\s+(\w+)\s*(.*)$", re.I)
+END_ANY = re.compile(r"^\s*end\s+(\w+)\s*$", re.I)
+LOCAL_DECL = re.compile(r"^\s*local\s+(.+)$", re.I)
+CATCH_STMT = re.compile(r"\bcatch\s+(\w+)", re.I)
+# words that follow "end" as a control-structure close, not a handler close
+_CTRL_ENDS = {"if", "repeat", "switch", "try"}
+
+
+def check_undeclared_catch(text):
+    """Flag a ``catch VAR`` whose VAR is not declared as a local or parameter of
+    the enclosing handler. On strict OXT an undeclared variable referenced in the
+    catch body throws a SECONDARY error at the moment the catch fires -- so the
+    real failure is masked and the handler dies with an opaque "error in function
+    handler". This is invisible to every other gate and to a quick read (the catch
+    only misbehaves when it actually fires), and it is exactly what made
+    heProbeSodium/heProbeTorrent/heDeckFromStreamKey blow up once their try
+    bodies started throwing. Every catch variable must be a declared local (the
+    family pattern; e.g. heTableNew declares tErr)."""
+    errors = []
+    cur = None
+    declared = set()
+    for lineno, code in logical_lines(text):
+        bare = strip_strings(code)
+        em = END_ANY.match(bare)
+        if em:
+            # only 'end <handlername>' closes a handler; end if/repeat/switch/try don't
+            if cur is not None and em.group(1).lower() == cur.lower():
+                cur = None
+                declared = set()
+            continue
+        hm = HANDLER_DECL.match(bare)
+        if hm and cur is None:
+            cur = hm.group(1)
+            declared = set()
+            params = hm.group(2).strip()
+            if params:
+                for p in params.split(","):
+                    tok = p.strip().lstrip("@").split()
+                    if tok:
+                        declared.add(tok[0].lower())
+            continue
+        lm = LOCAL_DECL.match(bare)
+        if lm and cur is not None:
+            for v in lm.group(1).split(","):
+                tok = v.strip().split()
+                if tok:
+                    declared.add(tok[0].lower())
+            continue
+        for var in CATCH_STMT.findall(bare):
+            if cur is not None and var.lower() not in declared:
+                errors.append(
+                    f"  L{lineno}: catch variable '{var}' in handler '{cur}' is not "
+                    f"declared as a local -- an undeclared catch var throws on strict "
+                    f"OXT when the catch fires (declare it: 'local ... {var}')"
+                )
+    return errors
+
+
 def check_dangling_else(text):
     """A single-line ``if … then <stmt>`` directly followed by a BARE ``else``
     line. LiveCode/OXT binds that else to the single-line if (the dangling-else
@@ -353,6 +411,7 @@ def main():
         problems += check_bitwise(text)
         problems += check_reserved_names(text)
         problems += check_undeclared_kconsts(text)
+        problems += check_undeclared_catch(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")

@@ -314,6 +314,16 @@ House additions for THIS repo (earned in the siblings, restated as law here):
   no structural check sees them. Do every bit operation with **pure integer arithmetic**
   (`div`, `mod`, `add`, `*`) — the repo carries `heByteXor` (an 8-iteration div/mod XOR)
   for exactly this. The static gate flags any bitwise operator (check 6).
+- **H8. Declare the catch variable as a local.** `try … catch tErr` where `tErr` is not in
+  the handler's `local` list throws a SECOND error on strict OXT the moment the catch
+  fires and its body references the variable — which masks the real failure and surfaces
+  as an opaque "error in function handler". It is invisible on a read (the catch only
+  misbehaves when it actually fires) and only bites once the `try` body starts throwing:
+  `heProbeSodium`/`heProbeTorrent`/`heDeckFromStreamKey`/`heNetStart` all shipped this and
+  blew up only once SodiumXT/TorrentXT was installed (found v0.10.x — the probe threw
+  instead of reporting). Every `catch <var>` must have a matching `local … <var>` (the
+  family pattern; `heTableNew` does it right). The static gate flags any undeclared catch
+  variable (check 9).
 
 ## The single-threaded performance playbook (condensed for a card game)
 

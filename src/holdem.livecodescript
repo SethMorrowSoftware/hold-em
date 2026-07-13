@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.0"
-constant kHeHarnessV = "19"
+constant kHeVersion = "0.10.1"
+constant kHeHarnessV = "20"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -234,6 +234,7 @@ end closeStack
 --------------------------------------------------------------------------
 
 function heHasSodium
+   local tProbeErr
    if gHasSodiumChk is empty then
       try
          get sxRandomUniform(2)
@@ -316,53 +317,63 @@ command heProbeSodium
    -- in its own try, reporting ok / THREW. Prints to the message box. With
    -- the corrected signatures this should be all-ok on an engine with
    -- SodiumXT installed; run it once to confirm the Phase 2 surface is live.
+   -- tErr and tOuterErr MUST be declared: an undeclared catch variable throws on
+   -- strict OXT, which is why this probe blew up only once SodiumXT was installed
+   -- (with it absent the handler returns before any catch can fire).
    local tRpt, tData, tPub, tSec, tSig, tSealed, tOpened, tMsg, tRecPub, tRecSec
+   local tErr, tOuterErr
    put "SodiumXT probe (holde-em " & kHeVersion & "):" & return into tRpt
    if not heHasSodium() then
       put "  SodiumXT not installed (sxRandomUniform threw)." & return after tRpt
       put tRpt
       return tRpt
    end if
-   put textEncode("holde-em probe", "utf-8") into tMsg
+   -- an outer guard so nothing here can ever escape and abort a harness run;
+   -- whatever throws is reported into the probe text instead of killing it
+   try
+      put textEncode("holde-em probe", "utf-8") into tMsg
 
-   try
-      put heBin2HexS(heHash32(textEncode("", "utf-8"))) into tData
-      put "  sxHash(empty,32) -> " & tData & return after tRpt
-   catch tErr
-      put "  sxHash: THREW: " & tErr & return after tRpt
-   end try
-   try
-      sxSignKeypairFromSeed heHash32(textEncode("seed", "utf-8")), tPub, tSec
-      put "  sxSignKeypairFromSeed: ok  pub=" & char 1 to 16 of heBin2HexS(tPub) & "..." & return after tRpt
-   catch tErr
-      put "  sxSignKeypairFromSeed: THREW: " & tErr & return after tRpt
-   end try
-   try
-      put heSignDetachedD(tMsg, tSec) into tSig
-      if heVerifyDetached(tSig, tMsg, tPub) then
-         put "  sxSignDetached + verify: ok (roundtrip verified)" & return after tRpt
-      else
-         put "  sxSignDetached: FAILED verify (unexpected)" & return after tRpt
-      end if
-      if not heVerifyDetached(tSig, textEncode("tampered", "utf-8"), tPub) then
-         put "  verify rejects a tampered message: ok" & return after tRpt
-      else
-         put "  verify accepted a tampered message: BAD" & return after tRpt
-      end if
-   catch tErr
-      put "  sxSignDetached/verify: THREW: " & tErr & return after tRpt
-   end try
-   try
-      sxBoxKeypairFromSeed heHash32(textEncode("box", "utf-8")), tRecPub, tRecSec
-      put sxSeal(tMsg, tRecPub) into tSealed
-      put sxSealOpen(tSealed, tRecPub, tRecSec) into tOpened
-      if sxMemEqual(tOpened, tMsg) then
-         put "  sxSeal + sxSealOpen: ok (sealed-box roundtrip)" & return after tRpt
-      else
-         put "  sxSeal/Open: roundtrip mismatch" & return after tRpt
-      end if
-   catch tErr
-      put "  sxSeal/sxSealOpen: THREW: " & tErr & return after tRpt
+      try
+         put heBin2HexS(heHash32(textEncode("", "utf-8"))) into tData
+         put "  sxHash(empty,32) -> " & tData & return after tRpt
+      catch tErr
+         put "  sxHash: THREW: " & tErr & return after tRpt
+      end try
+      try
+         sxSignKeypairFromSeed heHash32(textEncode("seed", "utf-8")), tPub, tSec
+         put "  sxSignKeypairFromSeed: ok  pub=" & char 1 to 16 of heBin2HexS(tPub) & "..." & return after tRpt
+      catch tErr
+         put "  sxSignKeypairFromSeed: THREW: " & tErr & return after tRpt
+      end try
+      try
+         put heSignDetachedD(tMsg, tSec) into tSig
+         if heVerifyDetached(tSig, tMsg, tPub) then
+            put "  sxSignDetached + verify: ok (roundtrip verified)" & return after tRpt
+         else
+            put "  sxSignDetached: FAILED verify (unexpected)" & return after tRpt
+         end if
+         if not heVerifyDetached(tSig, textEncode("tampered", "utf-8"), tPub) then
+            put "  verify rejects a tampered message: ok" & return after tRpt
+         else
+            put "  verify accepted a tampered message: BAD" & return after tRpt
+         end if
+      catch tErr
+         put "  sxSignDetached/verify: THREW: " & tErr & return after tRpt
+      end try
+      try
+         sxBoxKeypairFromSeed heHash32(textEncode("box", "utf-8")), tRecPub, tRecSec
+         put sxSeal(tMsg, tRecPub) into tSealed
+         put sxSealOpen(tSealed, tRecPub, tRecSec) into tOpened
+         if sxMemEqual(tOpened, tMsg) then
+            put "  sxSeal + sxSealOpen: ok (sealed-box roundtrip)" & return after tRpt
+         else
+            put "  sxSeal/Open: roundtrip mismatch" & return after tRpt
+         end if
+      catch tErr
+         put "  sxSeal/sxSealOpen: THREW: " & tErr & return after tRpt
+      end try
+   catch tOuterErr
+      put "  probe aborted (unguarded): " & tOuterErr & return after tRpt
    end try
 
    put tRpt
@@ -378,7 +389,7 @@ end heProbeSodium
 command heProbeTorrent
    -- capture "the result" immediately after each bt* command (gotcha 27):
    -- per the docs only btStartSession throws, the rest report via the result
-   local tRpt, tSession, tHash, tHandle, tRC
+   local tRpt, tSession, tHash, tHandle, tRC, tErr
    put "TorrentXT probe (holde-em " & kHeVersion & "):" & return into tRpt
    try
       put btStartSession() into tSession
@@ -712,7 +723,7 @@ end heShuffleFromStreamHex
 function heDeckFromStreamKey pKeyData
    -- 16 blocks (1024 hex chars) covers 51 draws with slack; extend on the
    -- astronomically-unlikely stream exhaustion rather than fail
-   local tBlockCount, tDeckList
+   local tBlockCount, tDeckList, tShufErr
    put 16 into tBlockCount
    repeat forever
       try
@@ -1021,7 +1032,7 @@ command heNetStart
    -- start THE TorrentXT session, enable rp1, publish our admission token,
    -- and arm the poll drain. NEEDS AN OXT PASS. Requires tableIdHex + identity
    -- already set (heTableCreate/heTableJoin do that first).
-   local tSession, tRole
+   local tSession, tRole, tErr
    if gGame["online"] is "true" then
       exit heNetStart
    end if
@@ -1698,7 +1709,7 @@ end heEval7
 
 function heFreshPrngState
    -- returns a MINSTD seed in 1..kHeRngMax
-   local tSeed
+   local tSeed, tErr
    put 0 into tSeed
    if heHasSodium() then
       try
@@ -3948,7 +3959,7 @@ command heMakeActionButton pBtnName, pLabelTxt, pLeftX
 end heMakeActionButton
 
 command heKitTryInit
-   local tIdx
+   local tIdx, tKitErr
    put "flat" into gUIMode
    put 0 into gAnimBusy
    if not heHasKit() then
