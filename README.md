@@ -24,15 +24,21 @@ self-test (`heRunSelftest` in the message box), and SodiumXT/TorrentXT diagnosti
 (`heProbeSodium` / `heProbeTorrent`) — in a single self-building stack with no required
 extensions to be playable hotseat. The table shows per-seat names, chip totals, bets in
 front, dealer/blind badges, and fold/all-in/acting/winner states, with quick-bet
-controls. The deal is a pure-integer PRNG shuffle so the playable path never touches FFI
-binary; the cryptographic Level 0 deal (spec 7.1) is KAT-pinned and drives the online
-path.
+controls. With **SodiumXT** present the played hand deals from the **Level 0 committed
+keyed-stream shuffle** (spec 7.1) — each contributor's seed is committed, then revealed,
+and the deck is a hash of the XOR of the seeds, so the shuffle is fixed by the commitments
+and **provably unstackable on replay**. The whole crypto path is wrapped in a `try`, so any
+failure falls back to a labelled practice PRNG and the playable path can never break. (In
+hotseat one human holds all seeds — this is the auditable machinery; the adversarial
+guarantee arrives when seeds come from independent online players.)
 
 A **History** panel shows every completed hand — board, pot, winner, the named showdown
-hands, and per-seat deltas — folded straight from the transcript and **re-verified on the
-spot**: the fold re-derives each settlement and compares it to the logged payout, so an
-all-green audit is the legitimacy proof, and "Copy transcript" exports the raw, replayable
-record. The fold is independently pinned in CI (`tools/fold-kat.py`).
+hands, per-seat deltas — folded straight from the transcript and **re-verified on the
+spot**, with **two audits**: the settlement (the fold re-derives each payout and compares
+it to the logged one) and, for Level 0 hands, the **deal** (the committed shuffle is
+re-derived from the revealed seeds and confirmed to have produced exactly the cards dealt).
+"Copy transcript" exports the raw, replayable record. Both audits are independently pinned
+in CI (`tools/fold-kat.py`).
 
 With **SodiumXT + TorrentXT** installed, the stack opens on an **online lobby**: Create a
 table (its 64-hex code is the invite) or Join one, and peers meet over the BitTorrent

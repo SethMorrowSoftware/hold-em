@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.5.7"
-constant kHeHarnessV = "12"
+constant kHeVersion = "0.6.0"
+constant kHeHarnessV = "13"
 constant kUIVersion = "5"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -698,6 +698,135 @@ function heAuditDeal pTableData, pHandNum, pSeedsHexA, pCommitsA, pCount, pDealA
    end if
    return "pass"
 end heAuditDeal
+
+function heAuditDealsFromLog pLogTxt
+   -- replay a transcript and RE-DERIVE every Level 0 deal from the revealed
+   -- seeds, confirming the committed keyed-stream shuffle produced exactly the
+   -- cards that were dealt -- so the deal is provably unstackable, checkable by
+   -- anyone holding the log. Only the streets that were actually dealt are
+   -- compared (a hand folded pre-flop has no board to check). Needs SodiumXT
+   -- (recomputes commitments + shuffle). Returns "N/M deals verified" then one
+   -- line per Level 0 hand; "no Level 0 deals in this transcript" if none.
+   local tLine, tType, tBodyTxt, tBodyA, tOut, tVerified, tTotal
+   local tHandNum, tOccList, tButton, tTableHex, tCount, tSeedsA, tCommitsA
+   local tHolesA, tBoardList, tPos, tSeatNum, tLevel0, tCardTxt, tOneCard
+   local tDeckList, tCheckA, tVerdict, tBoardN
+   if not heHasSodium() then
+      return "deal audit needs SodiumXT (it recomputes the committed shuffle)."
+   end if
+   set the itemDelimiter to comma
+   put 0 into tVerified
+   put 0 into tTotal
+   put empty into tOut
+   put "false" into tLevel0
+   repeat for each line tLine in pLogTxt
+      if tLine is empty then
+         next repeat
+      end if
+      put heLogField(tLine, 3) into tType
+      put heLogField(tLine, 4) into tBodyTxt
+      set the itemDelimiter to comma
+      switch tType
+         case "handStart"
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put tBodyA["seats"] into tOccList
+            replace "|" with comma in tOccList
+            put tBodyA["button"] into tButton
+            put heLogField(tLine, 1) into tHandNum
+            put "false" into tLevel0
+            put empty into tSeedsA
+            put empty into tCommitsA
+            put empty into tHolesA
+            put empty into tBoardList
+            break
+         case "dealLevel"
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put "true" into tLevel0
+            put tBodyA["table"] into tTableHex
+            put tBodyA["count"] into tCount
+            break
+         case "seedCommit"
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put tBodyA["commit"] into tCommitsA[tBodyA["pos"]]
+            break
+         case "seedReveal"
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put tBodyA["seed"] into tSeedsA[tBodyA["pos"]]
+            break
+         case "holeDeliver"
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put tBodyA["cards"] into tCardTxt
+            replace "|" with comma in tCardTxt
+            put heCardIndex(item 1 of tCardTxt) & comma & heCardIndex(item 2 of tCardTxt) into tHolesA[tBodyA["seat"]]
+            break
+         case "board"
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put tBodyA["cards"] into tCardTxt
+            replace "|" with comma in tCardTxt
+            repeat for each item tOneCard in tCardTxt
+               if tBoardList is empty then
+                  put heCardIndex(tOneCard) into tBoardList
+               else
+                  put tBoardList & comma & heCardIndex(tOneCard) into tBoardList
+               end if
+            end repeat
+            break
+         case "settle"
+            if tLevel0 is "true" then
+               add 1 to tTotal
+               put heAuditDealLog(tTableHex, tHandNum, tSeedsA, tCommitsA, tCount, tOccList, tButton, tHolesA, tBoardList) into tVerdict
+               if tVerdict is "pass" then
+                  add 1 to tVerified
+                  put "hand " & tHandNum & ": deal-verified (committed shuffle re-derived)" & return after tOut
+               else
+                  put "hand " & tHandNum & ": deal-FAILED " & tVerdict & return after tOut
+               end if
+            end if
+            break
+      end switch
+   end repeat
+   if tTotal is 0 then
+      return "no Level 0 deals in this transcript (practice PRNG deal)."
+   end if
+   return tVerified & "/" & tTotal & " deals verified" & return & tOut
+end heAuditDealsFromLog
+
+function heAuditDealLog pTableHex, pHandNum, pSeedsHexA, pCommitsA, pCount, pOccList, pButton, pHolesA, pBoardList
+   -- verify one Level 0 hand from the log: commits bind the seeds, the deck
+   -- re-derives, and the dealt holes (always) plus whatever board streets were
+   -- revealed match. Returns "pass" or "fail:...".
+   local tSeatPos, tDeckList, tCheckA, tSeatNum, tBoardN
+   set the itemDelimiter to comma
+   repeat with tSeatPos = 1 to pCount
+      if heSeedCommitHex(pSeedsHexA[tSeatPos]) is not pCommitsA[tSeatPos] then
+         return "fail:commit-mismatch-position-" & tSeatPos
+      end if
+   end repeat
+   put heLevel0Deck(heHex2BinD(pTableHex), pHandNum, pSeedsHexA, pCount) into tDeckList
+   put heDealAssign(tDeckList, pOccList, pButton) into tCheckA
+   repeat for each item tSeatNum in pOccList
+      if tCheckA["holesBy"][tSeatNum] is not pHolesA[tSeatNum] then
+         return "fail:hole-mismatch-seat-" & tSeatNum
+      end if
+   end repeat
+   put the number of items of pBoardList into tBoardN
+   if tBoardN >= 3 and (item 1 to 3 of pBoardList) is not tCheckA["flopList"] then
+      return "fail:flop-mismatch"
+   end if
+   if tBoardN >= 4 and (item 4 of pBoardList) is not tCheckA["turnIx"] then
+      return "fail:turn-mismatch"
+   end if
+   if tBoardN >= 5 and (item 5 of pBoardList) is not tCheckA["riverIx"] then
+      return "fail:river-mismatch"
+   end if
+   return "pass"
+end heAuditDealLog
 
 --------------------------------------------------------------------------
 -- Online transport (Phase 2a/2b, spec 3/4/5/10). Peers meet on the DHT via
@@ -2335,7 +2464,7 @@ end heFoldTranscript
 --------------------------------------------------------------------------
 
 command heTableNew
-   local tSeatNum
+   local tSeatNum, tErr
    put empty into gGame
    put kHeDefaultSB into gGame["sb"]
    put kHeDefaultBB into gGame["bb"]
@@ -2348,6 +2477,17 @@ command heTableNew
       put kHeDefaultStack into gGame["stacksBy"][tSeatNum]
    end repeat
    put heHexId(16) into gGame["tableId"]
+   -- a 32-byte crypto table id (hex) is the domain for the Level 0 committed
+   -- deal (spec 7.1). Present only with SodiumXT; its absence makes heHandStart
+   -- fall back to the labelled practice PRNG.
+   put empty into gGame["tableIdHex"]
+   if heHasSodium() then
+      try
+         put heBin2HexS(sxRandomBytes(32)) into gGame["tableIdHex"]
+      catch tErr
+         put empty into gGame["tableIdHex"]
+      end try
+   end if
    heLogAppend "cfg", "table", heCfgBody()
    heHudMark
 end heTableNew
@@ -2380,7 +2520,7 @@ end heSeatsAlive
 
 command heHandStart
    local tOccList, tSeatNum, tDeckList, tDealA, tHolePair, tHoleNames
-   local tSeatsTxt
+   local tSeatsTxt, tDealCount, tPos, tTableData, tSeedsA, tCommitsA, tDealErr
    set the itemDelimiter to comma
    if gGame["phase"] is "hand" then
       exit heHandStart
@@ -2402,12 +2542,62 @@ command heHandStart
    replace comma with "|" in tSeatsTxt
    heLogAppend "handStart", "table", "seats=" & tSeatsTxt & ",button=" & gGame["buttonSeat"]
 
-   -- deal from the integer PRNG (binary-free); CSPRNG-seeded when possible
-   put heShuffleDeck(heFreshPrngState()) into tDeckList
+   -- deal the deck. When SodiumXT is present, use the Level 0 COMMITTED
+   -- keyed-stream shuffle (spec 7.1): a per-contributor seed is committed, then
+   -- revealed, and the deck is a hash of the XOR of the seeds -- so the shuffle
+   -- is fixed by the commitments and provably unstackable on replay. The whole
+   -- crypto path is wrapped in a try, so ANY failure falls back to the labelled
+   -- practice PRNG and the playable path can never break. (In hotseat one human
+   -- holds all seeds -- this is the auditable machinery, not yet an adversarial
+   -- guarantee; that arrives when seeds come from independent online players.)
+   put heCountItems(tOccList) into tDealCount
+   put "practice" into gGame["dealMode"]
+   put empty into gGame["dealSeedsA"]
+   put empty into gGame["dealCommitsA"]
+   if heHasSodium() and gGame["tableIdHex"] is not empty then
+      try
+         put heHex2BinD(gGame["tableIdHex"]) into tTableData
+         put empty into tSeedsA
+         put empty into tCommitsA
+         put 0 into tPos
+         repeat for each item tSeatNum in tOccList
+            add 1 to tPos
+            put heBin2HexS(sxRandomBytes(32)) into tSeedsA[tPos]
+            put heSeedCommitHex(tSeedsA[tPos]) into tCommitsA[tPos]
+         end repeat
+         put heLevel0Deck(tTableData, gGame["handNum"], tSeedsA, tDealCount) into tDeckList
+         put tSeedsA into gGame["dealSeedsA"]
+         put tCommitsA into gGame["dealCommitsA"]
+         put "level0" into gGame["dealMode"]
+      catch tDealErr
+         put "practice" into gGame["dealMode"]
+      end try
+   end if
+   if gGame["dealMode"] is "practice" then
+      put heShuffleDeck(heFreshPrngState()) into tDeckList
+   end if
    put heDealAssign(tDeckList, tOccList, gGame["buttonSeat"]) into tDealA
    put tDeckList into tDealA["deckList"]
-   put heCountItems(tOccList) into tDealA["seatCount"]
+   put tDealCount into tDealA["seatCount"]
    put tDealA into gGame["deal"]
+
+   -- record the deal provenance in the transcript so the deal is auditable on
+   -- replay: the binding commit for each contributor, then the reveal. Anyone
+   -- with the transcript can re-derive the deck and confirm it was not stacked
+   -- (heAuditDealsFromLog / tools/fold-kat.py do exactly this).
+   if gGame["dealMode"] is "level0" then
+      heLogAppend "dealLevel", "table", "level=0,table=" & gGame["tableIdHex"] & ",count=" & tDealCount
+      put 0 into tPos
+      repeat for each item tSeatNum in tOccList
+         add 1 to tPos
+         heLogAppend "seedCommit", "seat" & tSeatNum, "pos=" & tPos & ",commit=" & gGame["dealCommitsA"][tPos]
+      end repeat
+      put 0 into tPos
+      repeat for each item tSeatNum in tOccList
+         add 1 to tPos
+         heLogAppend "seedReveal", "seat" & tSeatNum, "pos=" & tPos & ",seed=" & gGame["dealSeedsA"][tPos]
+      end repeat
+   end if
 
    -- hole delivery (hotseat shows all; Phase 2 seals per seat)
    repeat for each item tSeatNum in tOccList
@@ -2980,20 +3170,24 @@ function heHistVisible
 end heHistVisible
 
 command heHistRefresh
-   -- fold the current transcript and show the per-hand history plus the audit
-   -- verdict. The fold RE-DERIVES every settlement and compares it to the
-   -- logged one, so an all-verified transcript is the legitimacy proof.
-   local tFold, tHistTxt, tErrs, tAuditTxt
+   -- fold the current transcript and show the per-hand history plus TWO audits:
+   -- the settlement (the fold re-derives every payout and compares it to the
+   -- logged one) and, for Level 0 hands, the DEAL (heAuditDealsFromLog
+   -- re-derives the committed shuffle from the revealed seeds). An all-verified
+   -- transcript is the legitimacy proof.
+   local tFold, tHistTxt, tErrs, tAuditTxt, tDealAudit
    if not (there is a field "heHistList") then
       exit heHistRefresh
    end if
    put heFoldTranscript(gGame["log"]) into tFold
    put tFold["history"] into tHistTxt
    put tFold["errors"] into tErrs
+   put heAuditDealsFromLog(gGame["log"]) into tDealAudit
    if tHistTxt is empty then
       put "No completed hands yet. Play a hand (Deal), then re-open History." into tHistTxt
    end if
-   set the text of field "heHistList" to tHistTxt
+   set the text of field "heHistList" to tHistTxt & return & return \
+         & "-- deal audit (commit-reveal shuffle) --" & return & tDealAudit
    if tErrs is empty then
       put "AUDIT PASSED -- every hand's settlement matched the independent replay." into tAuditTxt
       set the textColor of field "heHistAudit" to "150,220,150"
@@ -3718,6 +3912,7 @@ command heTestDealRun
    -- tools/protocol-kat.py. SKIPs without SodiumXT. Exercises the real
    -- commit-reveal dealing protocol the online game uses.
    local tSeedsA, tXorHex, tKeyData, tDeckList, tDealA, tCommitsA, tTableData
+   local tDealLog, tHoles1, tHoles2, tHoles3, tFlopP, tAuditOut
    put return & "-- 7. Level 0 keyed-stream deal (spec 7.1, crypto path)" & return after gRpt
    if not heHasSodium() then
       heTSkip "deal: Level 0 keyed-stream", "SodiumXT not installed"
@@ -3751,6 +3946,42 @@ command heTestDealRun
    heTAssert "deal: audit names a corrupted commit", \
          heAuditDeal(tTableData, 1, tSeedsA, tCommitsA, 3, tDealA, "1,2,3", 1), \
          "fail:commit-mismatch-position-2"
+
+   -- audit-from-TRANSCRIPT (mirror of tools/fold-kat.py): build the canned
+   -- Level 0 log heHandStart would write and confirm heAuditDealsFromLog
+   -- re-derives the committed shuffle from the revealed seeds -- proving the
+   -- played deal is verifiable by anyone with the transcript, and that a
+   -- tampered revealed seed is caught.
+   put kKatHole1 into tHoles1
+   replace comma with "|" in tHoles1
+   put kKatHole2 into tHoles2
+   replace comma with "|" in tHoles2
+   put kKatHole3 into tHoles3
+   replace comma with "|" in tHoles3
+   put kKatFlop into tFlopP
+   replace comma with "|" in tFlopP
+   put heLogLine(0, "table", "cfg", "sb=1,bb=2,seats=1|2|3,stacks=400|400|400,button=1") & return into tDealLog
+   put heLogLine(1, "table", "handStart", "seats=1|2|3,button=1") & return after tDealLog
+   put heLogLine(1, "table", "dealLevel", "level=0,table=" & kKatTableHex & ",count=3") & return after tDealLog
+   put heLogLine(1, "seat1", "seedCommit", "pos=1,commit=" & kKatCommit1) & return after tDealLog
+   put heLogLine(1, "seat2", "seedCommit", "pos=2,commit=" & kKatCommit2) & return after tDealLog
+   put heLogLine(1, "seat3", "seedCommit", "pos=3,commit=" & kKatCommit3) & return after tDealLog
+   put heLogLine(1, "seat1", "seedReveal", "pos=1,seed=" & kKatSeed1) & return after tDealLog
+   put heLogLine(1, "seat2", "seedReveal", "pos=2,seed=" & kKatSeed2) & return after tDealLog
+   put heLogLine(1, "seat3", "seedReveal", "pos=3,seed=" & kKatSeed3) & return after tDealLog
+   put heLogLine(1, "table", "holeDeliver", "seat=1,cards=" & tHoles1) & return after tDealLog
+   put heLogLine(1, "table", "holeDeliver", "seat=2,cards=" & tHoles2) & return after tDealLog
+   put heLogLine(1, "table", "holeDeliver", "seat=3,cards=" & tHoles3) & return after tDealLog
+   put heLogLine(1, "table", "board", "street=flop,cards=" & tFlopP) & return after tDealLog
+   put heLogLine(1, "table", "board", "street=turn,cards=" & kKatTurn) & return after tDealLog
+   put heLogLine(1, "table", "board", "street=river,cards=" & kKatRiver) & return after tDealLog
+   put heLogLine(1, "table", "settle", "deltas=1:0|2:0|3:0") & return after tDealLog
+   put heAuditDealsFromLog(tDealLog) into tAuditOut
+   heTContains "deal: audit-from-transcript re-derives the committed shuffle", tAuditOut, "1/1 deals verified"
+   heTContains "deal: audit-from-transcript marks the hand deal-verified", tAuditOut, "hand 1: deal-verified"
+   replace ("pos=2,seed=" & kKatSeed2) with ("pos=2,seed=" & kKatSeed1) in tDealLog
+   put heAuditDealsFromLog(tDealLog) into tAuditOut
+   heTContains "deal: audit-from-transcript catches a tampered seed", tAuditOut, "deal-FAILED"
 end heTestDealRun
 
 command heTestLobbyRun
