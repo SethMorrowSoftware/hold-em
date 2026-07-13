@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.6.0"
-constant kHeHarnessV = "13"
+constant kHeVersion = "0.6.1"
+constant kHeHarnessV = "14"
 constant kUIVersion = "5"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -3866,6 +3866,7 @@ command heRunSelftest
    heTestCryptoRun
    heTestDealRun
    heTestLobbyRun
+   heTestNetSim
    put return & heProbeSodium() after gRpt
    put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
          & return after gRpt
@@ -4052,6 +4053,110 @@ command heTestLobbyRun
    end if
    heTAssert "resync: client recovers to the current chain head", tClientHead, tHead3
 end heTestLobbyRun
+
+command heTestNetSim
+   -- single-machine LOOPBACK of the online message orchestration -- no rp1, no
+   -- second machine. We drive the REAL stateful handlers (heHostRelay,
+   -- heNetIngestWire) against gGame and route the bytes each side would send by
+   -- hand, so seq-assignment, verify-or-drop, chain-advance, and resync recovery
+   -- are proven on ONE machine before a networked OXT pass. btRp1Send is never
+   -- reached (the host has no live peers, so heNetBroadcast is a no-op and the
+   -- resync request finds no host peer). gGame is saved and restored so the sim
+   -- never disturbs the live game. SKIPs without SodiumXT.
+   local tSaved, tHostPub, tHostSec, tPlayPub, tPlaySec, tHostPubHex, tPlayPubHex
+   local tCfgWire, tWire2, tWire3, tHostLog, tContent, tSenderSig, tPacket
+   local tHead1, tHead2, tHead3, tBadPub, tBadSec
+   put return & "-- 10. Online orchestration loopback (single machine, no rp1)" & return after gRpt
+   if not heHasSodium() then
+      heTSkip "netsim: online orchestration", "SodiumXT not installed"
+      exit heTestNetSim
+   end if
+   set the itemDelimiter to comma
+   put gGame into tSaved
+
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tHostPub, tHostSec
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed2), tPlayPub, tPlaySec
+   put heBin2HexS(tHostPub) into tHostPubHex
+   put heBin2HexS(tPlayPub) into tPlayPubHex
+
+   -- ===== HOST context =====
+   put empty into gGame
+   put "true" into gGame["online"]
+   put "true" into gGame["isHost"]
+   put tHostPubHex into gGame["idPubHex"]
+   put tHostSec into gGame["idSecData"]
+   put tHostPubHex into gGame["hostPubHex"]
+   put kKatTableHex into gGame["tableIdHex"]
+   put 0 into gGame["handNum"]
+   put 0 into gGame["seqCounter"]
+   put 0 into gGame["syncCooldown"]
+   put kHeGenesisPrev into gGame["chainHeadHex"]
+   put "true" into gGame["admittedA"][tHostPubHex]
+   put "true" into gGame["admittedA"][tPlayPubHex]     -- as if the player already handshook
+   put "host" into gGame["roleByPub"][tHostPubHex]
+   put "player" into gGame["roleByPub"][tPlayPubHex]
+
+   -- host emits a cfg (seq 1): heNetSendAction -> heHostRelay -> local ingest
+   heNetSendAction "cfg", kKatLobbyCfgBody
+   put gGame["log"] into tHostLog
+   heTAssert "netsim: host relayed + logged its own cfg (seq 1)", the number of lines of tHostLog, 1
+   put line 1 of tHostLog into tCfgWire
+   put gGame["chainHeadHex"] into tHead1
+
+   -- a player's signed action arrives; the host relays it (seq 2). This is the
+   -- real star-topology path minus the rp1 hop (peerPubA is empty, no broadcast).
+   put heEnvContentLine(kKatTableHex, 0, tPlayPubHex, "act", "verb=check,amount=0") into tContent
+   put heEnvSenderSigHex(tContent, tPlaySec) into tSenderSig
+   put tContent & tab & tSenderSig into tPacket
+   heHostRelay 0, tPacket
+   put gGame["log"] into tHostLog
+   heTAssert "netsim: host verified + relayed a player action (seq 2)", the number of lines of tHostLog, 2
+   put line 2 of tHostLog into tWire2
+   put gGame["chainHeadHex"] into tHead2
+
+   -- host emits a third wire (seq 3)
+   heNetSendAction "cfg", kKatLobbyCfgBody
+   put gGame["log"] into tHostLog
+   put line 3 of tHostLog into tWire3
+   put gGame["chainHeadHex"] into tHead3
+
+   -- a validly-signed action from an UNADMITTED key must be dropped by the relay
+   -- (admission is enforced, not just the signature) -- no new wire is produced
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed3), tBadPub, tBadSec
+   put heEnvContentLine(kKatTableHex, 0, heBin2HexS(tBadPub), "act", "verb=bet,amount=99") into tContent
+   put heEnvSenderSigHex(tContent, tBadSec) into tSenderSig
+   put tContent & tab & tSenderSig into tPacket
+   heHostRelay 0, tPacket
+   put gGame["log"] into tHostLog
+   heTAssert "netsim: host drops an unadmitted sender (no new wire)", the number of lines of tHostLog, 3
+
+   -- ===== PLAYER context =====
+   put empty into gGame
+   put "true" into gGame["online"]
+   put "false" into gGame["isHost"]
+   put tPlayPubHex into gGame["idPubHex"]
+   put tPlaySec into gGame["idSecData"]
+   put tHostPubHex into gGame["hostPubHex"]
+   put kKatTableHex into gGame["tableIdHex"]
+   put 0 into gGame["syncCooldown"]
+   put kHeGenesisPrev into gGame["chainHeadHex"]
+
+   -- player ingests the host cfg wire -> chain advances, cfg body stashed
+   heNetIngestWire tCfgWire
+   heTAssert "netsim: player accepts host cfg + advances chain to head1", gGame["chainHeadHex"], tHead1
+   heTAssert "netsim: player stashed the cfg body", gGame["cfgBody"], kKatLobbyCfgBody
+
+   -- GAP: player misses wire 2, receives wire 3 -> chain break, head unchanged
+   heNetIngestWire tWire3
+   heTAssert "netsim: player drops the ahead-of-gap wire (chain unchanged)", gGame["chainHeadHex"], tHead1
+
+   -- RESYNC replay: host replays 2 then 3 -> player recovers to head3
+   heNetIngestWire tWire2
+   heNetIngestWire tWire3
+   heTAssert "netsim: player recovers to the host chain head after replay", gGame["chainHeadHex"], tHead3
+
+   put tSaved into gGame
+end heTestNetSim
 
 command heTestCryptoRun
    -- on-engine mirror of tools/protocol-kat.py (spec 6 + 7.1 crypto). SKIPs
