@@ -86,9 +86,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.9.0"
-constant kHeHarnessV = "18"
-constant kUIVersion = "6"
+constant kHeVersion = "0.10.0"
+constant kHeHarnessV = "19"
+constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -131,6 +131,7 @@ constant kHeDefaultStack = 400
 -- hands when levelMode is "hands"; "off" holds the fixed stakes forever.
 constant kHeDefaultLevels = "1/2/0;2/4/0;3/6/0;5/10/0;10/20/0;15/30/0;25/50/0;50/100/10"
 constant kHeDefaultLevelEvery = 8
+constant kHeDefaultLevelMinutes = 10
 -- table pacing (spec 11: physics/timing is cosmetic; these are the "deal feel"
 -- beats so a hand does not flash by or end abruptly). These are the NORMAL-speed
 -- defaults; the host picks fast/normal/slow and heSpeedPace scales them into the
@@ -2586,9 +2587,10 @@ command heCfgDefaults
    put kHeDefaultBB into gCfg["bb"]
    put kHeDefaultAnte into gCfg["ante"]
    put kHeDefaultSeats into gCfg["numSeats"]
-   put "off" into gCfg["levelMode"]        -- "off" (cash, fixed stakes) | "hands"
+   put "off" into gCfg["levelMode"]        -- "off" (cash) | "hands" | "time"
    put kHeDefaultLevels into gCfg["levels"]
-   put kHeDefaultLevelEvery into gCfg["levelEvery"]
+   put kHeDefaultLevelEvery into gCfg["levelEvery"]      -- hands per level (hands mode)
+   put kHeDefaultLevelMinutes into gCfg["levelMinutes"]  -- minutes per level (time mode)
    put "normal" into gCfg["speed"]          -- "fast" | "normal" | "slow"
 end heCfgDefaults
 
@@ -2633,8 +2635,10 @@ command heTableNew
    put gCfg["levelMode"] into gGame["levelMode"]
    put gCfg["levels"] into gGame["levels"]
    put gCfg["levelEvery"] into gGame["levelEvery"]
+   put gCfg["levelMinutes"] into gGame["levelMinutes"]
    put gCfg["speed"] into gGame["speed"]
    put 0 into gGame["curLevel"]
+   put the milliseconds into gGame["tableStartMs"]   -- clock zero for time-based levels
    heSpeedPace gCfg["speed"]
    put 0 into gGame["handNum"]
    put 0 into gGame["buttonSeat"]
@@ -2662,7 +2666,7 @@ command heTableNew
    heHudMark
 end heTableNew
 
-command heApplyCfg pStartStack, pSB, pBB, pAnte, pNumSeats, pLevelMode, pSpeed
+command heApplyCfg pStartStack, pSB, pBB, pAnte, pNumSeats, pLevelMode, pLevelEvery, pLevelMinutes, pSpeed
    -- the settings panel calls this with validated values, then heTableNew to
    -- start a fresh table on the new configuration. Kept separate so config
    -- persists across tables (gCfg) independent of live game state (gGame).
@@ -2673,6 +2677,8 @@ command heApplyCfg pStartStack, pSB, pBB, pAnte, pNumSeats, pLevelMode, pSpeed
    put pAnte into gCfg["ante"]
    put pNumSeats into gCfg["numSeats"]
    put pLevelMode into gCfg["levelMode"]
+   put pLevelEvery into gCfg["levelEvery"]
+   put pLevelMinutes into gCfg["levelMinutes"]
    put pSpeed into gCfg["speed"]
 end heApplyCfg
 
@@ -2697,18 +2703,29 @@ function heLevelFor pHandNum, pLevelsTxt, pHandsPerLevel
    -- tournament blind schedule: pLevelsTxt is "sb/bb/ante;sb/bb/ante;...". The
    -- active level advances every pHandsPerLevel hands (1-based) and clamps at the
    -- last level. Returns "sb,bb,ante". Pure -- KAT-pinned in betting-kat.py.
-   local tLevels, tCount, tIdx, tEvery, tLevel
-   set the itemDelimiter to ";"
-   put pLevelsTxt into tLevels
-   put the number of items of tLevels into tCount
-   if tCount < 1 then
-      return "1,2,0"
-   end if
+   local tEvery, tIdx
    put pHandsPerLevel into tEvery
    if tEvery < 1 then
       put 1 into tEvery
    end if
    put trunc((pHandNum - 1) / tEvery) + 1 into tIdx
+   return heLevelForPeriod(tIdx, pLevelsTxt)
+end heLevelFor
+
+function heLevelForPeriod pPeriodIdx, pLevelsTxt
+   -- return the "sb,bb,ante" for a 1-based period index, clamped to the last
+   -- level. Shared by hand-count and (future) time-based schedules. Saves and
+   -- restores the itemDelimiter so it never leaks ";" to the caller (gotcha 5).
+   local tSaved, tLevels, tCount, tIdx, tLevel
+   put the itemDelimiter into tSaved
+   set the itemDelimiter to ";"
+   put pLevelsTxt into tLevels
+   put the number of items of tLevels into tCount
+   if tCount < 1 then
+      set the itemDelimiter to tSaved
+      return "1,2,0"
+   end if
+   put pPeriodIdx into tIdx
    if tIdx > tCount then
       put tCount into tIdx
    end if
@@ -2716,9 +2733,10 @@ function heLevelFor pHandNum, pLevelsTxt, pHandsPerLevel
       put 1 into tIdx
    end if
    put item tIdx of tLevels into tLevel
+   set the itemDelimiter to tSaved
    replace "/" with comma in tLevel
    return tLevel
-end heLevelFor
+end heLevelForPeriod
 
 function heSeatsAlive
    local tOut, tSeatNum
@@ -2732,28 +2750,55 @@ function heSeatsAlive
    return tOut
 end heSeatsAlive
 
-command heApplyLevel
-   -- set this hand's sb/bb/ante from the tournament schedule when one is active;
-   -- log a "level" line only when the level index changes (curLevel tracks it)
-   local tLvl, tIdx, tEvery, tLevelsTxt, tCount
-   if gGame["levelMode"] is not "hands" then
-      exit heApplyLevel
-   end if
-   put gGame["levels"] into tLevelsTxt   -- copy out before any chunk (H6)
+function heLevelCount pLevelsTxt
+   -- number of levels in a "sb/bb/ante;..." schedule (saves/restores delimiter)
+   local tSaved, tTxt, tN
+   put the itemDelimiter into tSaved
    set the itemDelimiter to ";"
-   put the number of items of tLevelsTxt into tCount
+   put pLevelsTxt into tTxt
+   put the number of items of tTxt into tN
+   set the itemDelimiter to tSaved
+   return tN
+end heLevelCount
+
+command heApplyLevel
+   -- set this hand's sb/bb/ante from the tournament schedule when one is active.
+   -- The level's PERIOD index comes from hands played (levelMode "hands") or wall-
+   -- clock minutes since the table opened (levelMode "time"); "off" holds fixed
+   -- stakes. Logs a "level" line only when the index changes (curLevel tracks it).
+   local tLvl, tIdx, tEvery, tElapsedMs, tPerMs, tCount
+   switch gGame["levelMode"]
+      case "hands"
+         put gGame["levelEvery"] into tEvery
+         if tEvery < 1 then
+            put 1 into tEvery
+         end if
+         put trunc((gGame["handNum"] - 1) / tEvery) + 1 into tIdx
+         break
+      case "time"
+         put gGame["levelMinutes"] into tEvery
+         if tEvery < 1 then
+            put 1 into tEvery
+         end if
+         put the milliseconds - gGame["tableStartMs"] into tElapsedMs
+         put tEvery * 60000 into tPerMs
+         put trunc(tElapsedMs / tPerMs) + 1 into tIdx
+         break
+      default
+         exit heApplyLevel
+   end switch
+   -- clamp the index to the schedule so curLevel settles at the top (no log spam)
+   put heLevelCount(gGame["levels"]) into tCount
    if tCount < 1 then
       exit heApplyLevel
    end if
-   put gGame["levelEvery"] into tEvery
-   if tEvery < 1 then
-      put 1 into tEvery
-   end if
-   put trunc((gGame["handNum"] - 1) / tEvery) + 1 into tIdx
    if tIdx > tCount then
       put tCount into tIdx
    end if
-   put heLevelFor(gGame["handNum"], tLevelsTxt, tEvery) into tLvl
+   if tIdx < 1 then
+      put 1 into tIdx
+   end if
+   put heLevelForPeriod(tIdx, gGame["levels"]) into tLvl
    set the itemDelimiter to comma
    put item 1 of tLvl into gGame["sb"]
    put item 2 of tLvl into gGame["bb"]
@@ -3411,17 +3456,26 @@ command heBuildSettings
    heMakeSettingRow "heSetAnte", "Ante (0 for none)", 272
    heMakeSettingRow "heSetSeats", "Players (2-6)", 310
 
-   heMakeLabel "heSetLevelLbl", "232,350,540,378", "Blinds", kHeWhite, 13
+   heMakeLabel "heSetLevelLbl", "232,346,540,374", "Blinds", kHeWhite, 13
    create button "heBtnSetLevel"
-   set the rect of button "heBtnSetLevel" to "560,348,792,380"
+   set the rect of button "heBtnSetLevel" to "560,344,792,376"
    set the label of button "heBtnSetLevel" to "Fixed (cash game)"
 
-   heMakeLabel "heSetSpeedLbl", "232,392,540,420", "Deal speed", kHeWhite, 13
+   -- interval row: meaning follows the blind mode (hands per level / minutes per
+   -- level); ignored when blinds are fixed. Its label repaints with the mode.
+   heMakeLabel "heSetIntervalLbl", "232,386,540,414", "Raise interval", kHeWhite, 13
+   create field "heSetInterval"
+   set the rect of field "heSetInterval" to "560,384,792,416"
+   set the textAlign of field "heSetInterval" to "center"
+   set the textSize of field "heSetInterval" to 14
+   set the lockText of field "heSetInterval" to false
+
+   heMakeLabel "heSetSpeedLbl", "232,426,540,454", "Deal speed", kHeWhite, 13
    create button "heBtnSetSpeed"
-   set the rect of button "heBtnSetSpeed" to "560,390,792,422"
+   set the rect of button "heBtnSetSpeed" to "560,424,792,456"
    set the label of button "heBtnSetSpeed" to "Normal"
 
-   heMakeLabel "heSetLevelInfo", "212,428,812,462", \
+   heMakeLabel "heSetLevelInfo", "212,462,812,492", \
          "a rising schedule turns the table into a tournament", kHeGoldColor, 11
 
    create button "heBtnSetApply"
@@ -3461,8 +3515,8 @@ command heSettingsSetVisible pOn
       set the visible of graphic "heSetBg" to pOn
    end if
    put "heSetTitle,heSetHint,heSetLevelInfo,heSetStackLbl,heSetSBLbl,heSetBBLbl," \
-         & "heSetAnteLbl,heSetSeatsLbl,heSetLevelLbl,heSetSpeedLbl," \
-         & "heSetStack,heSetSB,heSetBB,heSetAnte,heSetSeats" into tFields
+         & "heSetAnteLbl,heSetSeatsLbl,heSetLevelLbl,heSetIntervalLbl,heSetSpeedLbl," \
+         & "heSetStack,heSetSB,heSetBB,heSetAnte,heSetSeats,heSetInterval" into tFields
    put "heBtnSetLevel,heBtnSetSpeed,heBtnSetApply,heBtnSetCancel" into tButtons
    repeat for each item tNm in tFields
       if there is a field tNm then
@@ -3496,14 +3550,60 @@ command heSettingsRefresh
    set the text of field "heSetSeats" to gCfg["numSeats"]
    set the label of button "heBtnSetLevel" to heSettingsLevelLabel(gCfg["levelMode"])
    set the label of button "heBtnSetSpeed" to heSettingsSpeedLabel(gCfg["speed"])
+   heSettingsIntervalRefresh
 end heSettingsRefresh
 
-function heSettingsLevelLabel pMode
-   if pMode is "hands" then
-      return "Rising every " & kHeDefaultLevelEvery & " hands (tournament)"
+command heSettingsIntervalRefresh
+   -- the interval field + its label follow the blind mode
+   if there is not a field "heSetInterval" then
+      exit heSettingsIntervalRefresh
    end if
+   set the text of field "heSetIntervalLbl" to heSettingsIntervalLabel(gCfg["levelMode"])
+   if gCfg["levelMode"] is "time" then
+      set the text of field "heSetInterval" to gCfg["levelMinutes"]
+   else
+      set the text of field "heSetInterval" to gCfg["levelEvery"]
+   end if
+end heSettingsIntervalRefresh
+
+command heSettingsIntervalStash
+   -- read the interval field into the gCfg key for the CURRENT mode, so cycling
+   -- the mode never discards what the host typed. A bad value is left for Apply
+   -- to reject rather than silently overwriting the stored one.
+   local tVal
+   if there is not a field "heSetInterval" then
+      exit heSettingsIntervalStash
+   end if
+   put word 1 of the text of field "heSetInterval" into tVal
+   if not heSettingsNumOk(tVal, 1) then
+      exit heSettingsIntervalStash
+   end if
+   if gCfg["levelMode"] is "time" then
+      put tVal into gCfg["levelMinutes"]
+   else
+      put tVal into gCfg["levelEvery"]
+   end if
+end heSettingsIntervalStash
+
+function heSettingsLevelLabel pMode
+   switch pMode
+      case "hands"
+         return "Rising, by hands played"
+      case "time"
+         return "Rising, on a timer"
+   end switch
    return "Fixed (cash game)"
 end heSettingsLevelLabel
+
+function heSettingsIntervalLabel pMode
+   switch pMode
+      case "hands"
+         return "Hands per level"
+      case "time"
+         return "Minutes per level"
+   end switch
+   return "Raise interval (n/a for cash)"
+end heSettingsIntervalLabel
 
 function heSettingsSpeedLabel pSpeed
    switch pSpeed
@@ -3521,12 +3621,21 @@ command heSettingsCycle pWhich
    heCfgEnsure
    switch pWhich
       case "level"
-         if gCfg["levelMode"] is "hands" then
-            put "off" into gCfg["levelMode"]
-         else
-            put "hands" into gCfg["levelMode"]
-         end if
+         -- off -> by hands -> on a timer -> off. Stash the current interval field
+         -- back to the right gCfg key before switching, so cycling never loses it.
+         heSettingsIntervalStash
+         switch gCfg["levelMode"]
+            case "off"
+               put "hands" into gCfg["levelMode"]
+               break
+            case "hands"
+               put "time" into gCfg["levelMode"]
+               break
+            default
+               put "off" into gCfg["levelMode"]
+         end switch
          set the label of button "heBtnSetLevel" to heSettingsLevelLabel(gCfg["levelMode"])
+         heSettingsIntervalRefresh
          break
       case "speed"
          switch gCfg["speed"]
@@ -3546,16 +3655,23 @@ end heSettingsCycle
 
 command heSettingsApply
    -- validate the number fields, commit to the config, then start a fresh table
-   local tStack, tSB, tBB, tAnte, tSeats
+   local tStack, tSB, tBB, tAnte, tSeats, tInterval
+   heSettingsIntervalStash
    put word 1 of the text of field "heSetStack" into tStack
    put word 1 of the text of field "heSetSB" into tSB
    put word 1 of the text of field "heSetBB" into tBB
    put word 1 of the text of field "heSetAnte" into tAnte
    put word 1 of the text of field "heSetSeats" into tSeats
+   put word 1 of the text of field "heSetInterval" into tInterval
    if not heSettingsNumOk(tStack, 1) or not heSettingsNumOk(tSB, 0) \
          or not heSettingsNumOk(tBB, 1) or not heSettingsNumOk(tAnte, 0) \
          or not heSettingsNumOk(tSeats, kHeMinSeats) then
       heUISetStatus "Settings: every field must be a whole number (chips>=1, seats>=2)."
+      exit heSettingsApply
+   end if
+   if (gCfg["levelMode"] is "hands" or gCfg["levelMode"] is "time") \
+         and not heSettingsNumOk(tInterval, 1) then
+      heUISetStatus "Settings: the blind interval must be a whole number of at least 1."
       exit heSettingsApply
    end if
    -- clamp / normalise: BB is at least the SB, seats within the layout
@@ -3572,7 +3688,8 @@ command heSettingsApply
       heUISetStatus "Settings: the ante must be smaller than the starting stack."
       exit heSettingsApply
    end if
-   heApplyCfg tStack, tSB, tBB, tAnte, tSeats, gCfg["levelMode"], gCfg["speed"]
+   heApplyCfg tStack, tSB, tBB, tAnte, tSeats, gCfg["levelMode"], \
+         gCfg["levelEvery"], gCfg["levelMinutes"], gCfg["speed"]
    heSettingsHide
    heTableNew
    heUIClearCards
@@ -4480,20 +4597,23 @@ command heRunSelftest
    put 0 into gSkipN
    put "holde-em self-test  stack v" & kHeVersion & "  harness v" & kHeHarnessV \
          & return & return after gRpt
-   heTestEvaluatorRun
-   heTestBettingRun
-   heTestAnteRun
-   heTestLevelRun
-   heTestLegalRun
-   heTestScheduleRun
-   heTestShuffleRun
-   heTestFoldRun
-   heTestCryptoRun
-   heTestReceiptRun
-   heTestDealRun
-   heTestDealOrderRun
-   heTestLobbyRun
-   heTestNetSim
+   -- each section runs inside a guard so a first-contact runtime fault in one
+   -- is reported (with its error) and the rest still run -- the harness never
+   -- dies with an opaque "error in function handler", it tells you where
+   heRunSection "heTestEvaluatorRun"
+   heRunSection "heTestBettingRun"
+   heRunSection "heTestAnteRun"
+   heRunSection "heTestLevelRun"
+   heRunSection "heTestLegalRun"
+   heRunSection "heTestScheduleRun"
+   heRunSection "heTestShuffleRun"
+   heRunSection "heTestFoldRun"
+   heRunSection "heTestCryptoRun"
+   heRunSection "heTestReceiptRun"
+   heRunSection "heTestDealRun"
+   heRunSection "heTestDealOrderRun"
+   heRunSection "heTestLobbyRun"
+   heRunSection "heTestNetSim"
    put return & heProbeSodium() after gRpt
    put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
          & return after gRpt
@@ -4505,6 +4625,19 @@ command heRunSelftest
    put gRpt
    return gRpt
 end heRunSelftest
+
+command heRunSection pName
+   -- run one test section under a guard: a runtime fault is caught, counted as a
+   -- FAIL with its error text, and the remaining sections still run. Keeps a
+   -- first-contact arithmetic error in a new section from aborting the harness.
+   local tErr
+   try
+      do pName
+   catch tErr
+      add 1 to gFailN
+      put "FAIL  " & pName & " THREW: " & tErr & return after gRpt
+   end try
+end heRunSection
 
 command heTAssert pLabel, pObserved, pExpected
    if pObserved is pExpected then
@@ -5309,6 +5442,10 @@ command heTestLevelRun
    heTAssert "level: top level carries an ante", heLevelFor(57, tLv, 8), "50,100,10"
    heTAssert "level: clamps at the final level", heLevelFor(9999, tLv, 8), "50,100,10"
    heTAssert "level: every=1 advances each hand", heLevelFor(3, tLv, 1), "3,6,0"
+   heTAssert "level: period 1 is level 1", heLevelForPeriod(1, tLv), "1,2,0"
+   heTAssert "level: period 4 is level 4", heLevelForPeriod(4, tLv), "5,10,0"
+   heTAssert "level: period clamps at the top", heLevelForPeriod(999, tLv), "50,100,10"
+   heTAssert "level: count of the default schedule", heLevelCount(tLv), 8
 end heTestLevelRun
 
 function heTLegalAllAccepted pStateA, pSeatNum

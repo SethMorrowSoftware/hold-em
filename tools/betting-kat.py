@@ -590,17 +590,23 @@ def post_antes(st):
     return st
 
 
-def level_for(hand_num, levels_txt, hands_per_level):
+def level_for_period(period_idx, levels_txt):
+    # the level "sb,bb,ante" for a 1-based period index, clamped to the last level
     levels = levels_txt.split(";")
     if len(levels) < 1:
         return "1,2,0"
-    every = hands_per_level if hands_per_level >= 1 else 1
-    idx = (hand_num - 1) // every + 1
+    idx = period_idx
     if idx > len(levels):
         idx = len(levels)
     if idx < 1:
         idx = 1
     return levels[idx - 1].replace("/", ",")
+
+
+def level_for(hand_num, levels_txt, hands_per_level):
+    every = hands_per_level if hands_per_level >= 1 else 1
+    idx = (hand_num - 1) // every + 1
+    return level_for_period(idx, levels_txt)
 
 
 def case_antes():
@@ -665,6 +671,10 @@ def case_levels():
     check("level: top level carries an ante", level_for(57, lv, 8), "50,100,10")
     check("level: clamps at the final level", level_for(9999, lv, 8), "50,100,10")
     check("level: every=1 advances each hand", level_for(3, lv, 1), "3,6,0")
+    # the period->level mapping is shared by the hands and timer schedules
+    check("level: period 1 is level 1", level_for_period(1, lv), "1,2,0")
+    check("level: period 4 is level 4", level_for_period(4, lv), "5,10,0")
+    check("level: period clamps at the top", level_for_period(999, lv), "50,100,10")
 
 
 def main():
