@@ -299,6 +299,30 @@ def settle_hash(deltas_csv, chain_head):
     return H(b"HOLDEM-SETL-v1|" + deltas_csv.encode("utf-8") + b"|" + chain_head)
 
 
+# --------------------------------------------------------------------------
+# Host-trust hardening (spec 6 checkpoints + 8.3 settlement receipts). A ckpt
+# is a player's signature over the current chain head at a street boundary --
+# if two players' ckpts reference different heads, the host forked (attributable
+# equivocation). A settlement receipt is every seated player's signature over a
+# receipt head that hash-chains hand to hand, so the ledger is multi-signed and
+# no subset can rewrite it. Domains are separated and versioned (spec 16).
+# --------------------------------------------------------------------------
+
+GENESIS_RCPT = "00" * 32          # empty predecessor for the receipt chain
+
+
+def ckpt_sig(chain_head_hex, id_seed):
+    return ed_sign(("HOLDEM-CKPT-v1|" + chain_head_hex).encode("utf-8"), id_seed).hex()
+
+
+def receipt_head(settle_hash_hex, prev_rcpt_hex):
+    return H(b"HOLDEM-RCPT-v1|" + (settle_hash_hex + "|" + prev_rcpt_hex).encode("utf-8")).hex()
+
+
+def receipt_sig(rcpt_head_hex, id_seed):
+    return ed_sign(("HOLDEM-RSIG-v1|" + rcpt_head_hex).encode("utf-8"), id_seed).hex()
+
+
 def admit_token(table_hex, id_seed, role="host"):
     """Signed table-admission claim (spec 5): sign over
     "HOLDEM-SESS-v1|<tableHex>|<pubHex>|<role>", framed as pubHex TAB role TAB
@@ -391,6 +415,17 @@ def compute_all():
     out["settle_hash"] = settle_hash("1:-4,2:8,3:-4", prev).hex()
     _, out["admit_sig"] = admit_token(TABLE.hex(), ID_SEEDS[0])
 
+    # Host-trust fixture: a ckpt over the transcript head, and a TWO-hand
+    # settlement-receipt chain that all three players sign.
+    out["ckpt_sig"] = ckpt_sig(heads[5], ID_SEEDS[1])   # player 2 checkpoints head 6
+    settle_hash2 = settle_hash("1:2,2:-1,3:-1", GENESIS).hex()
+    out["settle_hash2"] = settle_hash2
+    rh1 = receipt_head(out["settle_hash"], GENESIS_RCPT)
+    rh2 = receipt_head(settle_hash2, rh1)
+    out["receipt_head1"] = rh1
+    out["receipt_head2"] = rh2
+    out["receipt_sigs"] = [receipt_sig(rh2, s) for s in ID_SEEDS]  # all three sign hand 2
+
     # Lobby presence + reconnect fixture (spec 9): the host (ID0) opens a table
     # and signs a cfg (seq 1, from genesis); once a player (ID1) has joined the
     # host signs a roster (seq 2). A late joiner replays both from genesis and
@@ -426,6 +461,7 @@ PINNED = {
   "91cfb880c55c546f559867c01427856b7e9f3efb5ef2b03d8f5bd4eb9cfb8f22",
   "62fcd52b3757f590c33bede7330620853074c1e5c153549244a8dac7287e3778"
  ],
+ "ckpt_sig": "08c7f29409998d642657b9a084802b7ca3a136d696e881b545ed4e5a750fdb6d14e4967f401977aca416f03c0d4f03f98b3acc53e61266f3d8cee9912639e20f",
  "commits": [
   "7623721b5a6372fa974ed62f558fce9992259eb2a834ece7bcea66bce970c0e3",
   "83726c97707155ba2e81f0e5f673dd9e10dfde06e1c8f643bdd8539403aace51",
@@ -460,10 +496,18 @@ PINNED = {
  ],
  "lobby_cfg_body": "v=1,level=0,sb=1,bb=2,seats=6,button=1",
  "lobby_head2": "54c4df80d160eaaef52536a8ff6f2a7e09caccc629e1c467fe382eedc8a23509",
+ "receipt_head1": "53ed9ccc64863dc05c1b76cd7953e19bba73895b8dd22ea00e6c9ff40f423cef",
+ "receipt_head2": "0284af24c750eaaaa5a521b87d8f1ab6ce00b0b2be074ce03d24884e004fc910",
+ "receipt_sigs": [
+  "222929a8ce05e0d45cab6658d9e67d882d6cfa1f91c35cda8e07a58763c4b1fb6c733e23d116f04ed91960c0ad386541139fed43e1632df341175021d70b1700",
+  "20a21d334da7d32b00bf3a17920350ebaad0773121fc3f2d9feba041360d9548fb527c555cab8039985439bed3af73d17656b939942a6bc3a793630275070706",
+  "429a37ee32d74fd2d09b1b3a86fccc383c7e773ef52670ed07e4ede7e2e10f9ab4b791d630d0b44bdb6c405ed5238cc0bbab9d40129d3673c2c39f1d5d1a9c09"
+ ],
  "river": "9s",
  "roster_body": "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10:player,b6ef1a19d789c27bea3f6c127db635929541f34907750ee12d0b715c010c7566:host",
  "seeds_xor": "73e2b09387940cf29398389f4d4fef74987ffac3c369b68cb522ded044cb00b8",
  "settle_hash": "68095dcf5a74fac1e1340a1073a466dcf117024257f5c265de21698257b34b6f",
+ "settle_hash2": "5e716ce9022f4c47d99e081b52be3a8bb5f9f1f56d3def18577c2f7ac9de8df5",
  "stream_block0": "22a256dd9846bb3d40d24d3d5441cdf5415e9fb3532ba99f4f4812630941108d",
  "stream_key": "e4d91a49ee23982afb804fd386cbd3d2df6370ae0a743b0f461325b94818e40f",
  "synth_deck": "Ac,Kc,3d,5h,Kh,5d,Qc,3h,2h,5c,8c,4h,4d,Tc,7h,Qs,6c,Ts,6h,7d,Th,6s,Kd,3c,Jc,9s,4c,Ah,5s,2d,8s,As,2s,Ad,9d,Qh,8d,Jh,Qd,Jd,2c,6d,7s,Ks,7c,Js,8h,3s,4s,9h,9c,Td",
@@ -515,6 +559,13 @@ def main():
         print('constant kKatLobbyCfgBody = "%s"' % got["lobby_cfg_body"])
         print('constant kKatRosterBody = "%s"' % got["roster_body"])
         print('constant kKatLobbyHead2 = "%s"' % got["lobby_head2"])
+        print('constant kKatCkptSig = "%s"' % got["ckpt_sig"])
+        print('constant kKatSettleHash2 = "%s"' % got["settle_hash2"])
+        print('constant kKatRcptHead1 = "%s"' % got["receipt_head1"])
+        print('constant kKatRcptHead2 = "%s"' % got["receipt_head2"])
+        print('constant kKatRcptSig1 = "%s"' % got["receipt_sigs"][0])
+        print('constant kKatRcptSig2 = "%s"' % got["receipt_sigs"][1])
+        print('constant kKatRcptSig3 = "%s"' % got["receipt_sigs"][2])
         return 0
 
     got = compute_all()
