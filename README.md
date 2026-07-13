@@ -24,7 +24,12 @@ self-test (`heRunSelftest` in the message box), and SodiumXT/TorrentXT diagnosti
 (`heProbeSodium` / `heProbeTorrent`) — in a single self-building stack with no required
 extensions to be playable hotseat. The table shows per-seat names, chip totals, bets in
 front, dealer/blind badges, and fold/all-in/acting/winner states, with quick-bet
-controls. With **SodiumXT** present the played hand deals from the **Level 0 committed
+controls. A hand plays out at **dealing pace** rather than flashing to the result: each
+board street lands a beat after the betting closes, an all-in **runs out one street at a
+time**, and the showdown **holds on the revealed hands** before the pot is settled and the
+next hand deals. The beats are timer-driven (never per-frame) and are four one-line
+constants (`kHeStreetRevealMs`, `kHeRunoutStepMs`, `kHeShowdownHoldMs`, `kHeNextHandDelayMs`)
+so the feel is easy to dial in on an OXT pass. With **SodiumXT** present the played hand deals from the **Level 0 committed
 keyed-stream shuffle** (spec 7.1) — each contributor's seed is committed, then revealed,
 and the deck is a hash of the XOR of the seeds, so the shuffle is fixed by the commitments
 and **provably unstackable on replay**. The whole crypto path is wrapped in a `try`, so any
