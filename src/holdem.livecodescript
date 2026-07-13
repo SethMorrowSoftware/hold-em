@@ -6,6 +6,21 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.5.1-0.5.6 -- audit hardening + provability. A four-way audit (protocol,
+pure-logic, OXT-dialect, coverage) drove: restored dropped deal KAT constants
+that silently broke heTestDealRun + a new gate for undeclared k-constants;
+verify-or-drop can no longer throw on a malformed frame (heIsHex before every
+decode, H4); chain-gap recovery so a lost rp1 wire no longer wedges a client
+(heNetRequestSync + s? replay, spec 9); tools/logic-fuzz.py proving the RULES
+against independent references (exhaustive evaluator = 7462 classes + exact
+category frequencies + 5/7-card order-isomorphism; peel-based settlement; whole
+-game conservation). heRank5 no longer depends on a stable sort (precomputed
+composite key). Auditable HAND HISTORY: heFoldTranscript emits a per-hand record
+(board/pot/winner/showdown/deltas) with a re-verified settle verdict, surfaced
+in a History panel with a "Copy transcript" export, independently pinned by
+tools/fold-kat.py. All verified statically / by KAT; the History panel, the
+heRank5 sort, and the transport need an OXT pass.
+
 v0.5.0 -- Phase 2e: the online LOBBY. Create or join a table over the DHT and
 watch the real transport work end to end -- peers admit-or-drop at handshake
 (signed session tokens), the host catches every new joiner up by replaying the
@@ -1383,12 +1398,13 @@ function heRank5 pFive
       return "08" & heTwoDigits(tHighStraight) & "00000000"
    end if
 
-   -- histogram: sort groups by (count, rank) descending in ONE pass with a
-   -- composite key (count * 100 + rank; rank <= 14 < 100, so count dominates
-   -- and rank breaks ties). A single sort means correctness does not depend on
-   -- LiveCode's sort being stable -- the ranking is provable from the code
-   -- alone (evaluator category frequencies + order-isomorphism are pinned in
-   -- tools/logic-fuzz.py).
+   -- histogram: sort groups by (count, rank) descending in ONE pass. The sort
+   -- key is PRECOMPUTED as item 1 (count * 100 + rank; rank <= 14 < 100, so
+   -- count dominates and rank breaks ties), then we sort by that single field
+   -- with the proven "by item 1 of each" form. So correctness depends neither
+   -- on LiveCode's sort being stable NOR on an arithmetic sort-by expression --
+   -- both are removed. Each line is "sortKey,count,rank" (frequencies +
+   -- order-isomorphism pinned in tools/logic-fuzz.py).
    repeat with tPos = 1 to 5
       put item tPos of tRankList into tRankVal
       if tCountA[tRankVal] is empty then
@@ -1398,15 +1414,15 @@ function heRank5 pFive
    end repeat
    put empty into tGroupLines
    repeat for each key tRankVal in tCountA
-      put tCountA[tRankVal] & comma & tRankVal & return after tGroupLines
+      put (tCountA[tRankVal] * 100 + tRankVal) & comma & tCountA[tRankVal] & comma & tRankVal & return after tGroupLines
    end repeat
    delete char -1 of tGroupLines
-   sort lines of tGroupLines numeric descending by (item 1 of each * 100 + item 2 of each)
+   sort lines of tGroupLines numeric descending by item 1 of each
    put empty into tSizes
    put empty into tGRanks
    repeat for each line tOut in tGroupLines
-      put item 1 of tOut & comma after tSizes
-      put item 2 of tOut & comma after tGRanks
+      put item 2 of tOut & comma after tSizes
+      put item 3 of tOut & comma after tGRanks
    end repeat
    delete char -1 of tSizes
    delete char -1 of tGRanks
@@ -2256,8 +2272,12 @@ function heFoldTranscript pLogTxt
             -- independent recomputation on this replay -- the audit, per hand.
             put empty into tBoardNames
             repeat for each item tOneCard in tBoardList
-               put heCardName(tOneCard) & space after tBoardNames
+               put heCardName(tOneCard) & comma after tBoardNames
             end repeat
+            if tBoardNames is not empty then
+               delete char -1 of tBoardNames        -- trailing comma
+               replace comma with space in tBoardNames
+            end if
             put 0 into tPotTotal
             put empty into tWinnersTxt
             put empty into tShownTxt
@@ -2276,9 +2296,10 @@ function heFoldTranscript pLogTxt
                delete char -1 of tWinnersTxt
             end if
             if tShownTxt is not empty then
-               delete char -2 to -1 of tShownTxt
+               delete char -1 of tShownTxt           -- trailing space, then...
+               delete char -1 of tShownTxt           -- ...trailing comma (two proven deletes)
             end if
-            put "hand " & heLogField(tLogLine, 1) & ": board " & word 1 to -1 of tBoardNames \
+            put "hand " & heLogField(tLogLine, 1) & ": board " & tBoardNames \
                   & "; pot " & tPotTotal & "; winner seat " & tWinnersTxt into tHistLine
             if tShownTxt is not empty then
                put "; showdown " & tShownTxt after tHistLine
