@@ -86,9 +86,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.8.0"
-constant kHeHarnessV = "17"
-constant kUIVersion = "5"
+constant kHeVersion = "0.9.0"
+constant kHeHarnessV = "18"
+constant kUIVersion = "6"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -116,15 +116,26 @@ constant kHeDomainRsig = "HOLDEM-RSIG-v1|"
 constant kHeGenesisPrev = "0000000000000000000000000000000000000000000000000000000000000000"
 constant kHeTwo32 = 4294967296
 
--- table defaults
+-- table defaults. kHeDefaultSeats is the MAX seats the layout builds (6 spots);
+-- the host can seat fewer (kHeMinSeats..kHeMaxSeats) per table via the config.
 constant kHeDefaultSeats = 6
+constant kHeMinSeats = 2
+constant kHeMaxSeats = 6
 constant kHeDefaultSB = 1
 constant kHeDefaultBB = 2
+constant kHeDefaultAnte = 0
 constant kHeDefaultStack = 400
+-- blind-level schedule (tournament option). One level = "sb/bb/ante"; levels are
+-- ";"-separated. A literal single-line string (gotcha 6: constants must be
+-- literal, so no & lf building). The level advances every kHeDefaultLevelEvery
+-- hands when levelMode is "hands"; "off" holds the fixed stakes forever.
+constant kHeDefaultLevels = "1/2/0;2/4/0;3/6/0;5/10/0;10/20/0;15/30/0;25/50/0;50/100/10"
+constant kHeDefaultLevelEvery = 8
 -- table pacing (spec 11: physics/timing is cosmetic; these are the "deal feel"
--- beats so a hand does not flash by or end abruptly). All four are one-line
--- tunables; a played hand reads them off timers, never per-frame. Verified
--- statically; the actual feel needs an OXT pass to dial in.
+-- beats so a hand does not flash by or end abruptly). These are the NORMAL-speed
+-- defaults; the host picks fast/normal/slow and heSpeedPace scales them into the
+-- gGame["pace*"] values the schedule handlers actually read (per-tick, not
+-- per-frame). Verified statically; the actual feel needs an OXT pass to dial in.
 constant kHeNextHandDelayMs = 2600  -- result shown, then the next hand deals
 constant kHeStreetRevealMs = 750    -- beat after betting closes before a street lands
 constant kHeRunoutStepMs = 1050     -- beat between streets when an all-in runs out
@@ -160,6 +171,9 @@ constant kHeWhite = "246,246,246"
 --------------------------------------------------------------------------
 
 local gGame            -- the whole table: see heTableNew for the key map
+local gCfg             -- persistent table configuration: survives heTableNew so
+                       -- the host's chosen stakes/stacks/seats/levels/speed carry
+                       -- from one table to the next. See heCfgDefaults for keys.
 local gHasSodiumChk    -- cached extension probe ("", "true", "false")
 local gHasKitChk
 local gUIMode          -- "flat" or "kit"
@@ -178,6 +192,7 @@ on preOpenStack
 end preOpenStack
 
 on openStack
+   heCfgDefaults
    heBuildTable
    heTableNew
    -- open on the lobby so the first choice is host / join / hotseat
@@ -1783,11 +1798,12 @@ end heDealAssign
 -- raise" -- the flag that makes under-raise all-ins not reopen betting.
 --------------------------------------------------------------------------
 
-function heBetNewHand pSB, pBB, pStacksA, pOccupiedList, pButtonSeat
+function heBetNewHand pSB, pBB, pAnte, pStacksA, pOccupiedList, pButtonSeat
    local tStateA, tSeatNum, tCount
    set the itemDelimiter to comma
    put pSB into tStateA["sb"]
    put pBB into tStateA["bb"]
+   put pAnte into tStateA["ante"]
    put pOccupiedList into tStateA["occ"]
    put pButtonSeat into tStateA["buttonSeat"]
    put "preflop" into tStateA["street"]
@@ -1884,6 +1900,21 @@ function heBetPay pStateA, pSeatNum, pAmount
    return tStateA
 end heBetPay
 
+function heBetPayDead pStateA, pSeatNum, pAmount
+   -- post dead money (antes): into the pot (handBy) only, NEVER the street bet,
+   -- so an ante does not reduce what a seat still owes to call the blind. A seat
+   -- short of the full ante posts what it has and is all-in for it (side-pot
+   -- eligible up to its contribution, exactly like a short blind).
+   local tStateA
+   put pStateA into tStateA
+   subtract pAmount from tStateA["stackBy"][pSeatNum]
+   add pAmount to tStateA["handBy"][pSeatNum]
+   if tStateA["stackBy"][pSeatNum] is 0 then
+      put "true" into tStateA["allinBy"][pSeatNum]
+   end if
+   return tStateA
+end heBetPayDead
+
 function heBetFirstInHandAfter pStateA, pAfterSeat
    local tOrder, tSeatNum
    set the itemDelimiter to comma
@@ -1966,6 +1997,21 @@ function heBetApply pStateA, pMsgType, pSeatNum, pAmount
    put empty into tStateA["note"]
 
    switch pMsgType
+
+      case "bidAnte"
+         -- every seat posts the ante as dead money before the blinds; a seat
+         -- short of the ante posts what it has (all-in for the ante)
+         if tStateA["phase"] is not "blinds" then
+            put "bidAnte-out-of-phase" into tStateA["err"]
+            return tStateA
+         end if
+         put min(tStateA["ante"], tStateA["stackBy"][pSeatNum]) into tPay
+         if pAmount is not tPay then
+            put "bidAnte-wrong-amount" into tStateA["err"]
+            return tStateA
+         end if
+         put heBetPayDead(tStateA, pSeatNum, tPay) into tStateA
+         return tStateA
 
       case "bidSB"
          if tStateA["phase"] is not "blinds" then
@@ -2334,7 +2380,7 @@ function heFoldTranscript pLogTxt
    -- (array), "handNum", "trace" (per-hand deltas lines), "errors" (lines).
    local tOutA, tLogLine, tType, tBodyTxt, tBodyA, tStateA, tHaveHand
    local tSeatNum, tHolesA, tBoardList, tRanksA, tDeltasA, tDeltasTxt
-   local tSevenList, tOccList, tButtonSeat, tSB, tBB, tFromTxt, tStacksTxt
+   local tSevenList, tOccList, tButtonSeat, tSB, tBB, tAnte, tFromTxt, tStacksTxt
    local tPos, tCardTxt, tOneCard
    local tHistLine, tBoardNames, tPotTotal, tWinnersTxt, tShownTxt, tHolePair, tAuditPart
    set the itemDelimiter to comma
@@ -2360,6 +2406,10 @@ function heFoldTranscript pLogTxt
             split tBodyA by comma and "="
             put tBodyA["sb"] into tSB
             put tBodyA["bb"] into tBB
+            put tBodyA["ante"] into tAnte    -- absent in pre-ante transcripts
+            if tAnte is empty then
+               put 0 into tAnte
+            end if
             put tBodyA["seats"] into tOccList
             replace "|" with comma in tOccList
             put tBodyA["button"] into tButtonSeat
@@ -2372,13 +2422,25 @@ function heFoldTranscript pLogTxt
             end repeat
             break
 
+         case "level"
+            -- tournament level change: subsequent hands use these stakes/ante
+            put tBodyTxt into tBodyA
+            split tBodyA by comma and "="
+            put tBodyA["sb"] into tSB
+            put tBodyA["bb"] into tBB
+            put tBodyA["ante"] into tAnte
+            if tAnte is empty then
+               put 0 into tAnte
+            end if
+            break
+
          case "handStart"
             put tBodyTxt into tBodyA
             split tBodyA by comma and "="
             put tBodyA["seats"] into tOccList
             replace "|" with comma in tOccList
             put tBodyA["button"] into tButtonSeat
-            put heBetNewHand(tSB, tBB, tOutA["stacksBy"], tOccList, tButtonSeat) into tStateA
+            put heBetNewHand(tSB, tBB, tAnte, tOutA["stacksBy"], tOccList, tButtonSeat) into tStateA
             put "true" into tHaveHand
             put empty into tHolesA
             put empty into tBoardList
@@ -2410,6 +2472,7 @@ function heFoldTranscript pLogTxt
             put heBetApply(tStateA, "board", 0, 0) into tStateA
             break
 
+         case "bidAnte"
          case "bidSB"
          case "bidBB"
          case "act"
@@ -2515,18 +2578,73 @@ end heFoldTranscript
 -- the engine (only accepted messages are logged), reacts to notes
 --------------------------------------------------------------------------
 
+command heCfgDefaults
+   -- seed the persistent table configuration. Called once at openStack and any
+   -- time gCfg is found empty; the settings panel (heApplyCfg) overwrites keys.
+   put kHeDefaultStack into gCfg["startStack"]
+   put kHeDefaultSB into gCfg["sb"]
+   put kHeDefaultBB into gCfg["bb"]
+   put kHeDefaultAnte into gCfg["ante"]
+   put kHeDefaultSeats into gCfg["numSeats"]
+   put "off" into gCfg["levelMode"]        -- "off" (cash, fixed stakes) | "hands"
+   put kHeDefaultLevels into gCfg["levels"]
+   put kHeDefaultLevelEvery into gCfg["levelEvery"]
+   put "normal" into gCfg["speed"]          -- "fast" | "normal" | "slow"
+end heCfgDefaults
+
+command heCfgEnsure
+   -- lazily fill gCfg so any entry point (a stale paste, a test) has a config
+   if gCfg["numSeats"] is empty then
+      heCfgDefaults
+   end if
+end heCfgEnsure
+
+function heSpeedMult pSpeed
+   -- fast deals in half the time, slow stretches the beats out
+   switch pSpeed
+      case "fast"
+         return 0.5
+      case "slow"
+         return 1.6
+   end switch
+   return 1.0
+end heSpeedMult
+
+command heSpeedPace pSpeed
+   -- scale the NORMAL-speed pacing constants into the live gGame["pace*"] values
+   -- the schedule handlers read. trunc keeps them whole milliseconds.
+   local tM
+   put heSpeedMult(pSpeed) into tM
+   put trunc(kHeNextHandDelayMs * tM) into gGame["paceNextHand"]
+   put trunc(kHeStreetRevealMs * tM) into gGame["paceReveal"]
+   put trunc(kHeRunoutStepMs * tM) into gGame["paceRunout"]
+   put trunc(kHeShowdownHoldMs * tM) into gGame["paceShowdown"]
+   put trunc(kHeFoldHoldMs * tM) into gGame["paceFold"]
+end heSpeedPace
+
 command heTableNew
    local tSeatNum, tErr
+   heCfgEnsure
    put empty into gGame
-   put kHeDefaultSB into gGame["sb"]
-   put kHeDefaultBB into gGame["bb"]
+   put gCfg["sb"] into gGame["sb"]
+   put gCfg["bb"] into gGame["bb"]
+   put gCfg["ante"] into gGame["ante"]
+   put gCfg["numSeats"] into gGame["numSeats"]
+   put gCfg["levelMode"] into gGame["levelMode"]
+   put gCfg["levels"] into gGame["levels"]
+   put gCfg["levelEvery"] into gGame["levelEvery"]
+   put gCfg["speed"] into gGame["speed"]
+   put 0 into gGame["curLevel"]
+   heSpeedPace gCfg["speed"]
    put 0 into gGame["handNum"]
    put 0 into gGame["buttonSeat"]
    put 0 into gGame["lastBB"]
    put "idle" into gGame["phase"]
    put empty into gGame["log"]
-   repeat with tSeatNum = 1 to kHeDefaultSeats
-      put kHeDefaultStack into gGame["stacksBy"][tSeatNum]
+   -- seat 1..numSeats with the opening stack; unseated spots stay absent from
+   -- stacksBy, so heSeatsAlive / the deal / settlement never touch them
+   repeat with tSeatNum = 1 to gGame["numSeats"]
+      put gCfg["startStack"] into gGame["stacksBy"][tSeatNum]
    end repeat
    put heHexId(16) into gGame["tableId"]
    -- a 32-byte crypto table id (hex) is the domain for the Level 0 committed
@@ -2544,24 +2662,68 @@ command heTableNew
    heHudMark
 end heTableNew
 
+command heApplyCfg pStartStack, pSB, pBB, pAnte, pNumSeats, pLevelMode, pSpeed
+   -- the settings panel calls this with validated values, then heTableNew to
+   -- start a fresh table on the new configuration. Kept separate so config
+   -- persists across tables (gCfg) independent of live game state (gGame).
+   heCfgEnsure
+   put pStartStack into gCfg["startStack"]
+   put pSB into gCfg["sb"]
+   put pBB into gCfg["bb"]
+   put pAnte into gCfg["ante"]
+   put pNumSeats into gCfg["numSeats"]
+   put pLevelMode into gCfg["levelMode"]
+   put pSpeed into gCfg["speed"]
+end heApplyCfg
+
 function heCfgBody
+   -- the table cfg logged to the transcript at create time. key=value pairs, so
+   -- new keys (ante, level) are backward-compatible with heFoldTranscript's parse.
    local tSeatsTxt, tStacksTxt, tSeatNum
    put empty into tSeatsTxt
    put empty into tStacksTxt
-   repeat with tSeatNum = 1 to kHeDefaultSeats
+   repeat with tSeatNum = 1 to gGame["numSeats"]
       put tSeatNum & "|" after tSeatsTxt
       put gGame["stacksBy"][tSeatNum] & "|" after tStacksTxt
    end repeat
    delete char -1 of tSeatsTxt
    delete char -1 of tStacksTxt
-   return "sb=" & gGame["sb"] & ",bb=" & gGame["bb"] \
-         & ",seats=" & tSeatsTxt & ",stacks=" & tStacksTxt & ",button=1"
+   return "sb=" & gGame["sb"] & ",bb=" & gGame["bb"] & ",ante=" & gGame["ante"] \
+         & ",seats=" & tSeatsTxt & ",stacks=" & tStacksTxt & ",button=1" \
+         & ",levelMode=" & gGame["levelMode"] & ",speed=" & gGame["speed"]
 end heCfgBody
+
+function heLevelFor pHandNum, pLevelsTxt, pHandsPerLevel
+   -- tournament blind schedule: pLevelsTxt is "sb/bb/ante;sb/bb/ante;...". The
+   -- active level advances every pHandsPerLevel hands (1-based) and clamps at the
+   -- last level. Returns "sb,bb,ante". Pure -- KAT-pinned in betting-kat.py.
+   local tLevels, tCount, tIdx, tEvery, tLevel
+   set the itemDelimiter to ";"
+   put pLevelsTxt into tLevels
+   put the number of items of tLevels into tCount
+   if tCount < 1 then
+      return "1,2,0"
+   end if
+   put pHandsPerLevel into tEvery
+   if tEvery < 1 then
+      put 1 into tEvery
+   end if
+   put trunc((pHandNum - 1) / tEvery) + 1 into tIdx
+   if tIdx > tCount then
+      put tCount into tIdx
+   end if
+   if tIdx < 1 then
+      put 1 into tIdx
+   end if
+   put item tIdx of tLevels into tLevel
+   replace "/" with comma in tLevel
+   return tLevel
+end heLevelFor
 
 function heSeatsAlive
    local tOut, tSeatNum
    put empty into tOut
-   repeat with tSeatNum = 1 to kHeDefaultSeats
+   repeat with tSeatNum = 1 to gGame["numSeats"]
       if gGame["stacksBy"][tSeatNum] > 0 then
          put tSeatNum & comma after tOut
       end if
@@ -2569,6 +2731,39 @@ function heSeatsAlive
    delete char -1 of tOut
    return tOut
 end heSeatsAlive
+
+command heApplyLevel
+   -- set this hand's sb/bb/ante from the tournament schedule when one is active;
+   -- log a "level" line only when the level index changes (curLevel tracks it)
+   local tLvl, tIdx, tEvery, tLevelsTxt, tCount
+   if gGame["levelMode"] is not "hands" then
+      exit heApplyLevel
+   end if
+   put gGame["levels"] into tLevelsTxt   -- copy out before any chunk (H6)
+   set the itemDelimiter to ";"
+   put the number of items of tLevelsTxt into tCount
+   if tCount < 1 then
+      exit heApplyLevel
+   end if
+   put gGame["levelEvery"] into tEvery
+   if tEvery < 1 then
+      put 1 into tEvery
+   end if
+   put trunc((gGame["handNum"] - 1) / tEvery) + 1 into tIdx
+   if tIdx > tCount then
+      put tCount into tIdx
+   end if
+   put heLevelFor(gGame["handNum"], tLevelsTxt, tEvery) into tLvl
+   set the itemDelimiter to comma
+   put item 1 of tLvl into gGame["sb"]
+   put item 2 of tLvl into gGame["bb"]
+   put item 3 of tLvl into gGame["ante"]
+   if tIdx is not gGame["curLevel"] then
+      put tIdx into gGame["curLevel"]
+      heLogAppend "level", "table", "level=" & tIdx & ",sb=" & gGame["sb"] \
+            & ",bb=" & gGame["bb"] & ",ante=" & gGame["ante"]
+   end if
+end heApplyLevel
 
 command heHandStart
    local tOccList, tSeatNum, tDeckList, tDealA, tHolePair, tHoleNames
@@ -2588,6 +2783,11 @@ command heHandStart
       exit heHandStart
    end if
    add 1 to gGame["handNum"]
+   -- tournament option: when a blind schedule is active, THIS hand's sb/bb/ante
+   -- come from the level for the hand number (levels rise as hands are played).
+   -- Logged only when the level actually changes so the transcript stays terse.
+   heApplyLevel
+   set the itemDelimiter to comma   -- heApplyLevel parses with ";" (gotcha 5)
    -- dead-button-aware schedule: the big blind advances to the next live seat
    -- each hand, so eliminations never double- or skip-charge a blind
    put heScheduleButton(tOccList, gGame["lastBB"]) into gGame["buttonSeat"]
@@ -2662,9 +2862,17 @@ command heHandStart
       heLogAppend "holeDeliver", "table", "seat=" & tSeatNum & ",cards=" & tHoleNames
    end repeat
 
-   -- blinds through the engine, then the table is live
-   put heBetNewHand(gGame["sb"], gGame["bb"], gGame["stacksBy"], tOccList, gGame["buttonSeat"]) into gGame["state"]
+   -- antes (if any) then blinds, all through the engine, then the table is live.
+   -- Antes are dead money posted by every seat before the blinds; a bidAnte for
+   -- each seat keeps them in the signed transcript so the fold can re-derive the
+   -- pot (heFoldTranscript handles bidAnte the same as the engine).
+   put heBetNewHand(gGame["sb"], gGame["bb"], gGame["ante"], gGame["stacksBy"], tOccList, gGame["buttonSeat"]) into gGame["state"]
    put gGame["state"]["bbSeat"] into gGame["lastBB"]
+   if gGame["ante"] > 0 then
+      repeat for each item tSeatNum in tOccList
+         heEngineDo "bidAnte", tSeatNum, min(gGame["ante"], gGame["stacksBy"][tSeatNum])
+      end repeat
+   end if
    heEngineDo "bidSB", gGame["state"]["sbSeat"], min(gGame["sb"], gGame["stacksBy"][gGame["state"]["sbSeat"]])
    heEngineDo "bidBB", gGame["state"]["bbSeat"], min(gGame["bb"], gGame["stacksBy"][gGame["state"]["bbSeat"]])
    heUIHandStart
@@ -2682,6 +2890,7 @@ command heEngineDo pMsgType, pSeatNum, pAmount
    end if
    put tStateA into gGame["state"]
    switch pMsgType
+      case "bidAnte"
       case "bidSB"
       case "bidBB"
          heLogAppend pMsgType, "seat" & pSeatNum, "amount=" & pAmount
@@ -2753,8 +2962,17 @@ command heScheduleReveal pStreetName
    put pStreetName into gGame["revealStreet"]
    put "reveal" into gGame["phase"]
    heHudMark
-   send "heRevealStep" to me in kHeStreetRevealMs milliseconds
+   send "heRevealStep" to me in hePaceMs("paceReveal", kHeStreetRevealMs) milliseconds
 end heScheduleReveal
+
+function hePaceMs pKey, pDefaultMs
+   -- the speed-scaled beat for a schedule step, defaulting to the normal-speed
+   -- constant if a hand somehow starts before heSpeedPace ran
+   if gGame[pKey] is a number then
+      return gGame[pKey]
+   end if
+   return pDefaultMs
+end hePaceMs
 
 on heRevealStep
    -- guarded against stale sends (playbook: defer world changes, then gate on
@@ -2800,7 +3018,7 @@ command heScheduleRunout
    -- engine, and reschedules itself until the engine reaches showdown.
    put "runout" into gGame["phase"]
    heHudMark
-   send "heRunoutStep" to me in kHeRunoutStepMs milliseconds
+   send "heRunoutStep" to me in hePaceMs("paceRunout", kHeRunoutStepMs) milliseconds
 end heScheduleRunout
 
 on heRunoutStep
@@ -2831,7 +3049,7 @@ on heRunoutStep
    -- the board message advances the engine street by street (fold-determinism)
    put heBetApply(gGame["state"], "board", 0, 0) into gGame["state"]
    heHudMark
-   send "heRunoutStep" to me in kHeRunoutStepMs milliseconds
+   send "heRunoutStep" to me in hePaceMs("paceRunout", kHeRunoutStepMs) milliseconds
 end heRunoutStep
 
 command heScheduleShowdown
@@ -2847,7 +3065,7 @@ command heScheduleShowdown
    put heBetInHandList(tStateA) into tInHandList
    put tDealA["flopList"] & comma & tDealA["turnIx"] & comma & tDealA["riverIx"] into tBoardIdxList
    put empty into tRanksA
-   put kHeFoldHoldMs into tHoldMs
+   put hePaceMs("paceFold", kHeFoldHoldMs) into tHoldMs
    if heCountItems(tInHandList) > 1 then
       -- a contested showdown: reveal every shown hand and hold long enough to read it
       repeat for each item tSeatNum in tInHandList
@@ -2855,7 +3073,7 @@ command heScheduleShowdown
          put heEval7(tSevenList) into tRanksA[tSeatNum]
       end repeat
       heUIShowdownReveal tInHandList, tRanksA
-      put kHeShowdownHoldMs into tHoldMs
+      put hePaceMs("paceShowdown", kHeShowdownHoldMs) into tHoldMs
    end if
    put tRanksA into gGame["showdownRanks"]
    heHudMark
@@ -2889,7 +3107,7 @@ command heHandSettle
    put "between" into gGame["phase"]
    heUISetStatus "Hand " & gGame["handNum"] & " settled: " & tDeltasTxt
    heHudMark
-   send "heNextHandTick" to me in kHeNextHandDelayMs milliseconds
+   send "heNextHandTick" to me in hePaceMs("paceNextHand", kHeNextHandDelayMs) milliseconds
 end heHandSettle
 
 on heNextHandTick
@@ -3050,9 +3268,13 @@ command heBuildTable
    create button "heBtnHistory"
    set the rect of button "heBtnHistory" to "892,8,980,36"
    set the label of button "heBtnHistory" to "History"
+   create button "heBtnSettings"
+   set the rect of button "heBtnSettings" to "792,8,884,36"
+   set the label of button "heBtnSettings" to "Settings"
 
    heBuildLobby
    heBuildHistory
+   heBuildSettings
    heKitTryInit
    unlock screen
 end heBuildTable
@@ -3122,6 +3344,7 @@ end heBuildLobby
 
 command heLobbyShow
    heHistHide
+   heSettingsHide
    heLobbySetVisible true
    heLobbyRefresh
 end heLobbyShow
@@ -3159,6 +3382,214 @@ function heLobbyVisible
    end if
    return false
 end heLobbyVisible
+
+--------------------------------------------------------------------------
+-- Settings overlay: the host configures the table (opening chips, blinds,
+-- ante, player count, blind schedule, deal speed), then Apply starts a fresh
+-- table on the new config. Built hidden; one unit like the lobby/history.
+-- All verified statically; needs an OXT pass.
+--------------------------------------------------------------------------
+
+command heBuildSettings
+   create graphic "heSetBg"
+   set the style of graphic "heSetBg" to "roundrect"
+   set the roundRadius of graphic "heSetBg" to 16
+   set the rect of graphic "heSetBg" to "192,84,832,556"
+   set the backgroundColor of graphic "heSetBg" to "20,26,24"
+   set the borderColor of graphic "heSetBg" to kHeGoldColor
+   set the borderWidth of graphic "heSetBg" to 2
+   set the opaque of graphic "heSetBg" to true
+
+   heMakeLabel "heSetTitle", "212,94,812,124", \
+         "Table settings -- play the game you want", kHeGoldColor, 16
+   heMakeLabel "heSetHint", "212,126,812,148", \
+         "the host sets these; Apply starts a fresh table on the new config", kHeWhite, 11
+
+   heMakeSettingRow "heSetStack", "Starting chips", 158
+   heMakeSettingRow "heSetSB", "Small blind", 196
+   heMakeSettingRow "heSetBB", "Big blind", 234
+   heMakeSettingRow "heSetAnte", "Ante (0 for none)", 272
+   heMakeSettingRow "heSetSeats", "Players (2-6)", 310
+
+   heMakeLabel "heSetLevelLbl", "232,350,540,378", "Blinds", kHeWhite, 13
+   create button "heBtnSetLevel"
+   set the rect of button "heBtnSetLevel" to "560,348,792,380"
+   set the label of button "heBtnSetLevel" to "Fixed (cash game)"
+
+   heMakeLabel "heSetSpeedLbl", "232,392,540,420", "Deal speed", kHeWhite, 13
+   create button "heBtnSetSpeed"
+   set the rect of button "heBtnSetSpeed" to "560,390,792,422"
+   set the label of button "heBtnSetSpeed" to "Normal"
+
+   heMakeLabel "heSetLevelInfo", "212,428,812,462", \
+         "a rising schedule turns the table into a tournament", kHeGoldColor, 11
+
+   create button "heBtnSetApply"
+   set the rect of button "heBtnSetApply" to "232,502,472,540"
+   set the label of button "heBtnSetApply" to "Apply & New Table"
+   create button "heBtnSetCancel"
+   set the rect of button "heBtnSetCancel" to "592,502,792,540"
+   set the label of button "heBtnSetCancel" to "Cancel"
+
+   heSettingsHide
+end heBuildSettings
+
+command heMakeSettingRow pFieldName, pLabelTxt, pTopY
+   heMakeLabel (pFieldName & "Lbl"), "232," & pTopY & ",540," & (pTopY + 28), pLabelTxt, kHeWhite, 13
+   create field pFieldName
+   set the rect of field pFieldName to "560," & (pTopY - 2) & ",792," & (pTopY + 30)
+   set the textAlign of field pFieldName to "center"
+   set the textSize of field pFieldName to 14
+   set the lockText of field pFieldName to false
+end heMakeSettingRow
+
+command heSettingsShow
+   heLobbyHide
+   heHistHide
+   heSettingsSetVisible true
+   heSettingsRefresh
+end heSettingsShow
+
+command heSettingsHide
+   heSettingsSetVisible false
+end heSettingsHide
+
+command heSettingsSetVisible pOn
+   local tFields, tButtons, tNm
+   set the itemDelimiter to comma
+   if there is a graphic "heSetBg" then
+      set the visible of graphic "heSetBg" to pOn
+   end if
+   put "heSetTitle,heSetHint,heSetLevelInfo,heSetStackLbl,heSetSBLbl,heSetBBLbl," \
+         & "heSetAnteLbl,heSetSeatsLbl,heSetLevelLbl,heSetSpeedLbl," \
+         & "heSetStack,heSetSB,heSetBB,heSetAnte,heSetSeats" into tFields
+   put "heBtnSetLevel,heBtnSetSpeed,heBtnSetApply,heBtnSetCancel" into tButtons
+   repeat for each item tNm in tFields
+      if there is a field tNm then
+         set the visible of field tNm to pOn
+      end if
+   end repeat
+   repeat for each item tNm in tButtons
+      if there is a button tNm then
+         set the visible of button tNm to pOn
+      end if
+   end repeat
+end heSettingsSetVisible
+
+function heSettingsVisible
+   if there is a graphic "heSetBg" then
+      return the visible of graphic "heSetBg"
+   end if
+   return false
+end heSettingsVisible
+
+command heSettingsRefresh
+   -- populate the fields/buttons from the persistent config
+   heCfgEnsure
+   if there is not a field "heSetStack" then
+      exit heSettingsRefresh
+   end if
+   set the text of field "heSetStack" to gCfg["startStack"]
+   set the text of field "heSetSB" to gCfg["sb"]
+   set the text of field "heSetBB" to gCfg["bb"]
+   set the text of field "heSetAnte" to gCfg["ante"]
+   set the text of field "heSetSeats" to gCfg["numSeats"]
+   set the label of button "heBtnSetLevel" to heSettingsLevelLabel(gCfg["levelMode"])
+   set the label of button "heBtnSetSpeed" to heSettingsSpeedLabel(gCfg["speed"])
+end heSettingsRefresh
+
+function heSettingsLevelLabel pMode
+   if pMode is "hands" then
+      return "Rising every " & kHeDefaultLevelEvery & " hands (tournament)"
+   end if
+   return "Fixed (cash game)"
+end heSettingsLevelLabel
+
+function heSettingsSpeedLabel pSpeed
+   switch pSpeed
+      case "fast"
+         return "Fast"
+      case "slow"
+         return "Slow"
+   end switch
+   return "Normal"
+end heSettingsSpeedLabel
+
+command heSettingsCycle pWhich
+   -- advance an enum choice and re-label its button (live on gCfg; number fields
+   -- stage until Apply)
+   heCfgEnsure
+   switch pWhich
+      case "level"
+         if gCfg["levelMode"] is "hands" then
+            put "off" into gCfg["levelMode"]
+         else
+            put "hands" into gCfg["levelMode"]
+         end if
+         set the label of button "heBtnSetLevel" to heSettingsLevelLabel(gCfg["levelMode"])
+         break
+      case "speed"
+         switch gCfg["speed"]
+            case "normal"
+               put "fast" into gCfg["speed"]
+               break
+            case "fast"
+               put "slow" into gCfg["speed"]
+               break
+            default
+               put "normal" into gCfg["speed"]
+         end switch
+         set the label of button "heBtnSetSpeed" to heSettingsSpeedLabel(gCfg["speed"])
+         break
+   end switch
+end heSettingsCycle
+
+command heSettingsApply
+   -- validate the number fields, commit to the config, then start a fresh table
+   local tStack, tSB, tBB, tAnte, tSeats
+   put word 1 of the text of field "heSetStack" into tStack
+   put word 1 of the text of field "heSetSB" into tSB
+   put word 1 of the text of field "heSetBB" into tBB
+   put word 1 of the text of field "heSetAnte" into tAnte
+   put word 1 of the text of field "heSetSeats" into tSeats
+   if not heSettingsNumOk(tStack, 1) or not heSettingsNumOk(tSB, 0) \
+         or not heSettingsNumOk(tBB, 1) or not heSettingsNumOk(tAnte, 0) \
+         or not heSettingsNumOk(tSeats, kHeMinSeats) then
+      heUISetStatus "Settings: every field must be a whole number (chips>=1, seats>=2)."
+      exit heSettingsApply
+   end if
+   -- clamp / normalise: BB is at least the SB, seats within the layout
+   if tBB < tSB then
+      put tSB into tBB
+   end if
+   if tSeats > kHeMaxSeats then
+      put kHeMaxSeats into tSeats
+   end if
+   if tSeats < kHeMinSeats then
+      put kHeMinSeats into tSeats
+   end if
+   if tAnte >= tStack then
+      heUISetStatus "Settings: the ante must be smaller than the starting stack."
+      exit heSettingsApply
+   end if
+   heApplyCfg tStack, tSB, tBB, tAnte, tSeats, gCfg["levelMode"], gCfg["speed"]
+   heSettingsHide
+   heTableNew
+   heUIClearCards
+   heUISetStatus "New table: " & tSeats & " seats, " & tStack & " chips, blinds " \
+         & tSB & "/" & tBB & ".  Press Deal."
+end heSettingsApply
+
+function heSettingsNumOk pVal, pMin
+   -- a whole, non-negative number at least pMin
+   if pVal is not a number then
+      return false
+   end if
+   if pVal is not trunc(pVal) then
+      return false
+   end if
+   return pVal >= pMin
+end heSettingsNumOk
 
 command heLobbyRefresh
    -- repaint identity, table line, roster, and the recent net activity from
@@ -3263,6 +3694,7 @@ end heBuildHistory
 
 command heHistShow
    heLobbyHide
+   heSettingsHide
    heHistSetVisible true
    heHistRefresh
 end heHistShow
@@ -3465,9 +3897,24 @@ on mouseUp
       case "heBtnHistClose"
          heHistHide
          exit mouseUp
+      case "heBtnSettings"
+         heSettingsShow
+         exit mouseUp
+      case "heBtnSetLevel"
+         heSettingsCycle "level"
+         exit mouseUp
+      case "heBtnSetSpeed"
+         heSettingsCycle "speed"
+         exit mouseUp
+      case "heBtnSetApply"
+         heSettingsApply
+         exit mouseUp
+      case "heBtnSetCancel"
+         heSettingsHide
+         exit mouseUp
    end switch
    -- while an overlay is up, the table/action buttons are inert
-   if heLobbyVisible() or heHistVisible() then
+   if heLobbyVisible() or heHistVisible() or heSettingsVisible() then
       exit mouseUp
    end if
    if tWho is "heBtnDeal" then
@@ -3697,6 +4144,12 @@ command heHudRefresh
    end if
 
    repeat with tSeatNum = 1 to kHeDefaultSeats
+      -- tables smaller than the 6-spot layout hide their unused seats entirely
+      if tSeatNum > gGame["numSeats"] then
+         heSeatChromeVisible tSeatNum, false
+         next repeat
+      end if
+      heSeatChromeVisible tSeatNum, true
       put heHandByOf(tSeatNum) into tHandBy
       -- chip TOTAL behind (always visible, even between hands)
       if gGame["stacksBy"][tSeatNum] is a number then
@@ -3741,6 +4194,31 @@ command heHudRefresh
    end if
 end heHudRefresh
 
+command heSeatChromeVisible pSeatNum, pOn
+   -- show or hide a whole seat's persistent chrome, so a table configured for
+   -- fewer than the 6 layout spots does not display ghost seats
+   local tCtl
+   set the itemDelimiter to comma
+   if there is a graphic ("hePanel" & pSeatNum) then
+      set the visible of graphic ("hePanel" & pSeatNum) to pOn
+   end if
+   repeat for each item tCtl in "heSeatName,heSeatStack,heSeatBadge,heSeatState,heSeatBet"
+      if there is a field (tCtl & pSeatNum) then
+         set the visible of field (tCtl & pSeatNum) to pOn
+      end if
+   end repeat
+   if not pOn then
+      -- unseated: also drop the bet chip and any hole cards
+      if there is a graphic ("heSeatChip" & pSeatNum) then
+         set the visible of graphic ("heSeatChip" & pSeatNum) to false
+      end if
+      if there is a field ("heHole" & pSeatNum & "a") then
+         set the visible of field ("heHole" & pSeatNum & "a") to false
+         set the visible of field ("heHole" & pSeatNum & "b") to false
+      end if
+   end if
+end heSeatChromeVisible
+
 command heSeatFace pSeatNum, pActing
    -- panel colour + state label: acting (gold), folded (dim), all-in (gold text)
    local tState, tFolded, tAllin
@@ -3777,6 +4255,12 @@ function heHeaderTxt
       put "     " & toUpper(gGame["state"]["street"]) after tTxt
    end if
    put "     Blinds " & gGame["sb"] & "/" & gGame["bb"] after tTxt
+   if gGame["ante"] > 0 then
+      put "     Ante " & gGame["ante"] after tTxt
+   end if
+   if gGame["levelMode"] is "hands" and gGame["curLevel"] > 0 then
+      put "     Level " & gGame["curLevel"] after tTxt
+   end if
    return tTxt
 end heHeaderTxt
 
@@ -3998,6 +4482,8 @@ command heRunSelftest
          & return & return after gRpt
    heTestEvaluatorRun
    heTestBettingRun
+   heTestAnteRun
+   heTestLevelRun
    heTestLegalRun
    heTestScheduleRun
    heTestShuffleRun
@@ -4613,6 +5099,7 @@ command heTestEvaluatorRun
 end heTestEvaluatorRun
 
 function heTNewHand pSB, pBB, pStacksList, pOccList, pButtonSeat
+   -- ante-free wrapper for the existing betting cases; heTNewHandAnte adds antes
    local tStacksA, tPos, tSeatNum
    set the itemDelimiter to comma
    put 0 into tPos
@@ -4620,8 +5107,19 @@ function heTNewHand pSB, pBB, pStacksList, pOccList, pButtonSeat
       add 1 to tPos
       put item tPos of pStacksList into tStacksA[tSeatNum]
    end repeat
-   return heBetNewHand(pSB, pBB, tStacksA, pOccList, pButtonSeat)
+   return heBetNewHand(pSB, pBB, 0, tStacksA, pOccList, pButtonSeat)
 end heTNewHand
+
+function heTNewHandAnte pSB, pBB, pAnte, pStacksList, pOccList, pButtonSeat
+   local tStacksA, tPos, tSeatNum
+   set the itemDelimiter to comma
+   put 0 into tPos
+   repeat for each item tSeatNum in pOccList
+      add 1 to tPos
+      put item tPos of pStacksList into tStacksA[tSeatNum]
+   end repeat
+   return heBetNewHand(pSB, pBB, pAnte, tStacksA, pOccList, pButtonSeat)
+end heTNewHandAnte
 
 function heTBlinds pStateA
    local tStateA
@@ -4745,6 +5243,74 @@ command heTestBettingRun
    heTAssert "blind: both blinds all-in -> runout", tStateA["phase"], "runout"
 end heTestBettingRun
 
+command heTestAnteRun
+   -- antes are dead money: into the pot (handBy), NEVER the street bet, so a seat
+   -- still owes the full blind. Mirror of betting-kat case_antes / conservation.
+   local tStateA, tDeltasA, tRanksA, tSeatNum
+   put return & "-- 2b. antes (dead money) + chip conservation" & return after gRpt
+   set the itemDelimiter to comma
+
+   put heTNewHandAnte(1, 2, 1, "100,100,100", "1,2,3", 1) into tStateA
+   repeat with tSeatNum = 1 to 3
+      put heBetApply(tStateA, "bidAnte", tSeatNum, 1) into tStateA
+   end repeat
+   heTAssert "ante: dead money in the pot (s1 handBy)", tStateA["handBy"][1], 1
+   heTAssert "ante: not on the street bet (s1 streetBy)", tStateA["streetBy"][1], 0
+   put heTBlinds(tStateA) into tStateA
+   heTAssert "ante: SB total = ante + small blind", tStateA["handBy"][2], 2
+   heTAssert "ante: BB total = ante + big blind", tStateA["handBy"][3], 3
+   put heTAct(tStateA, 1, "fold,0", empty, "ante: utg folds") into tStateA
+   put heTAct(tStateA, 2, "fold,0", empty, "ante: sb folds") into tStateA
+   heTAssert "ante: fold-around ends the hand", tStateA["phase"], "handdone"
+   put empty into tRanksA
+   put heSettleOf(tStateA, tRanksA) into tDeltasA
+   heTAssert "ante: dead money folds into the winner's pot", \
+         heTDeltasTxt(tDeltasA, tStateA["occ"]), "1:-1|2:-2|3:3"
+
+   put heTNewHandAnte(1, 2, 5, "100,100,1", "1,2,3", 1) into tStateA
+   repeat with tSeatNum = 1 to 3
+      put heBetApply(tStateA, "bidAnte", tSeatNum, min(5, tStateA["stackBy"][tSeatNum])) into tStateA
+   end repeat
+   heTAssert "ante: short seat posts what it has", tStateA["handBy"][3], 1
+   heTAssert "ante: short seat all-in for the ante", tStateA["allinBy"][3], "true"
+
+   put heTNewHandAnte(5, 10, 2, "200,200,200", "1,2,3", 1) into tStateA
+   repeat with tSeatNum = 1 to 3
+      put heBetApply(tStateA, "bidAnte", tSeatNum, 2) into tStateA
+   end repeat
+   put heTBlinds(tStateA) into tStateA
+   put heTAct(tStateA, 1, "allin,198", empty, "ante: s1 all-in 198") into tStateA
+   put heTAct(tStateA, 2, "allin,198", empty, "ante: s2 all-in 198") into tStateA
+   put heTAct(tStateA, 3, "allin,198", empty, "ante: s3 all-in 198") into tStateA
+   heTAssert "ante: three-way all-in runs out", tStateA["phase"], "runout"
+   put heBetApply(tStateA, "board", 0, 0) into tStateA
+   put heBetApply(tStateA, "board", 0, 0) into tStateA
+   put heBetApply(tStateA, "board", 0, 0) into tStateA
+   put empty into tRanksA
+   put "011413120900" into tRanksA[1]
+   put "021104140000" into tRanksA[2]
+   put "081400000000" into tRanksA[3]
+   put heSettleOf(tStateA, tRanksA) into tDeltasA
+   heTAssert "ante: winner scoops the 600 pot (each put in its whole 200)", \
+         heTDeltasTxt(tDeltasA, tStateA["occ"]), "1:-200|2:-200|3:400"
+end heTestAnteRun
+
+command heTestLevelRun
+   -- tournament blind schedule: pure level selection by hand number (heLevelFor).
+   -- Mirror of betting-kat case_levels.
+   local tLv
+   put return & "-- 2c. tournament blind levels (heLevelFor)" & return after gRpt
+   put "1/2/0;2/4/0;3/6/0;5/10/0;10/20/0;15/30/0;25/50/0;50/100/10" into tLv
+   heTAssert "level: hand 1 is level 1", heLevelFor(1, tLv, 8), "1,2,0"
+   heTAssert "level: last hand of level 1", heLevelFor(8, tLv, 8), "1,2,0"
+   heTAssert "level: first hand of level 2", heLevelFor(9, tLv, 8), "2,4,0"
+   heTAssert "level: hand 20 is level 3", heLevelFor(20, tLv, 8), "3,6,0"
+   heTAssert "level: hand 25 is level 4", heLevelFor(25, tLv, 8), "5,10,0"
+   heTAssert "level: top level carries an ante", heLevelFor(57, tLv, 8), "50,100,10"
+   heTAssert "level: clamps at the final level", heLevelFor(9999, tLv, 8), "50,100,10"
+   heTAssert "level: every=1 advances each hand", heLevelFor(3, tLv, 1), "3,6,0"
+end heTestLevelRun
+
 function heTLegalAllAccepted pStateA, pSeatNum
    -- replay every line heBetLegal offers through heBetApply (the gate); returns
    -- "ok" iff all are accepted, else the first rejected action. bet/raise offer
@@ -4816,7 +5382,7 @@ function heTButtonSchedule pLiveList, pLastBB
       put 100 into tStacksA[tSeatNum]
    end repeat
    put heScheduleButton(pLiveList, pLastBB) into tBtn
-   put heBetNewHand(1, 2, tStacksA, pLiveList, tBtn) into tStateA
+   put heBetNewHand(1, 2, 0, tStacksA, pLiveList, tBtn) into tStateA
    return tBtn & comma & tStateA["sbSeat"] & comma & tStateA["bbSeat"]
 end heTButtonSchedule
 

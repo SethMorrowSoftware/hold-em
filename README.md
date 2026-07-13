@@ -24,7 +24,15 @@ self-test (`heRunSelftest` in the message box), and SodiumXT/TorrentXT diagnosti
 (`heProbeSodium` / `heProbeTorrent`) — in a single self-building stack with no required
 extensions to be playable hotseat. The table shows per-seat names, chip totals, bets in
 front, dealer/blind badges, and fold/all-in/acting/winner states, with quick-bet
-controls. A hand plays out at **dealing pace** rather than flashing to the result: each
+controls. A **Settings** panel lets the host configure the table — **opening chips, small/
+big blind, ante, player count (2-6), a rising blind schedule** (turning the table into a
+tournament), and **deal speed** (fast/normal/slow) — and Apply starts a fresh table on the
+new config. The betting engine handles antes as dead money (into the pot, never the street
+bet, so a seat still owes the full blind) and side pots layer over them; the blind schedule
+raises the stakes every N hands. All of that is machine-verified: antes and the level
+schedule are pinned in `tools/betting-kat.py`, re-checked on-engine (`heTestAnteRun` /
+`heTestLevelRun`), and fuzzed for chip conservation over thousands of ante hands in
+`tools/logic-fuzz.py`. A hand plays out at **dealing pace** rather than flashing to the result: each
 board street lands a beat after the betting closes, an all-in **runs out one street at a
 time**, and the showdown **holds on the revealed hands** before the pot is settled and the
 next hand deals. The beats are timer-driven (never per-frame) and are four one-line

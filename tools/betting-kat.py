@@ -44,9 +44,9 @@ def check(label, observed, expected):
 # booleans are the strings "true"/"false" like xTalk custom-property law.
 # --------------------------------------------------------------------------
 
-def new_hand(sb, bb, stacks, occ, button):
+def new_hand(sb, bb, stacks, occ, button, ante=0):
     st = {
-        "sb": sb, "bb": bb, "occ": list(occ), "buttonSeat": button,
+        "sb": sb, "bb": bb, "ante": ante, "occ": list(occ), "buttonSeat": button,
         "street": "preflop", "phase": "blinds", "toAct": 0,
         "betCur": 0, "raiseFull": bb, "aggressor": 0, "sdFirst": 0,
         "err": "", "note": "",
@@ -107,6 +107,14 @@ def _pay(st, s, amount):
         st["allinBy"][s] = "true"
 
 
+def _pay_dead(st, s, amount):
+    # antes: pot (handBy) only, never the street bet
+    st["stackBy"][s] -= amount
+    st["handBy"][s] += amount
+    if st["stackBy"][s] == 0:
+        st["allinBy"][s] = "true"
+
+
 def _first_in_hand_after(st, after):
     for s in _rotate_after(st["occ"], after):
         if st["foldedBy"][s] == "false":
@@ -155,6 +163,17 @@ def apply_msg(state, mtype, seat, amount):
     st = copy.deepcopy(state)
     st["err"] = ""
     st["note"] = ""
+
+    if mtype == "bidAnte":
+        if st["phase"] != "blinds":
+            st["err"] = "bidAnte-out-of-phase"
+            return st
+        pay = min(st["ante"], st["stackBy"][seat])
+        if amount != pay:
+            st["err"] = "bidAnte-wrong-amount"
+            return st
+        _pay_dead(st, seat, pay)
+        return st
 
     if mtype == "bidSB":
         if st["phase"] != "blinds":
@@ -556,6 +575,98 @@ def case_blind_schedule():
           (btn, st["sbSeat"], st["bbSeat"]), (6, 1, 4))
 
 
+# --------------------------------------------------------------------------
+# Antes (dead money) + the tournament blind-level schedule. Mirrors of
+# heBetPayDead / the bidAnte case, and heLevelFor. Antes go into the pot but
+# NOT the street bet, so a seat still owes the full blind to call; settlement
+# treats ante money like any other contribution, so side pots and chip
+# conservation just work. Duplicated on-engine in heTestAnteRun/heTestLevelRun.
+# --------------------------------------------------------------------------
+
+def post_antes(st):
+    for s in st["occ"]:
+        st = apply_msg(st, "bidAnte", s, min(st["ante"], st["stackBy"][s]))
+        assert st["err"] == "", st["err"]
+    return st
+
+
+def level_for(hand_num, levels_txt, hands_per_level):
+    levels = levels_txt.split(";")
+    if len(levels) < 1:
+        return "1,2,0"
+    every = hands_per_level if hands_per_level >= 1 else 1
+    idx = (hand_num - 1) // every + 1
+    if idx > len(levels):
+        idx = len(levels)
+    if idx < 1:
+        idx = 1
+    return levels[idx - 1].replace("/", ",")
+
+
+def case_antes():
+    # 3-handed, ante 1 each, blinds 1/2. Antes are dead money: everyone antes,
+    # then the SB still owes the full small blind, the BB the full big blind.
+    st = new_hand(1, 2, {1: 100, 2: 100, 3: 100}, [1, 2, 3], 1, ante=1)
+    st = post_antes(st)
+    check("ante: all three posted dead money (handBy)",
+          [st["handBy"][s] for s in (1, 2, 3)], [1, 1, 1])
+    check("ante: dead money not on the street bet",
+          [st["streetBy"][s] for s in (1, 2, 3)], [0, 0, 0])
+    st = run_blinds(st)
+    check("ante: SB seat total = ante + small blind", st["handBy"][2], 2)
+    check("ante: BB seat total = ante + big blind", st["handBy"][3], 3)
+    check("ante: still owe the full BB to call", st["betCur"] - st["streetBy"][1], 2)
+    # everyone folds to the BB: pot = 3 antes + SB + BB = 6; BB nets +3
+    st = apply_msg(st, "act", 1, "fold,0")
+    st = apply_msg(st, "act", 2, "fold,0")
+    check("ante: fold-around ends the hand", st["phase"], "handdone")
+    deltas = settle(st, {})
+    check("ante: dead money folds into the pot the winner takes",
+          deltas, {1: -1, 2: -2, 3: 3})
+
+
+def case_ante_short_allin():
+    # a seat with fewer chips than the ante posts what it has and is all-in
+    st = new_hand(1, 2, {1: 100, 2: 100, 3: 1}, [1, 2, 3], 1, ante=5)
+    st = post_antes(st)
+    check("ante: short seat posts what it has", st["handBy"][3], 1)
+    check("ante: short seat is all-in for the ante", st["allinBy"][3], "true")
+    check("ante: full-stack seats posted the whole ante", st["handBy"][1], 5)
+
+
+def case_ante_conservation():
+    # antes + an all-in runout must conserve chips exactly (0-sum deltas). Each
+    # seat's ante (2) comes out of its 200 first, so the all-in is for 198, not
+    # 200 -- a common off-by-ante the engine must get right.
+    st = new_hand(5, 10, {1: 200, 2: 200, 3: 200}, [1, 2, 3], 1, ante=2)
+    st = post_antes(st)
+    st = run_blinds(st)
+    st = apply_msg(st, "act", 1, "allin,198")
+    st = apply_msg(st, "act", 2, "allin,198")
+    st = apply_msg(st, "act", 3, "allin,198")
+    check("ante: three-way all-in runs out", st["phase"], "runout")
+    for _ in range(3):
+        st = apply_msg(st, "board", 0, 0)
+    deltas = settle(st, {1: "011413120900", 2: "021104140000", 3: "081400000000"})
+    check("ante: settlement is zero-sum (chip conservation)",
+          sum(deltas.values()), 0)
+    # each seat put in ante(2) + all-in(198) = its whole 200, so the pot is 600
+    check("ante: winner scoops the whole 600 pot (all-in, best hand)",
+          deltas[3], 400)
+
+
+def case_levels():
+    lv = "1/2/0;2/4/0;3/6/0;5/10/0;10/20/0;15/30/0;25/50/0;50/100/10"
+    check("level: hand 1 is level 1", level_for(1, lv, 8), "1,2,0")
+    check("level: last hand of level 1", level_for(8, lv, 8), "1,2,0")
+    check("level: first hand of level 2", level_for(9, lv, 8), "2,4,0")
+    check("level: hand 20 is level 3", level_for(20, lv, 8), "3,6,0")
+    check("level: hand 25 is level 4", level_for(25, lv, 8), "5,10,0")
+    check("level: top level carries an ante", level_for(57, lv, 8), "50,100,10")
+    check("level: clamps at the final level", level_for(9999, lv, 8), "50,100,10")
+    check("level: every=1 advances each hand", level_for(3, lv, 1), "3,6,0")
+
+
 def main():
     case_blind_schedule()
     case_min_raise()
@@ -567,6 +678,10 @@ def main():
     case_split_odd_chip_and_order()
     case_blind_allin_runout()
     case_check_around()
+    case_antes()
+    case_ante_short_allin()
+    case_ante_conservation()
+    case_levels()
     print()
     if FAILS:
         print("FAILED -- %d betting case(s) wrong." % len(FAILS))

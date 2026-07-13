@@ -357,8 +357,12 @@ def _legal_consistent(st):
     return bad
 
 
-def _play_hand(sb, bb, stacks, occ, button, rng, legal_out=None):
-    st = bk.new_hand(sb, bb, stacks, occ, button)
+def _play_hand(sb, bb, stacks, occ, button, rng, legal_out=None, ante=0):
+    st = bk.new_hand(sb, bb, stacks, occ, button, ante=ante)
+    if ante > 0:
+        for s in occ:
+            st = bk.apply_msg(st, "bidAnte", s, min(ante, st["stackBy"][s]))
+            assert st["err"] == "", st["err"]
     st = bk.apply_msg(st, "bidSB", st["sbSeat"], min(sb, st["stackBy"][st["sbSeat"]]))
     assert st["err"] == "", st["err"]
     st = bk.apply_msg(st, "bidBB", st["bbSeat"], min(bb, st["stackBy"][st["bbSeat"]]))
@@ -397,13 +401,17 @@ def check_games(sessions):
         seats = sorted(seed_rng.sample(range(1, 10), n))
         stacks = {s: seed_rng.randint(1, 60) for s in seats}
         total0 = sum(stacks.values())
+        # a third of the sessions run with an ante, so the bidAnte / dead-money
+        # path is fuzzed for chip conservation end to end (antes are pot money)
+        ante = seed_rng.choice([0, 0, 1, 2]) if n >= 2 else 0
         last_bb = 0
         for _h in range(60):
             live = [s for s in seats if stacks[s] > 0]
             if len(live) < 2:
                 break
             btn = bk.schedule_button(live, last_bb)
-            st, d = _play_hand(1, 2, {s: stacks[s] for s in live}, live, btn, act_rng, legal_bad)
+            st, d = _play_hand(1, 2, {s: stacks[s] for s in live}, live, btn, act_rng,
+                               legal_bad, ante=ante)
             if sum(d.values()) != 0:
                 print("  NONCONSERVE hand live=%r btn=%d d=%r" % (live, btn, d))
                 fails += 1
