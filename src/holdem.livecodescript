@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.6.1"
-constant kHeHarnessV = "14"
+constant kHeVersion = "0.6.2"
+constant kHeHarnessV = "15"
 constant kUIVersion = "5"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -3860,6 +3860,7 @@ command heRunSelftest
          & return & return after gRpt
    heTestEvaluatorRun
    heTestBettingRun
+   heTestLegalRun
    heTestScheduleRun
    heTestShuffleRun
    heTestFoldRun
@@ -4500,6 +4501,68 @@ command heTestBettingRun
    put heBetApply(tStateA, "bidBB", 6, 2) into tStateA
    heTAssert "blind: both blinds all-in -> runout", tStateA["phase"], "runout"
 end heTestBettingRun
+
+function heTLegalAllAccepted pStateA, pSeatNum
+   -- replay every line heBetLegal offers through heBetApply (the gate); returns
+   -- "ok" iff all are accepted, else the first rejected action. bet/raise offer
+   -- a MIN and a MAX (words 2 and 3) -- both must be accepted.
+   local tMenu, tLine, tVerb, tRes
+   put heBetLegal(pStateA, pSeatNum) into tMenu
+   repeat for each line tLine in tMenu
+      put word 1 of tLine into tVerb
+      switch tVerb
+         case "fold"
+         case "check"
+            put heBetApply(pStateA, "act", pSeatNum, tVerb & ",0") into tRes
+            break
+         case "call"
+         case "allin"
+            put heBetApply(pStateA, "act", pSeatNum, tVerb & comma & word 2 of tLine) into tRes
+            break
+         case "bet"
+         case "raise"
+            put heBetApply(pStateA, "act", pSeatNum, tVerb & comma & word 2 of tLine) into tRes
+            if tRes["err"] is empty then
+               put heBetApply(pStateA, "act", pSeatNum, tVerb & comma & word 3 of tLine) into tRes
+            end if
+            break
+      end switch
+      if tRes["err"] is not empty then
+         return "rejected:" & tLine & "(" & tRes["err"] & ")"
+      end if
+   end repeat
+   return "ok"
+end heTLegalAllAccepted
+
+command heTestLegalRun
+   -- heBetLegal must offer exactly the actions heBetApply accepts (the gate).
+   -- On-engine mirror of the legal-consistency fuzz in tools/logic-fuzz.py: for
+   -- reachable states, every action heBetLegal offers is replayed through
+   -- heBetApply and must be accepted. A bug here would show a player an illegal
+   -- move or hide a legal one -- a fairness bug.
+   local tStateA, tSeatNum
+   put return & "-- 11. heBetLegal: every offered action is accepted (spec 8.1)" & return after gRpt
+   set the itemDelimiter to comma
+   -- preflop, 3-handed, 100 each, button 1: first-to-act faces the big blind
+   put heTNewHand(1, 2, "100,100,100", "1,2,3", 1) into tStateA
+   put heTBlinds(tStateA) into tStateA
+   put tStateA["toAct"] into tSeatNum
+   heTAssert "legal: preflop first-to-act menu is non-empty", \
+         (heBetLegal(tStateA, tSeatNum) is not empty), "true"
+   heTAssert "legal: every preflop action offered is accepted", \
+         heTLegalAllAccepted(tStateA, tSeatNum), "ok"
+   -- the next seat now faces a raise (re-raise decision)
+   put heTAct(tStateA, tSeatNum, "raise,6", "", "legal: setup a raise to 6") into tStateA
+   put tStateA["toAct"] into tSeatNum
+   heTAssert "legal: every action offered facing a raise is accepted", \
+         heTLegalAllAccepted(tStateA, tSeatNum), "ok"
+   -- a short stack that cannot cover a full raise: menu still all-accepted
+   put heTNewHand(1, 2, "3,100,100", "1,2,3", 1) into tStateA
+   put heTBlinds(tStateA) into tStateA
+   put tStateA["toAct"] into tSeatNum
+   heTAssert "legal: short-stack menu is all accepted", \
+         heTLegalAllAccepted(tStateA, tSeatNum), "ok"
+end heTestLegalRun
 
 function heTButtonSchedule pLiveList, pLastBB
    -- returns "button,SB,BB" the way the shell schedules a hand, via the pure
