@@ -85,6 +85,30 @@ def transcript(tamper=""):
     return L
 
 
+def ante_transcript():
+    # 3-handed, ante 2 each, blinds 1/2. Everyone antes (dead money), then folds
+    # to the BB. Pot = 3 antes (6) + SB (1) + BB (2) = 9; BB keeps its own 2, so
+    # nets +7 over the 5 the other two put in. The fold must re-derive this from
+    # the bidAnte lines alone -- if it ignored antes the settle would mismatch.
+    L = []
+    L.append((0, "table", "cfg",
+              "sb=1,bb=2,ante=2,seats=1|2|3,stacks=400|400|400,button=1,levelMode=off,speed=normal"))
+    L.append((1, "table", "handStart", "seats=1|2|3,button=1"))
+    L.append((1, "table", "holeDeliver", "seat=1,cards=3d|5d"))
+    L.append((1, "table", "holeDeliver", "seat=2,cards=Ac|5h"))
+    L.append((1, "table", "holeDeliver", "seat=3,cards=Kc|Kh"))
+    L.append((1, "seat1", "bidAnte", "amount=2"))
+    L.append((1, "seat2", "bidAnte", "amount=2"))
+    L.append((1, "seat3", "bidAnte", "amount=2"))
+    L.append((1, "seat2", "bidSB", "amount=1"))
+    L.append((1, "seat3", "bidBB", "amount=2"))
+    L.append((1, "seat1", "act", "verb=fold,amount=0"))
+    L.append((1, "seat2", "act", "verb=fold,amount=0"))
+    # pot 9: seat1 -2 (ante), seat2 -3 (ante+SB), seat3 +5 (ante+BB back, +5 net)
+    L.append((1, "table", "settle", "deltas=1:-2|2:-3|3:5"))
+    return L
+
+
 def _kv(body):
     return dict(part.split("=", 1) for part in body.split(","))
 
@@ -93,7 +117,7 @@ def independent_fold(tx):
     """A from-scratch replay: distinct parsing/orchestration from the xTalk's
     heFoldTranscript, driving the cross-checked betting/evaluator mirrors."""
     stacks = {}
-    sb = bb = 0
+    sb = bb = ante = 0
     st = None
     holes = {}
     board = []                       # card indices, in dealt order
@@ -104,13 +128,17 @@ def independent_fold(tx):
         d = _kv(body) if body else {}
         if typ == "cfg":
             sb, bb = int(d["sb"]), int(d["bb"])
+            ante = int(d.get("ante", 0))
             seats = [int(x) for x in d["seats"].split("|")]
             stk = [int(x) for x in d["stacks"].split("|")]
             stacks = {s: stk[i] for i, s in enumerate(seats)}
+        elif typ == "level":
+            sb, bb = int(d["sb"]), int(d["bb"])
+            ante = int(d.get("ante", 0))
         elif typ == "handStart":
             occ = [int(x) for x in d["seats"].split("|")]
             btn = int(d["button"])
-            st = bk.new_hand(sb, bb, {s: stacks[s] for s in occ}, occ, btn)
+            st = bk.new_hand(sb, bb, {s: stacks[s] for s in occ}, occ, btn, ante=ante)
             holes, board = {}, []
         elif typ == "holeDeliver":
             c = d["cards"].split("|")
@@ -119,7 +147,7 @@ def independent_fold(tx):
             for c in d["cards"].split("|"):
                 board.append(ev.card_index(c))
             st = bk.apply_msg(st, "board", 0, 0)
-        elif typ in ("bidSB", "bidBB"):
+        elif typ in ("bidAnte", "bidSB", "bidBB"):
             st = bk.apply_msg(st, typ, int(frm[4:]), int(d["amount"]))
         elif typ == "act":
             st = bk.apply_msg(st, "act", int(frm[4:]), d["verb"] + "," + d["amount"])
@@ -291,6 +319,17 @@ def main():
     bad = independent_fold(transcript("badact"))
     contains("illegal action rejected on replay",
              " ".join(bad["errors"]), "engine-rejected")
+
+    # antes: the fold re-derives the pot from the bidAnte lines and verifies it
+    anteres = independent_fold(ante_transcript())
+    ast = anteres["stacks"]
+    check("ante fold: final stacks 398/397/405",
+          "%d/%d/%d" % (ast[1], ast[2], ast[3]), "398/397/405")
+    check("ante fold: no replay errors (settle re-derived from antes)",
+          anteres["errors"], [])
+    check("ante fold: chips conserved across the hand",
+          ast[1] + ast[2] + ast[3], 1200)
+    contains("ante fold: settlement verified", anteres["history"][0], "settle-verified")
 
     # Level 0 committed-deal audit from the transcript
     v, t, lines = audit_deals_from_log(build_level0_transcript())
