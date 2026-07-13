@@ -86,7 +86,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.7.0"
+constant kHeVersion = "0.8.0"
 constant kHeHarnessV = "17"
 constant kUIVersion = "5"
 
@@ -121,7 +121,15 @@ constant kHeDefaultSeats = 6
 constant kHeDefaultSB = 1
 constant kHeDefaultBB = 2
 constant kHeDefaultStack = 400
-constant kHeNextHandDelayMs = 3500
+-- table pacing (spec 11: physics/timing is cosmetic; these are the "deal feel"
+-- beats so a hand does not flash by or end abruptly). All four are one-line
+-- tunables; a played hand reads them off timers, never per-frame. Verified
+-- statically; the actual feel needs an OXT pass to dial in.
+constant kHeNextHandDelayMs = 2600  -- result shown, then the next hand deals
+constant kHeStreetRevealMs = 750    -- beat after betting closes before a street lands
+constant kHeRunoutStepMs = 1050     -- beat between streets when an all-in runs out
+constant kHeShowdownHoldMs = 2900   -- hold on the revealed showdown before settling
+constant kHeFoldHoldMs = 1400       -- shorter beat on a fold-win (no cards to read)
 
 -- UI geometry (flat mode and kit mode share the layout)
 constant kHeStackRect = "0,0,1024,690"
@@ -2566,7 +2574,11 @@ command heHandStart
    local tOccList, tSeatNum, tDeckList, tDealA, tHolePair, tHoleNames
    local tSeatsTxt, tDealCount, tPos, tTableData, tSeedsA, tCommitsA, tDealErr
    set the itemDelimiter to comma
-   if gGame["phase"] is "hand" then
+   -- only start from a settled table: "idle" (fresh/after clear) or "between"
+   -- (result shown). Any active or animating phase (hand/reveal/runout/
+   -- showdown) means a Deal click or a stale next-hand send must be ignored so
+   -- a paced sequence is never interrupted or a hand double-dealt.
+   if gGame["phase"] is not "idle" and gGame["phase"] is not "between" then
       exit heHandStart
    end if
    put heSeatsAlive() into tOccList
@@ -2689,37 +2701,72 @@ command heActionDo pSeatNum, pVerb, pAmount
    end if
    heEngineDo "act", pSeatNum, pVerb & comma & pAmount
    heHudMark
-   heUIPromptToAct
+   -- only prompt the next actor if the action stayed on the same street; a
+   -- street close / runout / showdown handed off to a paced step that will
+   -- prompt (or settle) on its own timer, and phase is no longer "hand".
+   if gGame["phase"] is "hand" then
+      heUIPromptToAct
+   end if
 end heActionDo
 
 command heReactToNotes
+   -- the engine transition is instant; its VISIBLE consequences are paced so a
+   -- hand plays out like real dealing instead of flashing to the result. Each
+   -- consequence hands off to a timer-driven step and returns; nothing here
+   -- deals a card or settles synchronously. A single act produces at most one
+   -- of these notes (a street close, a runout, or a showdown), so the first
+   -- match wins and we stop.
    local tNoteLine, tNotesTxt
    put gGame["state"]["note"] into tNotesTxt
    repeat for each line tNoteLine in tNotesTxt
       set the itemDelimiter to comma
       switch item 1 of tNoteLine
          case "advance:flop"
-            heDealBoard "flop"
-            break
+            heScheduleReveal "flop"
+            exit repeat
          case "advance:turn"
-            heDealBoard "turn"
-            break
+            heScheduleReveal "turn"
+            exit repeat
          case "advance:river"
-            heDealBoard "river"
-            break
+            heScheduleReveal "river"
+            exit repeat
          case "runout"
-            heRunoutBoards
-            break
+            heScheduleRunout
+            exit repeat
          case "showdown"
-            heHandShowdown
-            break
+            heScheduleShowdown
+            exit repeat
          default
             if tNoteLine begins with "foldwin:" then
-               heHandShowdown
+               heScheduleShowdown
+               exit repeat
             end if
       end switch
    end repeat
 end heReactToNotes
+
+command heScheduleReveal pStreetName
+   -- betting closed and the next street is due: hold a beat with the buttons
+   -- inert (the "reveal" phase is non-actionable), then land the board and
+   -- reopen the action. gGame["state"] already advanced inside heBetApply;
+   -- this only paces the visual reveal.
+   put pStreetName into gGame["revealStreet"]
+   put "reveal" into gGame["phase"]
+   heHudMark
+   send "heRevealStep" to me in kHeStreetRevealMs milliseconds
+end heScheduleReveal
+
+on heRevealStep
+   -- guarded against stale sends (playbook: defer world changes, then gate on
+   -- our own phase lock so a Deal/new-hand cannot let a late reveal double-fire)
+   if gGame["phase"] is not "reveal" then
+      exit heRevealStep
+   end if
+   heDealBoard gGame["revealStreet"]
+   put "hand" into gGame["phase"]
+   heHudMark
+   heUIPromptToAct
+end heRevealStep
 
 command heDealBoard pStreetName
    local tDealA, tCardsTxt, tIdxList, tIdx
@@ -2746,51 +2793,89 @@ command heDealBoard pStreetName
    heHudMark
 end heDealBoard
 
-command heRunoutBoards
-   -- no more betting possible: deal the remaining streets; the board
-   -- messages advance the engine street by street (fold-determinism)
-   local tStateA
-   repeat forever
-      put gGame["state"] into tStateA
-      if tStateA["phase"] is not "runout" then
-         exit repeat
-      end if
-      switch tStateA["street"]
-         case "preflop"
-            heDealBoard "flop"
-            break
-         case "flop"
-            heDealBoard "turn"
-            break
-         case "turn"
-            heDealBoard "river"
-            break
-         default
-            exit repeat
-      end switch
-      put heBetApply(gGame["state"], "board", 0, 0) into gGame["state"]
-      heReactToNotes
-   end repeat
-end heRunoutBoards
+command heScheduleRunout
+   -- no more betting possible (all-in with at most one live better): run the
+   -- remaining streets out ONE AT A TIME on a timer so the board comes like a
+   -- real all-in, not all at once. heRunoutStep deals a street, advances the
+   -- engine, and reschedules itself until the engine reaches showdown.
+   put "runout" into gGame["phase"]
+   heHudMark
+   send "heRunoutStep" to me in kHeRunoutStepMs milliseconds
+end heScheduleRunout
 
-command heHandShowdown
-   -- settle, receipt line, schedule the next hand
-   local tStateA, tRanksA, tSeatNum, tSevenList, tDeltasA, tDeltasTxt
-   local tDealA, tInHandList, tBoardIdxList
+on heRunoutStep
+   local tStateA
+   if gGame["phase"] is not "runout" then
+      exit heRunoutStep
+   end if
+   put gGame["state"] into tStateA
+   if tStateA["phase"] is not "runout" then
+      -- engine has dealt the last street: hold, then settle
+      heScheduleShowdown
+      exit heRunoutStep
+   end if
+   switch tStateA["street"]
+      case "preflop"
+         heDealBoard "flop"
+         break
+      case "flop"
+         heDealBoard "turn"
+         break
+      case "turn"
+         heDealBoard "river"
+         break
+      default
+         heScheduleShowdown
+         exit heRunoutStep
+   end switch
+   -- the board message advances the engine street by street (fold-determinism)
+   put heBetApply(gGame["state"], "board", 0, 0) into gGame["state"]
+   heHudMark
+   send "heRunoutStep" to me in kHeRunoutStepMs milliseconds
+end heRunoutStep
+
+command heScheduleShowdown
+   -- reveal the contested hands (or just hold on a fold-win), then settle after
+   -- a beat so the result registers instead of the hand ending abruptly. The
+   -- ranks needed by the settlement are stashed for heHandSettle.
+   local tStateA, tRanksA, tSeatNum, tSevenList
+   local tDealA, tInHandList, tBoardIdxList, tHoldMs
    set the itemDelimiter to comma
+   put "showdown" into gGame["phase"]
    put gGame["state"] into tStateA
    put gGame["deal"] into tDealA
    put heBetInHandList(tStateA) into tInHandList
-
    put tDealA["flopList"] & comma & tDealA["turnIx"] & comma & tDealA["riverIx"] into tBoardIdxList
    put empty into tRanksA
+   put kHeFoldHoldMs into tHoldMs
    if heCountItems(tInHandList) > 1 then
+      -- a contested showdown: reveal every shown hand and hold long enough to read it
       repeat for each item tSeatNum in tInHandList
          put tDealA["holesBy"][tSeatNum] & comma & tBoardIdxList into tSevenList
          put heEval7(tSevenList) into tRanksA[tSeatNum]
       end repeat
       heUIShowdownReveal tInHandList, tRanksA
+      put kHeShowdownHoldMs into tHoldMs
    end if
+   put tRanksA into gGame["showdownRanks"]
+   heHudMark
+   send "heSettleStep" to me in tHoldMs milliseconds
+end heScheduleShowdown
+
+on heSettleStep
+   -- guarded against stale sends: only the showdown we set up may settle
+   if gGame["phase"] is not "showdown" then
+      exit heSettleStep
+   end if
+   heHandSettle
+end heSettleStep
+
+command heHandSettle
+   -- settle from the stashed showdown ranks, log the deltas, schedule next hand
+   local tStateA, tRanksA, tSeatNum, tDeltasA, tDeltasTxt
+   set the itemDelimiter to comma
+   put gGame["state"] into tStateA
+   put gGame["showdownRanks"] into tRanksA
    put heSettleOf(tStateA, tRanksA) into tDeltasA
 
    put empty into tDeltasTxt
@@ -2805,7 +2890,7 @@ command heHandShowdown
    heUISetStatus "Hand " & gGame["handNum"] & " settled: " & tDeltasTxt
    heHudMark
    send "heNextHandTick" to me in kHeNextHandDelayMs milliseconds
-end heHandShowdown
+end heHandSettle
 
 on heNextHandTick
    -- guarded against stale sends (playbook: defer world changes, then gate)
@@ -3595,7 +3680,9 @@ command heHudRefresh
    set the text of field "hePot" to "POT  " & tPotAmt
    set the visible of graphic "hePotChip" to (tPotAmt > 0)
    set the text of field "heHeader" to heHeaderTxt()
-   heEnableBtn "heBtnDeal", (gGame["phase"] is not "hand")
+   -- Deal is offered only from a settled table; during reveal/runout/showdown
+   -- beats it stays inert so a click cannot cut a paced sequence short
+   heEnableBtn "heBtnDeal", (gGame["phase"] is "idle" or gGame["phase"] is "between")
    if gGame["phase"] is not "hand" then
       heDisableActions
    end if
