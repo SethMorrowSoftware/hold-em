@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.6.3"
-constant kHeHarnessV = "16"
+constant kHeVersion = "0.7.0"
+constant kHeHarnessV = "17"
 constant kUIVersion = "5"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -109,6 +109,10 @@ constant kHeDomainShuf = "HOLDEM-SHUF-v1|"
 constant kHeDomainChain = "HOLDEM-CHAIN-v1|"
 constant kHeDomainSettle = "HOLDEM-SETL-v1|"
 constant kHeDomainSess = "HOLDEM-SESS-v1|"
+-- host-trust hardening (spec 6 checkpoints, 8.3 settlement receipts)
+constant kHeDomainCkpt = "HOLDEM-CKPT-v1|"
+constant kHeDomainRcpt = "HOLDEM-RCPT-v1|"
+constant kHeDomainRsig = "HOLDEM-RSIG-v1|"
 constant kHeGenesisPrev = "0000000000000000000000000000000000000000000000000000000000000000"
 constant kHeTwo32 = 4294967296
 
@@ -452,6 +456,46 @@ function heSettleHashHex pDeltasCSV, pChainHeadData
    -- H("HOLDEM-SETL-v1|" || deltas || "|" || chainHead); chainHead is Data
    return heBin2HexS(heHash32(textEncode(kHeDomainSettle & pDeltasCSV & "|", "utf-8") & pChainHeadData))
 end heSettleHashHex
+
+-- Host-trust hardening (spec 6 checkpoints, spec 8.3 settlement receipts),
+-- KAT-pinned in tools/protocol-kat.py. A ckpt is a player's signature over the
+-- chain head at a street boundary: if two players' ckpts sign DIFFERENT heads,
+-- the host forked -- attributable equivocation. A settlement receipt is every
+-- seated player's signature over a receipt head that hash-chains hand to hand,
+-- so the ledger is multi-signed and no subset can rewrite it. All hex text; the
+-- signature payloads are ASCII, so no FFI-bridged binary reaches the chunk
+-- evaluator (H6). Sig verification never throws (heVerifyDetached returns false).
+
+function heCkptSigHex pChainHeadHex, pSecData
+   -- a player signs "HOLDEM-CKPT-v1|<chainHead>" to checkpoint the transcript
+   return heBin2HexS(heSignDetachedD(textEncode(kHeDomainCkpt & pChainHeadHex, "utf-8"), pSecData))
+end heCkptSigHex
+
+function heCkptVerify pSigHex, pChainHeadHex, pPubHex
+   if not heIsHex(pSigHex, 128) or not heIsHex(pPubHex, 64) then
+      return false
+   end if
+   return heVerifyDetached(heHex2BinD(pSigHex), textEncode(kHeDomainCkpt & pChainHeadHex, "utf-8"), heHex2BinD(pPubHex))
+end heCkptVerify
+
+function heReceiptHeadHex pSettleHashHex, pPrevRcptHex
+   -- H("HOLDEM-RCPT-v1|" || settleHash || "|" || prevReceipt) -- receipts chain
+   -- hand to hand; the genesis predecessor is kHeGenesisPrev (64 zeros)
+   return heHashDomHex(kHeDomainRcpt, textEncode(pSettleHashHex & "|" & pPrevRcptHex, "utf-8"))
+end heReceiptHeadHex
+
+function heReceiptSigHex pRcptHeadHex, pSecData
+   -- a seated player signs "HOLDEM-RSIG-v1|<receiptHead>"; the collected
+   -- signatures over one receipt head form the settlement receipt (spec 8.3)
+   return heBin2HexS(heSignDetachedD(textEncode(kHeDomainRsig & pRcptHeadHex, "utf-8"), pSecData))
+end heReceiptSigHex
+
+function heReceiptSigVerify pSigHex, pRcptHeadHex, pPubHex
+   if not heIsHex(pSigHex, 128) or not heIsHex(pPubHex, 64) then
+      return false
+   end if
+   return heVerifyDetached(heHex2BinD(pSigHex), textEncode(kHeDomainRsig & pRcptHeadHex, "utf-8"), heHex2BinD(pPubHex))
+end heReceiptSigVerify
 
 function heEnvWireParse pWireLine
    -- split a wire line into its fields and rebuild the two signed spans
@@ -3850,6 +3894,13 @@ constant kKatIdPub2 = "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e
 constant kKatLobbyCfgBody = "v=1,level=0,sb=1,bb=2,seats=6,button=1"
 constant kKatRosterBody = "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10:player,b6ef1a19d789c27bea3f6c127db635929541f34907750ee12d0b715c010c7566:host"
 constant kKatLobbyHead2 = "54c4df80d160eaaef52536a8ff6f2a7e09caccc629e1c467fe382eedc8a23509"
+constant kKatCkptSig = "08c7f29409998d642657b9a084802b7ca3a136d696e881b545ed4e5a750fdb6d14e4967f401977aca416f03c0d4f03f98b3acc53e61266f3d8cee9912639e20f"
+constant kKatSettleHash2 = "5e716ce9022f4c47d99e081b52be3a8bb5f9f1f56d3def18577c2f7ac9de8df5"
+constant kKatRcptHead1 = "53ed9ccc64863dc05c1b76cd7953e19bba73895b8dd22ea00e6c9ff40f423cef"
+constant kKatRcptHead2 = "0284af24c750eaaaa5a521b87d8f1ab6ce00b0b2be074ce03d24884e004fc910"
+constant kKatRcptSig1 = "222929a8ce05e0d45cab6658d9e67d882d6cfa1f91c35cda8e07a58763c4b1fb6c733e23d116f04ed91960c0ad386541139fed43e1632df341175021d70b1700"
+constant kKatRcptSig2 = "20a21d334da7d32b00bf3a17920350ebaad0773121fc3f2d9feba041360d9548fb527c555cab8039985439bed3af73d17656b939942a6bc3a793630275070706"
+constant kKatRcptSig3 = "429a37ee32d74fd2d09b1b3a86fccc383c7e773ef52670ed07e4ede7e2e10f9ab4b791d630d0b44bdb6c405ed5238cc0bbab9d40129d3673c2c39f1d5d1a9c09"
 
 command heRunSelftest
    put empty into gRpt
@@ -3865,6 +3916,7 @@ command heRunSelftest
    heTestShuffleRun
    heTestFoldRun
    heTestCryptoRun
+   heTestReceiptRun
    heTestDealRun
    heTestDealOrderRun
    heTestLobbyRun
@@ -4305,6 +4357,58 @@ command heTestCryptoRun
    heTAssert "admit: role is recoverable", \
          heAdmitTokenRole(heAdmitTokenData(kKatTableHex, kKatIdPub1, tSec, "host")), "host"
 end heTestCryptoRun
+
+command heTestReceiptRun
+   -- on-engine mirror of the host-trust hardening (spec 6 checkpoints + 8.3
+   -- settlement receipts), pinned in tools/protocol-kat.py. Three players are
+   -- simulated with the KAT identities, so the MULTI-PARTY signed ledger is
+   -- verified on one machine. SKIPs without SodiumXT.
+   local tPub1, tSec1, tPub2, tSec2, tPub3, tSec3, tSh2, tRh1, tRh2, tSig1, tSig2, tSig3
+   put return & "-- 13. Host trust: checkpoints + multi-signed settlement receipts" & return after gRpt
+   if not heHasSodium() then
+      heTSkip "receipts: ckpt + settlement receipts", "SodiumXT not installed"
+      exit heTestReceiptRun
+   end if
+   set the itemDelimiter to comma
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tPub1, tSec1
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed2), tPub2, tSec2
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed3), tPub3, tSec3
+
+   -- ckpt: a player signs the transcript head; a fork or a wrong signer fails
+   heTAssert "ckpt: player signs the chain head", heCkptSigHex(kKatChainHead6, tSec2), kKatCkptSig
+   heTAssert "ckpt: verify accepts the signer", \
+         heCkptVerify(kKatCkptSig, kKatChainHead6, heBin2HexS(tPub2)), "true"
+   heTAssert "ckpt: verify rejects a different signer", \
+         heCkptVerify(kKatCkptSig, kKatChainHead6, heBin2HexS(tPub1)), "false"
+   heTAssert "ckpt: verify rejects a forked (different) head", \
+         heCkptVerify(kKatCkptSig, kKatRcptHead1, heBin2HexS(tPub2)), "false"
+
+   -- settlement receipt chain: hand 1 then hand 2, each receipt chained to the last
+   put heSettleHashHex("1:2,2:-1,3:-1", heHex2BinD(kHeGenesisPrev)) into tSh2
+   heTAssert "receipt: hand-2 settlement digest", tSh2, kKatSettleHash2
+   put heReceiptHeadHex(kKatSettleHash, kHeGenesisPrev) into tRh1
+   heTAssert "receipt: hand-1 receipt head (from genesis)", tRh1, kKatRcptHead1
+   put heReceiptHeadHex(tSh2, tRh1) into tRh2
+   heTAssert "receipt: hand-2 receipt head (chained to hand 1)", tRh2, kKatRcptHead2
+
+   -- all three seated players sign the hand-2 receipt head
+   put heReceiptSigHex(tRh2, tSec1) into tSig1
+   put heReceiptSigHex(tRh2, tSec2) into tSig2
+   put heReceiptSigHex(tRh2, tSec3) into tSig3
+   heTAssert "receipt: player 1 signature", tSig1, kKatRcptSig1
+   heTAssert "receipt: player 2 signature", tSig2, kKatRcptSig2
+   heTAssert "receipt: player 3 signature", tSig3, kKatRcptSig3
+   heTAssert "receipt: all three signatures verify (ledger multi-signed)", \
+         heReceiptSigVerify(tSig1, tRh2, heBin2HexS(tPub1)) and \
+         heReceiptSigVerify(tSig2, tRh2, heBin2HexS(tPub2)) and \
+         heReceiptSigVerify(tSig3, tRh2, heBin2HexS(tPub3)), "true"
+   -- a signature over the WRONG (rolled-back) head is rejected
+   heTAssert "receipt: a signature over a rolled-back head is rejected", \
+         heReceiptSigVerify(tSig1, tRh1, heBin2HexS(tPub1)), "false"
+   -- a forged co-signer (player 3's sig checked against player 1's key) is rejected
+   heTAssert "receipt: a forged co-signer is rejected", \
+         heReceiptSigVerify(tSig3, tRh2, heBin2HexS(tPub1)), "false"
+end heTestReceiptRun
 
 function heTIdxOf pNamesTxt
    local tOut, tNameTxt, tNames
