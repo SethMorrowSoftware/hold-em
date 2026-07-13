@@ -309,7 +309,55 @@ def _legal_actions(st):
     return acts
 
 
-def _play_hand(sb, bb, stacks, occ, button, rng):
+def _legal_consistent(st):
+    """Every action heBetLegal (bk.bet_legal) OFFERS must be accepted by apply_msg
+    (the gate), and every action apply_msg ACCEPTS must be represented in the
+    menu. A disagreement means the UI would offer an illegal move or hide a legal
+    one -- a fairness bug. Returns a list of violation strings."""
+    seat = st["toAct"]
+    if st["phase"] != "acting":
+        return []
+    menu = bk.bet_legal(st, seat)
+    verbs = set(m.split()[0] for m in menu)
+    bad = []
+
+    def accepts(action):
+        return bk.apply_msg(st, "act", seat, action)["err"] == ""
+
+    # 1) offered => accepted (bet/raise checked at min, max, and a midpoint)
+    for a in menu:
+        p = a.split()
+        if p[0] in ("fold", "check"):
+            if not accepts(p[0] + ",0"):
+                bad.append("offered-rejected:" + a)
+        elif p[0] in ("call", "allin"):
+            if not accepts("%s,%s" % (p[0], p[1])):
+                bad.append("offered-rejected:" + a)
+        else:                                   # bet / raise MIN MAX
+            lo, hi = int(p[1]), int(p[2])
+            for t in {lo, hi, (lo + hi) // 2}:
+                if not accepts("%s,%d" % (p[0], t)):
+                    bad.append("offered-range-rejected:%s,%d" % (p[0], t))
+
+    # 2) accepted => offered (per verb)
+    stack = st["stackBy"][seat]
+    owe = st["betCur"] - st["streetBy"][seat]
+    max_to = st["streetBy"][seat] + stack
+    for v in ("fold", "check"):
+        if accepts(v + ",0") and v not in verbs:
+            bad.append("accepted-not-offered:" + v)
+    if owe > 0 and accepts("call,%d" % min(owe, stack)) and "call" not in verbs:
+        bad.append("accepted-not-offered:call")
+    if any(accepts("bet,%d" % t) for t in range(1, max_to + 1)) and "bet" not in verbs:
+        bad.append("accepted-not-offered:bet")
+    if any(accepts("raise,%d" % t) for t in range(st["betCur"] + 1, max_to + 1)) and "raise" not in verbs:
+        bad.append("accepted-not-offered:raise")
+    if accepts("allin,%d" % max_to) and "allin" not in verbs:
+        bad.append("accepted-not-offered:allin")
+    return bad
+
+
+def _play_hand(sb, bb, stacks, occ, button, rng, legal_out=None):
     st = bk.new_hand(sb, bb, stacks, occ, button)
     st = bk.apply_msg(st, "bidSB", st["sbSeat"], min(sb, st["stackBy"][st["sbSeat"]]))
     assert st["err"] == "", st["err"]
@@ -321,6 +369,8 @@ def _play_hand(sb, bb, stacks, occ, button, rng):
         assert guard < 500, "hand did not terminate"
         ph = st["phase"]
         if ph == "acting":
+            if legal_out is not None:
+                legal_out.extend(_legal_consistent(st))
             acts = _legal_actions(st)
             assert acts, "no legal action for seat %d" % st["toAct"]
             st = bk.apply_msg(st, "act", st["toAct"], rng.choice(acts))
@@ -341,6 +391,7 @@ def check_games(sessions):
     act_rng = random.Random(999)
     fails = 0
     hands = 0
+    legal_bad = []
     for _ in range(sessions):
         n = seed_rng.randint(2, 6)
         seats = sorted(seed_rng.sample(range(1, 10), n))
@@ -352,7 +403,7 @@ def check_games(sessions):
             if len(live) < 2:
                 break
             btn = bk.schedule_button(live, last_bb)
-            st, d = _play_hand(1, 2, {s: stacks[s] for s in live}, live, btn, act_rng)
+            st, d = _play_hand(1, 2, {s: stacks[s] for s in live}, live, btn, act_rng, legal_bad)
             if sum(d.values()) != 0:
                 print("  NONCONSERVE hand live=%r btn=%d d=%r" % (live, btn, d))
                 fails += 1
@@ -368,7 +419,12 @@ def check_games(sessions):
                 break
             last_bb = st["bbSeat"]
             hands += 1
-    print("  games: %d sessions, %d hands, failures %d" % (sessions, hands, fails))
+    if legal_bad:
+        fails += len(legal_bad)
+        for v in legal_bad[:6]:
+            print("  LEGAL-INCONSISTENT %s" % v)
+    print("  games: %d sessions, %d hands, failures %d (heBetLegal disagreements %d)"
+          % (sessions, hands, fails, len(legal_bad)))
     return fails == 0
 
 

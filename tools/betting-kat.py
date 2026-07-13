@@ -332,6 +332,32 @@ def settle(st, ranks):
     return deltas
 
 
+def bet_legal(st, seat):
+    """Mirror of heBetLegal: the legal-action menu for `seat`, one entry each of
+    "fold" / "check" / "call N" / "bet MIN MAX" / "raise MINTO MAXTO" /
+    "allin N". Empty unless it is `seat`'s turn to act. logic-fuzz.py checks that
+    what this offers is EXACTLY what apply_msg (the gate) accepts."""
+    out = []
+    if st["phase"] != "acting" or st["toAct"] != seat:
+        return out
+    owe = st["betCur"] - st["streetBy"][seat]
+    out.append("fold")
+    if owe <= 0:
+        out.append("check")
+    else:
+        out.append("call %d" % min(owe, st["stackBy"][seat]))
+    max_to = st["streetBy"][seat] + st["stackBy"][seat]
+    if st["actedBy"][seat] == "false" and max_to > st["betCur"]:
+        min_to = min(st["betCur"] + st["raiseFull"], max_to)
+        if st["betCur"] == 0:
+            out.append("bet %d %d" % (min_to, max_to))
+        else:
+            out.append("raise %d %d" % (min_to, max_to))
+    if st["actedBy"][seat] == "false" or max_to <= st["betCur"]:
+        out.append("allin %d" % max_to)
+    return out
+
+
 # --------------------------------------------------------------------------
 # The pinned scenarios (each one is duplicated on-engine in the harness)
 # --------------------------------------------------------------------------
