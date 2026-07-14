@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.6"
-constant kHeHarnessV = "25"
+constant kHeVersion = "0.11.0"
+constant kHeHarnessV = "26"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -125,6 +125,10 @@ constant kHeDefaultSB = 1
 constant kHeDefaultBB = 2
 constant kHeDefaultAnte = 0
 constant kHeDefaultStack = 400
+-- how many out-of-order future wires the online client will hold while it waits
+-- for the gap before them to fill (rp1 is lossy and reorders/duplicates). A wire
+-- further than this ahead of what we have applied is left to the full-log replay.
+constant kHeWireBufMax = 64
 -- blind-level schedule (tournament option). One level = "sb/bb/ante"; levels are
 -- ";"-separated. A literal single-line string (gotcha 6: constants must be
 -- literal, so no & lf building). The level advances every kHeDefaultLevelEvery
@@ -1186,6 +1190,9 @@ command heTableCreate
    put 0 into gGame["handNum"]
    put 0 into gGame["seqCounter"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
@@ -1228,6 +1235,9 @@ command heTableJoin pCodeTxt
    put empty into gGame["hostPubHex"]
    put 0 into gGame["handNum"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
@@ -1384,39 +1394,105 @@ command heHostRelay pPeer, pContentAndSig
 end heHostRelay
 
 command heNetIngestWire pWire
-   -- everyone's inbound path: verify-or-drop against the host key and local
-   -- chain head, then advance the chain and fold the message (spec 6/8).
-   local tVerdict, tA, tTypeTxt, tSeqTxt
-   put heEnvVerify(pWire, empty, gGame["hostPubHex"], gGame["chainHeadHex"]) into tVerdict
+   -- everyone's inbound path. rp1 is lossy AND redelivers/reorders wires, so a
+   -- verified wire is classified by its host-signed seq against the last we
+   -- applied (gGame["lastSeq"]), NOT by a bare prev==head test:
+   --   seq <= lastSeq         : already applied -> drop SILENTLY. This is the fix
+   --                            for the networked chain-break storm -- the host
+   --                            re-broadcasts and rp1 redelivers constantly, and
+   --                            treating every duplicate as a "chain gap" made the
+   --                            client resync-loop forever and the game never start.
+   --   seq  = lastSeq + 1      : the expected next wire -> chain-check + apply,
+   --                            then drain any buffered wires now in order.
+   --   seq  > lastSeq + 1      : a real gap -> buffer it and ask the host to replay.
+   -- Signatures/shape are verified first (never the chain position -- that is what
+   -- the seq classification decides), so a duplicate/reordered wire is judged by
+   -- seq, not mistaken for a signature failure. Verify-or-drop never raises (H4).
+   local tVerdict, tA, tSeq
+   put heEnvVerify(pWire, empty, gGame["hostPubHex"], empty) into tVerdict
    if tVerdict is not "ok" then
-      -- drop and log; a bad/replayed/reordered message is not an exception
       put tVerdict && char 1 to 24 of pWire & return after gGame["netLog"]
-      -- a chain break means we missed a wire (rp1 is lossy/reorders): ask the
-      -- host to replay the transcript so we catch up, instead of wedging here
-      -- forever (spec 9). Debounced in heNetRequestSync. Other drops are real
-      -- rejections and must NOT trigger a resync.
-      if tVerdict is "drop:chain-break" then
-         heNetRequestSync
-      end if
       heLobbyRefresh
       exit heNetIngestWire
    end if
-   put heChainNextHex(pWire) into gGame["chainHeadHex"]
    put heEnvWireParse(pWire) into tA
-   put pWire & return after gGame["log"]
-   put tA["type"] into tTypeTxt
-   put tA["seq"] into tSeqTxt
-   put "ok     " & tTypeTxt & " seq " & tSeqTxt & return after gGame["netLog"]
-   -- lobby presence bodies drive the roster/cfg display; gameplay wires drive
-   -- the betting engine (the deal increment). tA fields are plain locals now,
-   -- so heEnvBodyText chunks only plain text (H6-safe).
-   if tTypeTxt is "roster" then
-      put heEnvBodyText(tA["bodyHex"]) into gGame["rosterBody"]
-   else if tTypeTxt is "cfg" then
-      put heEnvBodyText(tA["bodyHex"]) into gGame["cfgBody"]
+   put tA["seq"] into tSeq
+   if tSeq is not a number then
+      exit heNetIngestWire
    end if
+   if tSeq <= gGame["lastSeq"] then
+      exit heNetIngestWire   -- duplicate / already applied: drop, no resync loop
+   end if
+   if tSeq > gGame["lastSeq"] + 1 then
+      heNetBufferWire tSeq, pWire
+      put "gap    seq " & tSeq & " held (need " & (gGame["lastSeq"] + 1) & ")" & return after gGame["netLog"]
+      heNetRequestSync
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   -- tSeq is exactly lastSeq+1: it must chain onto our head, or the host's stream
+   -- is inconsistent (shouldn't happen) -- ask for a replay rather than wedge.
+   if tA["prev"] is not gGame["chainHeadHex"] then
+      put "drop:chain-break" && char 1 to 24 of pWire & return after gGame["netLog"]
+      heNetRequestSync
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   heNetApplyWire pWire, tA
+   heNetDrainBuffer
    heLobbyRefresh
 end heNetIngestWire
+
+command heNetApplyWire pWire, pA
+   -- apply one verified, in-order wire: advance the chain head, record the seq,
+   -- append to the transcript, and fold presence bodies into the display. pA is
+   -- a parsed wire (heEnvWireParse); its fields are plain locals so heEnvBodyText
+   -- chunks only plain text (H6-safe).
+   put heChainNextHex(pWire) into gGame["chainHeadHex"]
+   put pA["seq"] into gGame["lastSeq"]
+   put pWire & return after gGame["log"]
+   put "ok     " & pA["type"] & " seq " & pA["seq"] & return after gGame["netLog"]
+   if pA["type"] is "roster" then
+      put heEnvBodyText(pA["bodyHex"]) into gGame["rosterBody"]
+   else if pA["type"] is "cfg" then
+      put heEnvBodyText(pA["bodyHex"]) into gGame["cfgBody"]
+   end if
+end heNetApplyWire
+
+command heNetBufferWire pSeq, pWire
+   -- hold an out-of-order future wire until the gap before it fills. Bounded: a
+   -- wire more than kHeWireBufMax ahead of what we have applied is left to the
+   -- full-log replay, so a flood of far-future seqs cannot grow the buffer.
+   if pSeq <= gGame["lastSeq"] + kHeWireBufMax and gGame["wireBuf"][pSeq] is empty then
+      put pWire into gGame["wireBuf"][pSeq]
+      add 1 to gGame["wireBufN"]
+   end if
+end heNetBufferWire
+
+command heNetDrainBuffer
+   -- after applying a wire, apply any buffered wires that are now consecutive.
+   -- Each is emptied as it is applied; when none remain (wireBufN back to 0) the
+   -- whole buffer is reset so emptied keys never accumulate across a long game.
+   local tNext, tWire, tA
+   repeat forever
+      put gGame["lastSeq"] + 1 into tNext
+      if gGame["wireBuf"][tNext] is empty then
+         exit repeat
+      end if
+      put gGame["wireBuf"][tNext] into tWire
+      put empty into gGame["wireBuf"][tNext]
+      subtract 1 from gGame["wireBufN"]
+      put heEnvWireParse(tWire) into tA
+      if tA["prev"] is not gGame["chainHeadHex"] then
+         exit repeat   -- a buffered wire that no longer chains: leave it for replay
+      end if
+      heNetApplyWire tWire, tA
+   end repeat
+   if gGame["wireBufN"] <= 0 then
+      put empty into gGame["wireBuf"]
+      put 0 into gGame["wireBufN"]
+   end if
+end heNetDrainBuffer
 
 command heNetSendAction pTypeTxt, pBodyTxt
    -- a player emits a signed content line to the host (or, if we are the host,
@@ -4996,6 +5072,9 @@ command heTestNetSim
    put kKatTableHex into gGame["tableIdHex"]
    put 0 into gGame["handNum"]
    put 0 into gGame["seqCounter"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put 0 into gGame["syncCooldown"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
    put "true" into gGame["admittedA"][tHostPubHex]
@@ -5047,20 +5126,37 @@ command heTestNetSim
    put kKatTableHex into gGame["tableIdHex"]
    put 0 into gGame["syncCooldown"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
 
-   -- player ingests the host cfg wire -> chain advances, cfg body stashed
+   -- player ingests the host cfg wire (seq 1) -> chain advances, cfg body stashed
    heNetIngestWire tCfgWire
    heTAssert "netsim: player accepts host cfg + advances chain to head1", gGame["chainHeadHex"], tHead1
    heTAssert "netsim: player stashed the cfg body", gGame["cfgBody"], kKatLobbyCfgBody
+   heTAssert "netsim: player lastSeq is 1 after cfg", gGame["lastSeq"], 1
 
-   -- GAP: player misses wire 2, receives wire 3 -> chain break, head unchanged
+   -- REORDER: the player receives wire 3 (seq 3) BEFORE wire 2 -- rp1 reorders.
+   -- It must be HELD (buffered), not dropped, and the chain must stay put.
    heNetIngestWire tWire3
-   heTAssert "netsim: player drops the ahead-of-gap wire (chain unchanged)", gGame["chainHeadHex"], tHead1
+   heTAssert "netsim: out-of-order future wire is held, chain unchanged", gGame["chainHeadHex"], tHead1
+   heTAssert "netsim: the gap wire is buffered (not dropped)", gGame["wireBufN"], 1
 
-   -- RESYNC replay: host replays 2 then 3 -> player recovers to head3
+   -- the missing wire 2 arrives: it applies AND the buffered wire 3 drains behind
+   -- it in the same step, so the chain jumps straight to head3 from wire 2 alone.
+   heNetIngestWire tWire2
+   heTAssert "netsim: filling the gap cascades the buffered wire to head3", gGame["chainHeadHex"], tHead3
+   heTAssert "netsim: buffer emptied after the cascade", gGame["wireBufN"], 0
+
+   -- DUPLICATES: rp1 redelivers wires constantly. An already-applied wire must be
+   -- dropped SILENTLY -- no chain change, no resync -- or the client resync-loops
+   -- forever and the game never starts (the actual networked bug this fixes).
+   heNetIngestWire tCfgWire
+   heTAssert "netsim: a duplicate cfg (seq 1) is dropped, chain unchanged", gGame["chainHeadHex"], tHead3
    heNetIngestWire tWire2
    heNetIngestWire tWire3
-   heTAssert "netsim: player recovers to the host chain head after replay", gGame["chainHeadHex"], tHead3
+   heTAssert "netsim: duplicate wires 2 and 3 are dropped, chain stays head3", gGame["chainHeadHex"], tHead3
+   heTAssert "netsim: lastSeq stays 3 through the duplicates", gGame["lastSeq"], 3
 
    put tSaved into gGame
 end heTestNetSim
