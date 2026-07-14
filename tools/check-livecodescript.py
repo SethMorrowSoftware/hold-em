@@ -368,6 +368,62 @@ def check_undeclared_catch(text):
     return errors
 
 
+CALL_PAREN = re.compile(r"\b(\w+)\s*\(")
+
+
+def check_command_as_function(text):
+    """Flag a locally-declared COMMAND (``command X`` / ``on X``) that is invoked
+    with function-call syntax ``X(...)``. On this engine a command called as a
+    function throws at the call site -- the body never even runs -- which is what
+    made heRunSelftest's ``put ... heProbeSodium() ...`` blow up with "error in
+    function handler" pointing at the call line. A command reports via ``the
+    result`` or writes its output directly; only a ``function`` may be called with
+    ``()`` (CLAUDE.md gotcha 7). Sibling/engine functions (sx*/bt*/b2k*, textEncode,
+    ...) are not declared here as commands, so they never false-flag."""
+    commands = set()
+    functions = set()
+    for _, code in logical_lines(text):
+        bare = strip_strings(code)
+        m = HANDLER_DECL.match(bare)
+        if not m or END_ANY.match(bare):
+            continue
+        kw = bare.strip().split()[0].lower()
+        if kw == "function":
+            functions.add(m.group(1).lower())
+        elif kw in ("command", "on"):
+            commands.add(m.group(1).lower())
+    # a name declared as BOTH (shouldn't happen) is treated as callable -- skip it
+    suspect = commands - functions
+    errors = []
+    seen = set()
+    for lineno, code in logical_lines(text):
+        bare = strip_strings(code)
+        if HANDLER_DECL.match(bare) and not END_ANY.match(bare):
+            continue  # the declaration line's own "name (params" is not a call
+        for m in CALL_PAREN.finditer(bare):
+            name = m.group(1)
+            if name.lower() not in suspect:
+                continue
+            # A command STATEMENT with a parenthesised first argument --
+            # `heMakeLabel (x & "y"), z` -- is legal. That only happens when the
+            # command name leads the statement (nothing but whitespace before it,
+            # or right after `then`/`else`). The bug is a command name used inside
+            # an EXPRESSION (`put ... heProbeSodium() ...`), where real text
+            # precedes it. So skip the leading-token position, flag the rest.
+            before = bare[:m.start()].strip()
+            if before == "" or before.split()[-1].lower() in ("then", "else"):
+                continue
+            if (lineno, name) in seen:
+                continue
+            seen.add((lineno, name))
+            errors.append(
+                f"  L{lineno}: command '{name}' is called with function-call "
+                f"syntax '{name}(...)' -- a command called as a function throws "
+                f"on this engine (call it as a statement; a function may use '()')"
+            )
+    return errors
+
+
 def check_dangling_else(text):
     """A single-line ``if … then <stmt>`` directly followed by a BARE ``else``
     line. LiveCode/OXT binds that else to the single-line if (the dangling-else
@@ -412,6 +468,7 @@ def main():
         problems += check_reserved_names(text)
         problems += check_undeclared_kconsts(text)
         problems += check_undeclared_catch(text)
+        problems += check_command_as_function(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")
