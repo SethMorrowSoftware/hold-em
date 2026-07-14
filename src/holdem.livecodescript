@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.5"
-constant kHeHarnessV = "24"
+constant kHeVersion = "0.10.6"
+constant kHeHarnessV = "25"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -1060,6 +1060,24 @@ function heLobbyCfgBody
          & ",seats=" & kHeDefaultSeats & ",button=1"
 end heLobbyCfgBody
 
+function heReadableErr pErr
+   -- pull the human-readable message out of a LiveCode execution-error struct
+   -- (lines of errNo,line,col[,text]); a thrown extension error carries the real
+   -- reason as the text field of one of those lines. Returns the first line's
+   -- text that reads like a sentence, else the raw error unchanged.
+   local tLine, tTxt
+   set the itemDelimiter to comma
+   repeat for each line tLine in pErr
+      if the number of items of tLine >= 4 then
+         put item 4 to -1 of tLine into tTxt
+         if the number of chars of tTxt > 10 and tTxt contains space then
+            return tTxt
+         end if
+      end if
+   end repeat
+   return pErr
+end heReadableErr
+
 command heNetStart
    -- start THE TorrentXT session, enable rp1, publish our admission token,
    -- and arm the poll drain. NEEDS AN OXT PASS. Requires tableIdHex + identity
@@ -1071,7 +1089,12 @@ command heNetStart
    try
       put btStartSession() into tSession
    catch tErr
-      heUISetStatus "Network start threw (ABI mismatch?): " & tErr
+      -- btStartSession is the one bt* handler that throws, and the usual cause is
+      -- an ABI mismatch between TorrentXT's bundled native library and its .lcb
+      -- binding (reinstall/repackage TorrentXT so they match). Surface the
+      -- readable reason, not the raw LiveCode error struct.
+      heUISetStatus "TorrentXT session failed to start: " & heReadableErr(tErr) \
+            & "  --  reinstall/rebuild TorrentXT so its native library matches its binding. Hotseat still works."
       exit heNetStart
    end try
    if tSession is 0 or tSession is empty then
