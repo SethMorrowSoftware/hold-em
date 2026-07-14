@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.1"
-constant kHeHarnessV = "20"
+constant kHeVersion = "0.10.2"
+constant kHeHarnessV = "21"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -322,15 +322,19 @@ command heProbeSodium
    -- (with it absent the handler returns before any catch can fire).
    local tRpt, tData, tPub, tSec, tSig, tSealed, tOpened, tMsg, tRecPub, tRecSec
    local tErr, tOuterErr
-   put "SodiumXT probe (holde-em " & kHeVersion & "):" & return into tRpt
-   if not heHasSodium() then
-      put "  SodiumXT not installed (sxRandomUniform threw)." & return after tRpt
-      put tRpt
-      return tRpt
-   end if
-   -- an outer guard so nothing here can ever escape and abort a harness run;
-   -- whatever throws is reported into the probe text instead of killing it
+   -- the version is stamped in so a STALE paste identifies itself: if the line
+   -- below does not say "v0.10.1" (or later) in OXT, the running stack is an old
+   -- paste and needs re-pasting -- that alone explains a probe that still throws.
+   put "SodiumXT probe (holde-em " & kHeVersion & ", harness v" & kHeHarnessV & "):" & return into tRpt
+   -- ONE outer guard around the whole body -- including the heHasSodium check --
+   -- so nothing here can ever escape and abort a harness run; whatever throws is
+   -- reported into the probe text instead of killing it
    try
+      if not heHasSodium() then
+         put "  SodiumXT not installed (sxRandomUniform threw)." & return after tRpt
+         put tRpt
+         return tRpt
+      end if
       put textEncode("holde-em probe", "utf-8") into tMsg
 
       try
@@ -4602,6 +4606,7 @@ constant kKatRcptSig2 = "20a21d334da7d32b00bf3a17920350ebaad0773121fc3f2d9feba04
 constant kKatRcptSig3 = "429a37ee32d74fd2d09b1b3a86fccc383c7e773ef52670ed07e4ede7e2e10f9ab4b791d630d0b44bdb6c405ed5238cc0bbab9d40129d3673c2c39f1d5d1a9c09"
 
 command heRunSelftest
+   local tProbeErr
    put empty into gRpt
    put 0 into gPassN
    put 0 into gFailN
@@ -4625,7 +4630,11 @@ command heRunSelftest
    heRunSection "heTestDealOrderRun"
    heRunSection "heTestLobbyRun"
    heRunSection "heTestNetSim"
-   put return & heProbeSodium() after gRpt
+   try
+      put return & heProbeSodium() after gRpt
+   catch tProbeErr
+      put return & "heProbeSodium THREW (outer): " & tProbeErr after gRpt
+   end try
    put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
          & return after gRpt
    if gFailN > 0 then
