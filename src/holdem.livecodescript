@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.4"
-constant kHeHarnessV = "23"
+constant kHeVersion = "0.10.5"
+constant kHeHarnessV = "24"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -1064,7 +1064,7 @@ command heNetStart
    -- start THE TorrentXT session, enable rp1, publish our admission token,
    -- and arm the poll drain. NEEDS AN OXT PASS. Requires tableIdHex + identity
    -- already set (heTableCreate/heTableJoin do that first).
-   local tSession, tRole, tErr
+   local tSession, tRole, tErr, tRp1Err
    if gGame["online"] is "true" then
       exit heNetStart
    end if
@@ -1079,14 +1079,29 @@ command heNetStart
       exit heNetStart
    end if
    put tSession into gGame["session"]
-   btSetBool tSession, "enable_dht", true
-   btRp1Enable tSession
    if gGame["isHost"] is "true" then
       put "host" into tRole
    else
       put "player" into tRole
    end if
-   btRp1SetToken tSession, heAdmitTokenData(gGame["tableIdHex"], gGame["idPubHex"], gGame["idSecData"], tRole)
+   -- rp1 is TorrentXT's peer-wire messaging plugin (ABI v8+); a build that ships
+   -- the session/DHT surface but not rp1 makes btRp1Enable "can't find handler".
+   -- The online game needs rp1, so if the transport setup can't complete, tear the
+   -- session back down and report it clearly rather than crash the join (H4/H1).
+   try
+      btSetBool tSession, "enable_dht", true
+      btRp1Enable tSession
+      btRp1SetToken tSession, heAdmitTokenData(gGame["tableIdHex"], gGame["idPubHex"], gGame["idSecData"], tRole)
+   catch tRp1Err
+      heUISetStatus "This TorrentXT build has no rp1 peer messaging (needs the rp1 plugin, ABI v8+): " \
+            & tRp1Err & ".  Online is unavailable on this build; hotseat still works."
+      try
+         btStopSession tSession
+      catch tErr
+      end try
+      put empty into gGame["session"]
+      exit heNetStart
+   end try
    put "true" into gGame["online"]
    send "heNetPollTick" to me in 250 milliseconds
 end heNetStart
@@ -1102,14 +1117,23 @@ end heNetStop
 command heNetJoinSwarm pIsHost
    -- add the phantom swarm on the table's rendezvous id, then announce (host)
    -- or discover (player) on the DHT (spec 10). The DHT carries zero game data.
-   local tSession
-   put gGame["session"] into tSession
-   get btAddInfohash(tSession, gGame["infohashHex"], heTempPath())
-   if pIsHost then
-      btDhtAnnounce tSession, gGame["infohashHex"], 0
-   else
-      btDhtGetPeers tSession, gGame["infohashHex"]
+   -- Only runs when heNetStart brought the transport fully up (online true), so a
+   -- build that failed the rp1 setup never reaches these DHT calls; guarded anyway.
+   local tSession, tSwarmErr
+   if gGame["online"] is not "true" then
+      exit heNetJoinSwarm
    end if
+   put gGame["session"] into tSession
+   try
+      get btAddInfohash(tSession, gGame["infohashHex"], heTempPath())
+      if pIsHost then
+         btDhtAnnounce tSession, gGame["infohashHex"], 0
+      else
+         btDhtGetPeers tSession, gGame["infohashHex"]
+      end if
+   catch tSwarmErr
+      heUISetStatus "DHT rendezvous unavailable on this TorrentXT build: " & tSwarmErr
+   end try
 end heNetJoinSwarm
 
 function heTableInfohash pTableHex
@@ -1150,6 +1174,9 @@ command heTableCreate
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "host" into gGame["roleByPub"][gGame["idPubHex"]]
    heNetStart
+   if gGame["online"] is not "true" then
+      exit heTableCreate   -- transport unavailable; heNetStart set the status
+   end if
    heNetJoinSwarm true
    -- seed the transcript with a signed table cfg (seq 1, from genesis); late
    -- joiners replay it and verify the host's key before anything else
@@ -1189,6 +1216,9 @@ command heTableJoin pCodeTxt
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "player" into gGame["roleByPub"][gGame["idPubHex"]]
    heNetStart
+   if gGame["online"] is not "true" then
+      exit heTableJoin   -- transport unavailable; heNetStart set the status
+   end if
    heNetJoinSwarm false
    heUISetStatus "Joining table " & char 1 to 12 of tCode & "... waiting for the host."
 end heTableJoin
