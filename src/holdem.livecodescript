@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.2"
-constant kHeHarnessV = "21"
+constant kHeVersion = "0.10.3"
+constant kHeHarnessV = "22"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -380,6 +380,11 @@ command heProbeSodium
       put "  probe aborted (unguarded): " & tOuterErr & return after tRpt
    end try
 
+   -- heProbeSodium is a COMMAND, so it must NOT be called with function-call
+   -- syntax heProbeSodium() -- that throws (the harness hit exactly this). Like
+   -- the test sections, it appends its report to gRpt; the harness runs it via
+   -- heRunSection, and a standalone `heProbeSodium` echoes the report too.
+   put return & tRpt after gRpt
    put tRpt
    return tRpt
 end heProbeSodium
@@ -4606,7 +4611,6 @@ constant kKatRcptSig2 = "20a21d334da7d32b00bf3a17920350ebaad0773121fc3f2d9feba04
 constant kKatRcptSig3 = "429a37ee32d74fd2d09b1b3a86fccc383c7e773ef52670ed07e4ede7e2e10f9ab4b791d630d0b44bdb6c405ed5238cc0bbab9d40129d3673c2c39f1d5d1a9c09"
 
 command heRunSelftest
-   local tProbeErr
    put empty into gRpt
    put 0 into gPassN
    put 0 into gFailN
@@ -4630,11 +4634,7 @@ command heRunSelftest
    heRunSection "heTestDealOrderRun"
    heRunSection "heTestLobbyRun"
    heRunSection "heTestNetSim"
-   try
-      put return & heProbeSodium() after gRpt
-   catch tProbeErr
-      put return & "heProbeSodium THREW (outer): " & tProbeErr after gRpt
-   end try
+   heRunSection "heProbeSodium"
    put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
          & return after gRpt
    if gFailN > 0 then

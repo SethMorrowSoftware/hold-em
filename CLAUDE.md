@@ -247,7 +247,14 @@ bug in the family.
 6. **Constants must be literal.** `constant k = "120"` compiles; `constant k = a*b`
    does not — derive computed values at runtime.
 7. **Command results vs function returns.** A command reports via `the result`; a
-   function returns a value. Mixing them up fails silently.
+   function returns a value. Mixing them up fails silently — and calling a **command**
+   with function-call syntax `heFoo()` does not fail silently: it **throws** at the call
+   site ("error in function handler"), the body never runs (found v0.10.x — the harness
+   called `heProbeSodium()` this way and the probe blew up before executing). Only a
+   `function` may be invoked with `()`; a command is a statement, or route it through a
+   value via `the result`. The static gate flags a locally-declared command used with
+   `()` (check 10) — a parenthesised first argument `heFoo (x), y` is legal and is not
+   flagged.
 8. **Custom properties are text.** Everything round-trips as strings; booleans are the
    strings `"true"`/`"false"`.
 10. **Dangling else.** A bare `else` on the line after a single-line `if cond then stmt`
