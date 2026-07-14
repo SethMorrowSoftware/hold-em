@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.3"
-constant kHeHarnessV = "22"
+constant kHeVersion = "0.10.4"
+constant kHeHarnessV = "23"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -364,6 +364,11 @@ command heProbeSodium
       catch tErr
          put "  sxSignDetached/verify: THREW: " & tErr & return after tRpt
       end try
+      -- the sealed-box surface (sxBoxKeypairFromSeed / sxSeal / sxSealOpen) is
+      -- SodiumXT Phase 4; a build that ships sign+hash but not box makes these
+      -- "can't find handler". That is EXPECTED on such a build and does not break
+      -- the game -- hole-card sealing is future work, and heIdentitySetup guards
+      -- the box key so a join still succeeds.
       try
          sxBoxKeypairFromSeed heHash32(textEncode("box", "utf-8")), tRecPub, tRecSec
          put sxSeal(tMsg, tRecPub) into tSealed
@@ -374,7 +379,8 @@ command heProbeSodium
             put "  sxSeal/Open: roundtrip mismatch" & return after tRpt
          end if
       catch tErr
-         put "  sxSeal/sxSealOpen: THREW: " & tErr & return after tRpt
+         put "  box surface (sxBoxKeypairFromSeed/sxSeal/sxSealOpen): THREW: " & tErr \
+               & " -- ok if this SodiumXT build has no Phase 4 box handlers yet" & return after tRpt
       end try
    catch tOuterErr
       put "  probe aborted (unguarded): " & tOuterErr & return after tRpt
@@ -949,15 +955,32 @@ end heIdentitySeedHex
 command heIdentitySetup
    -- derive and cache the long-term ed25519 identity and a fresh per-table
    -- X25519 session box key (private hole-card lanes seal to the box key)
-   local tSeedData, tPub, tSec, tBoxPub, tBoxSec
-   put heHex2BinD(heIdentitySeedHex()) into tSeedData
+   local tSeedData, tSeedHex, tPub, tSec, tBoxPub, tBoxSec, tBoxErr
+   put heIdentitySeedHex() into tSeedHex
+   put heHex2BinD(tSeedHex) into tSeedData
    sxSignKeypairFromSeed tSeedData, tPub, tSec
    put heBin2HexS(tPub) into gGame["idPubHex"]
    put tSec into gGame["idSecData"]
    put heFingerprintOf(tPub) into gGame["idFingerprint"]
-   sxBoxKeypairFromSeed heHash32(textEncode(kHeDomainSess, "utf-8") & tSeedData), tBoxPub, tBoxSec
-   put tBoxPub into gGame["boxPubData"]
-   put tBoxSec into gGame["boxSecData"]
+   -- The per-table X25519 box key is for the FUTURE sealed hole-card lanes; the
+   -- current lobby (ed25519 identity + admission tokens) never reads it. It is
+   -- derived best-effort and GUARDED: sxBoxKeypairFromSeed is a SodiumXT Phase 4
+   -- (public-key box) handler, and a build that ships the sign/hash surface but
+   -- not the box surface yet makes it "can't find handler" -- which must not break
+   -- a guest join (H4: an unbuilt/absent seam never breaks the working path). The
+   -- signature is correct per SodiumXT docs/api-reference.md
+   -- (sxBoxKeypairFromSeed pSeed, out rPub, out rSec); it simply may be absent.
+   -- NB: the seed is hashed from a TEXT input (domain + seed hex), never a binary
+   -- & of two Data values (H6 corollary).
+   put empty into gGame["boxPubData"]
+   put empty into gGame["boxSecData"]
+   try
+      sxBoxKeypairFromSeed heHash32(textEncode(kHeDomainSess & tSeedHex, "utf-8")), tBoxPub, tBoxSec
+      put tBoxPub into gGame["boxPubData"]
+      put tBoxSec into gGame["boxSecData"]
+   catch tBoxErr
+      -- box lane unavailable on this SodiumXT build; not needed by the lobby yet
+   end try
 end heIdentitySetup
 
 function heAdmitTokenData pTableHex, pPubHex, pSecData, pRole
