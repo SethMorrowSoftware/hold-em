@@ -6,6 +6,27 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.11.0 -- deep-dive alpha-readiness audit (9-dimension adversarial review).
+Fixes two shipped-path defects the KATs could not see (they mirror the pure
+engine, not the impure driver): (P0) heHandStart capped the blind from the
+PRE-ante bankroll while the engine validates against the POST-ante stack, so a
+blind seat short after its ante had its SB/BB rejected -- dropping the small
+blind or wedging the hand in tournament (ante) play; now capped from the engine
+stack, pinned by new heTestAnteRun asserts. (P1) a Deal click during the
+"between" result-pause left the prior hand's heNextHandTick pending, which could
+auto-deal an extra hand -- heCancelPacedSteps now sweeps in-flight paced sends at
+heHandStart. Online transport (lobby-only) hardened: envelope table-id/version
+bound on ingest; roster/cfg folded only from the host key (relay + ingest);
+per-peer "s?" replay rate-limit; heNetStop cancels the poll tick (no forked poll
+loop); stale peer handle pruned on reconnect; trust-on-first-use host-key pinning
+with a conflict warning; throw-safe rp1 dispatch. CI gates hardened: the vacuous
+evaluator-kat antisymmetry tautology replaced with a real check, and
+check-livecodescript now catches gotcha 29 (constant used above its declaration)
+and gotcha 11 (local inside a block). The "provably unstackable" wording is
+corrected to "tamper-evident / consistent with the revealed seeds" -- adversarial
+unstackability against a cheating dealer needs independent per-player seeds
+(spec 7.1 online deal), still future work. Harness v27.
+
 v0.5.1-0.5.6 -- audit hardening + provability. A four-way audit (protocol,
 pure-logic, OXT-dialect, coverage) drove: restored dropped deal KAT constants
 that silently broke heTestDealRun + a new gate for undeclared k-constants;
@@ -796,8 +817,10 @@ end heAuditDeal
 function heAuditDealsFromLog pLogTxt
    -- replay a transcript and RE-DERIVE every Level 0 deal from the revealed
    -- seeds, confirming the committed keyed-stream shuffle produced exactly the
-   -- cards that were dealt -- so the deal is provably unstackable, checkable by
-   -- anyone holding the log. Only the streets that were actually dealt are
+   -- cards that were dealt -- so the deal is provably CONSISTENT with the revealed
+   -- seeds (tamper-evident), checkable by anyone holding the log. (Unstackability
+   -- against a cheating dealer needs independent per-player seeds -- spec 7.1 online
+   -- deal -- not the single-party seeds generated here.) Only the dealt streets are
    -- compared (a hand folded pre-flop has no board to check). Needs SodiumXT
    -- (recomputes commitments + shuffle). Returns "N/M deals verified" then one
    -- line per Level 0 hand; "no Level 0 deals in this transcript" if none.
@@ -3023,12 +3046,15 @@ command heHandStart
 
    -- deal the deck. When SodiumXT is present, use the Level 0 COMMITTED
    -- keyed-stream shuffle (spec 7.1): a per-contributor seed is committed, then
-   -- revealed, and the deck is a hash of the XOR of the seeds -- so the shuffle
-   -- is fixed by the commitments and provably unstackable on replay. The whole
-   -- crypto path is wrapped in a try, so ANY failure falls back to the labelled
-   -- practice PRNG and the playable path can never break. (In hotseat one human
-   -- holds all seeds -- this is the auditable machinery, not yet an adversarial
-   -- guarantee; that arrives when seeds come from independent online players.)
+   -- revealed, and the deck is a hash of the XOR of the seeds -- so the shuffle is
+   -- fixed by the commitments and provably consistent with the revealed seeds on
+   -- replay (tamper-evident). The whole crypto path is wrapped in a try, so ANY
+   -- failure falls back to the labelled practice PRNG and the playable path can
+   -- never break. NOTE seeds are generated LOCALLY here (one node holds them all --
+   -- in hotseat, one human): this is the auditable, tamper-evident machinery, NOT
+   -- an adversarial unstackability guarantee against a cheating dealer. That needs
+   -- independent per-player seeds, each committed before any reveal, and arrives
+   -- with online play (spec 7.1).
    put heCountItems(tOccList) into tDealCount
    put "practice" into gGame["dealMode"]
    put empty into gGame["dealSeedsA"]

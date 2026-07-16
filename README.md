@@ -41,10 +41,13 @@ constants (`kHeStreetRevealMs`, `kHeRunoutStepMs`, `kHeShowdownHoldMs`, `kHeNext
 so the feel is easy to dial in on an OXT pass. With **SodiumXT** present the played hand deals from the **Level 0 committed
 keyed-stream shuffle** (spec 7.1) — each contributor's seed is committed, then revealed,
 and the deck is a hash of the XOR of the seeds, so the shuffle is fixed by the commitments
-and **provably unstackable on replay**. The whole crypto path is wrapped in a `try`, so any
-failure falls back to a labelled practice PRNG and the playable path can never break. (In
-hotseat one human holds all seeds — this is the auditable machinery; the adversarial
-guarantee arrives when seeds come from independent online players.)
+and **provably consistent with the revealed seeds on replay** — tamper-evident: no one can
+swap a card after the fact. The whole crypto path is wrapped in a `try`, so any failure
+falls back to a labelled practice PRNG and the playable path can never break. (One party
+still contributes every seed today — in hotseat one human holds them all — so this is the
+auditable, tamper-evident machinery, **not yet** unstackable against a *cheating dealer*:
+that adversarial guarantee needs independent per-player seeds, each committed before any
+reveal, and arrives with online play.)
 
 A **History** panel shows every completed hand — board, pot, winner, the named showdown
 hands, per-seat deltas — folded straight from the transcript and **re-verified on the
