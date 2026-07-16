@@ -6,6 +6,20 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.11.1 -- OXT-pass fix: the History panel folded to pot 0 / settle-MISMATCH on
+every hand after an online Create/Join. Root cause: the online lobby and the
+hotseat game share gGame["log"], but a hotseat line is 4 tab-fields
+(handNum|from|type|body) while an online wire is a 10-field signed envelope whose
+3rd field is the hand number, not the type. heTableCreate/heTableJoin clears the
+log and appends a wire cfg (which carries sb/bb but NO per-seat stacks); leaving
+to hotseat then appended hands onto a log with no readable hotseat cfg, so the
+fold seeded heBetNewHand with empty stakes/stacks, every blind was rejected, the
+pot stayed 0, and the (correct, non-zero) live settle lines all showed MISMATCH.
+The live game itself was always correct. Fix: heBtnLeave starts a fresh hotseat
+table (clean cfg) unless the log is already a clean hotseat transcript
+(heLogIsCleanHotseat), so a peek at the lobby and back preserves a running game.
+Harness v28.
+
 v0.11.0 -- deep-dive alpha-readiness audit (9-dimension adversarial review).
 Fixes two shipped-path defects the KATs could not see (they mirror the pure
 engine, not the impure driver): (P0) heHandStart capped the blind from the
@@ -107,8 +121,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.11.0"
-constant kHeHarnessV = "27"
+constant kHeVersion = "0.11.1"
+constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -2570,6 +2584,32 @@ command heLogAppend pTypeTxt, pFromTxt, pBodyTxt
    put heLogLine(gGame["handNum"], pFromTxt, pTypeTxt, pBodyTxt) & return after gGame["log"]
 end heLogAppend
 
+function heLogIsCleanHotseat pLogTxt
+   -- true iff pLogTxt begins with a 4-field hotseat line whose type is "cfg" (not
+   -- an online WIRE envelope, and not empty). The online lobby and the hotseat game
+   -- share gGame["log"] but in two incompatible formats: a hotseat line is
+   -- handNum TAB from TAB type TAB body (4 tab fields), while an online wire is a
+   -- 10-field signed envelope whose 3rd field is the hand number, NOT the type. A
+   -- hotseat History fold reads field 3 as the type and needs a hotseat "cfg" line
+   -- (which carries sb/bb/ante AND per-seat stacks) to seed heBetNewHand. So when
+   -- heTableCreate/heTableJoin has clobbered the log with a wire cfg (which carries
+   -- no stacks), leaving the lobby to hotseat must start a fresh hotseat table.
+   -- Pure (takes the log as a parameter) so it can be pinned in the harness.
+   local tFirst, tSaved
+   put line 1 of pLogTxt into tFirst
+   if tFirst is empty then
+      return false
+   end if
+   put the itemDelimiter into tSaved
+   set the itemDelimiter to tab
+   if the number of items of tFirst is 4 and item 3 of tFirst is "cfg" then
+      set the itemDelimiter to tSaved
+      return true
+   end if
+   set the itemDelimiter to tSaved
+   return false
+end heLogIsCleanHotseat
+
 function heFoldTranscript pLogTxt
    -- pure fold: replay a transcript and RE-DERIVE everything (engine state,
    -- showdown ranks, settlements); logged settle lines are verified against
@@ -4227,6 +4267,16 @@ on mouseUp
          exit mouseUp
       case "heBtnLeave"
          heNetStop
+         -- returning to hotseat: if the transcript was clobbered by an online
+         -- create/join (it now leads with a signed WIRE, or was emptied), start a
+         -- fresh hotseat table so gGame["log"] carries a real hotseat cfg (with
+         -- stakes AND stacks) for the History fold. A clean in-progress hotseat
+         -- game (log begins with a 4-field hotseat "cfg") is preserved -- so a
+         -- peek at the lobby and back does not wipe a running game. (deep-dive:
+         -- the lobby wire log and the hotseat transcript share gGame["log"].)
+         if not heLogIsCleanHotseat(gGame["log"]) then
+            heTableNew
+         end if
          heLobbyHide
          heUISetStatus "Back to hotseat. Press Deal to play, or Lobby to go online."
          exit mouseUp
@@ -5919,4 +5969,18 @@ command heTestFoldRun
    heTContains "fold: tampered settle line is caught", tFoldA["errors"], "settle-mismatch"
    put heFoldTranscript(heTKatLog("badact")) into tFoldA
    heTContains "fold: wrong-amount action rejected on replay", tFoldA["errors"], "engine-rejected"
+
+   -- deep-dive (OXT-pass finding): the online lobby and the hotseat game share
+   -- gGame["log"] in two incompatible formats -- a 4-field hotseat line vs a
+   -- 10-field signed wire. A hotseat log clobbered by an online create/join folds
+   -- to pot 0 / settle-MISMATCH (no hotseat cfg -> no stakes/stacks). heBtnLeave
+   -- now starts a fresh hotseat table whenever heLogIsCleanHotseat is false; pin
+   -- its recognition of a clean hotseat log vs a wire-led / empty one.
+   heTAssert "log: a hotseat cfg-led log is recognized as clean", \
+         heLogIsCleanHotseat(heLogLine(0, "table", "cfg", "sb=1,bb=2,ante=0,seats=1|2,stacks=400|400,button=1") \
+         & return & heLogLine(1, "table", "handStart", "seats=1|2,button=1")), true
+   heTAssert "log: a wire-envelope-led log is NOT a clean hotseat log", \
+         heLogIsCleanHotseat("1" & tab & "aa" & tab & "0" & tab & "bb" & tab & "cfg" & tab & "cc" \
+         & tab & "dd" & tab & "1" & tab & "ee" & tab & "ff"), false
+   heTAssert "log: an empty log is not a clean hotseat log", heLogIsCleanHotseat(empty), false
 end heTestFoldRun
