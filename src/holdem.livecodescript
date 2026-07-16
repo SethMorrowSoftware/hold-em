@@ -6,6 +6,18 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.12.0 -- real card art (kit mode). Vendored the Kenney "Playing Cards Pack"
+spritesheet (assets/cards/playingCards.png + .xml, CC0) -- the 52-card TextureAtlas
+Box2Dxt's foreign-sheet loader parses. Added heKenneyFrame, mapping each internal
+card id to its atlas frame (As -> cardSpadesA, Ts -> cardSpades10), and repointed
+heKitTryInit's icon pre-warm at those real frame names (the old loop warmed "7s"/
+"back", which exist in no Kenney atlas and threw). tools/atlas-kat.py pins in CI
+that all 52 cards resolve to frames present in the atlas and that every frame rect
+fits the sheet. The atlas load path + frame ".png" suffix + the actual card-sprite
+RENDER wiring (b2kSprite*) still need the Box2Dxt api-reference and an OXT pass;
+kit mode falls back to the flat glyph cards until then. Point uHeAtlasPath at the
+vendored atlas to enable it.
+
 v0.11.1 -- OXT-pass fix: the History panel folded to pot 0 / settle-MISMATCH on
 every hand after an online Create/Join. Root cause: the online lobby and the
 hotseat game share gGame["log"], but a hotseat line is 4 tab-fields
@@ -121,7 +133,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.11.1"
+constant kHeVersion = "0.12.0"
 constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
@@ -4210,6 +4222,40 @@ function heCardFace pIdx
    return tRankTxt & heSuitGlyph(heCardSuitVal(pIdx))
 end heCardFace
 
+function heKenneyFrame pIdx
+   -- map an internal card id (1..52) to its Kenney "Playing Cards Pack" atlas frame
+   -- BASE name (no extension), for kit-mode card art. heCardName gives rank+suit
+   -- ("As","Ts","7c"); Kenney names frames card<Suit><Rank>: c->Clubs d->Diamonds
+   -- h->Hearts s->Spades, ten as "10". So 52 (As) -> "cardSpadesA", Ts -> "cardSpades10".
+   -- The vendored atlas (assets/cards/playingCards.xml, CC0) carries the ".png" suffix
+   -- on its SubTexture names; whether Box2Dxt keeps or strips it on load is a
+   -- per-sheet question (gotcha 24) resolved on the OXT pass. Pinned by tools/atlas-kat.py.
+   local tName, tRankCh, tSuitCh, tSuitTxt, tRankTxt
+   put heCardName(pIdx) into tName
+   put char 1 of tName into tRankCh
+   put char 2 of tName into tSuitCh
+   switch tSuitCh
+      case "c"
+         put "Clubs" into tSuitTxt
+         break
+      case "d"
+         put "Diamonds" into tSuitTxt
+         break
+      case "h"
+         put "Hearts" into tSuitTxt
+         break
+      case "s"
+         put "Spades" into tSuitTxt
+         break
+   end switch
+   if tRankCh is "T" then
+      put "10" into tRankTxt
+   else
+      put tRankCh into tRankTxt
+   end if
+   return "card" & tSuitTxt & tRankTxt
+end heKenneyFrame
+
 command heMakeActionButton pBtnName, pLabelTxt, pLeftX
    create button pBtnName
    set the rect of button pBtnName to pLeftX & ",592" & comma & (pLeftX + 76) & ",624"
@@ -4232,10 +4278,15 @@ command heKitTryInit
    try
       start using stack "box2dxt-kit"
       b2kSheetLoadAtlas "heCards", the uHeAtlasPath of this stack
+      -- pre-warm every face by its Kenney frame name (card<Suit><Rank>, e.g.
+      -- "cardSpadesA"). The vendored atlas (assets/cards, CC0) carries the ".png"
+      -- suffix on its frame names; if Box2Dxt strips it on load (gotcha 24 -- check
+      -- per sheet), drop the & ".png" here. An OXT pass confirms which form the sheet
+      -- exposes. Kenney's face sheet has NO card-back frame (the old "back" ensure
+      -- threw on it), so the back is drawn separately in kit mode -- a follow-up.
       repeat with tIdx = 1 to 52
-         b2kSheetEnsureIcon "heCards", heCardName(tIdx)
+         b2kSheetEnsureIcon "heCards", heKenneyFrame(tIdx) & ".png"
       end repeat
-      b2kSheetEnsureIcon "heCards", "back"
       put "kit" into gUIMode
    catch tKitErr
       put "flat" into gUIMode
