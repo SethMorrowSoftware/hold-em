@@ -87,7 +87,7 @@ needs an OXT pass.
 --------------------------------------------------------------------------
 
 constant kHeVersion = "0.11.0"
-constant kHeHarnessV = "26"
+constant kHeHarnessV = "27"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -1130,10 +1130,21 @@ command heNetStart
 end heNetStart
 
 command heNetStop
+   local tMsgLine
    if gGame["online"] is not "true" then
       exit heNetStop
    end if
    put "false" into gGame["online"]
+   -- cancel the outstanding poll tick before tearing the session down: the online
+   -- flag alone let a stale tick (scheduled before the stop) revive itself, so a
+   -- re-create/re-join forked a SECOND poll loop that never died (H2). Sweep our
+   -- own poll send. (gotcha 5: pendingMessages is comma-delimited id,time,name,..)
+   set the itemDelimiter to comma
+   repeat for each line tMsgLine in the pendingMessages
+      if item 3 of tMsgLine is "heNetPollTick" then
+         cancel item 1 of tMsgLine
+      end if
+   end repeat
    btStopSession gGame["session"]
 end heNetStop
 
@@ -1249,7 +1260,7 @@ end heTableJoin
 on heNetPollTick
    -- one poll drain per tick (H2): rp1 events for gameplay, plus btPoll to
    -- keep the engine's own event queue clear. Never per-frame.
-   local tEvents, tEv
+   local tEvents, tEv, tPollErr
    if gGame["online"] is not "true" then
       exit heNetPollTick
    end if
@@ -1258,8 +1269,15 @@ on heNetPollTick
       subtract 1 from gGame["syncCooldown"]
    end if
    put btRp1Poll(gGame["session"]) into tEvents
+   -- an inbound rp1 event is attacker-controlled: a single throwing dispatch must
+   -- drop-and-log (H4), never abort the drain or -- worse -- skip the re-arm below
+   -- and silently kill the poll loop (deep-dive transport). The re-arm always runs.
    repeat for each element tEv in tEvents
-      heNetOnRp1 tEv
+      try
+         heNetOnRp1 tEv
+      catch tPollErr
+         put "poll   dropped a throwing rp1 event: " & tPollErr & return after gGame["netLog"]
+      end try
    end repeat
    get btPoll(gGame["session"])
    send "heNetPollTick" to me in 250 milliseconds
@@ -1280,7 +1298,7 @@ end heNetOnRp1
 command heNetOnHandshake pPeer, pTokenData
    -- admit-or-drop (spec 5): a peer whose token does not verify against this
    -- table is ignored, before any game message is accepted from it
-   local tPubHex, tRoleTxt, tIsNew, tOldPeer, tReconnect
+   local tPubHex, tRoleTxt, tIsNew, tOldPeer, tReconnect, tPeersA, tHostShort
    put heAdmitTokenVerify(pTokenData, gGame["tableIdHex"]) into tPubHex
    if tPubHex is empty then
       put "drop   handshake from an unadmitted peer" & return after gGame["netLog"]
@@ -1293,16 +1311,34 @@ command heNetOnHandshake pPeer, pTokenData
    -- transcript replayed too, not just first-time joiners (spec 9)
    put gGame["peerByPub"][tPubHex] into tOldPeer
    put (tOldPeer is not empty and tOldPeer is not pPeer) into tReconnect
+   -- on reconnect, drop the stale handle so peerPubA holds only live peers and
+   -- heNetBroadcast never sends to a dead handle (deep-dive transport). Delete via
+   -- a plain local array (the supported form; avoids a nested-subscript delete).
+   if tReconnect then
+      put gGame["peerPubA"] into tPeersA
+      delete variable tPeersA[tOldPeer]
+      put tPeersA into gGame["peerPubA"]
+   end if
    put tPubHex into gGame["peerPubA"][pPeer]
    put pPeer into gGame["peerByPub"][tPubHex]
    put "true" into gGame["admittedA"][tPubHex]
    put tRoleTxt into gGame["roleByPub"][tPubHex]
    -- adopt as host only a peer whose token DECLARES role "host" -- the phantom
-   -- swarm connects players to each other too, so "first peer" is not the host
-   -- (full host election, incl. host loss, is spec 9 / a later increment)
-   if gGame["isHost"] is not "true" and gGame["hostPubHex"] is empty \
-         and tRoleTxt is "host" then
-      put tPubHex into gGame["hostPubHex"]
+   -- swarm connects players to each other too, so "first peer" is not the host.
+   -- Trust-on-first-use: pin the first host key and surface (do NOT silently
+   -- swap to) any later, DIFFERENT host-declaring key -- attributable, and the
+   -- seam where a real invite<->host binding will reject it outright. Full host
+   -- election / host loss is spec 9 / a later increment.
+   if gGame["isHost"] is not "true" and tRoleTxt is "host" then
+      if gGame["hostPubHex"] is empty then
+         put tPubHex into gGame["hostPubHex"]
+      else if gGame["hostPubHex"] is not tPubHex then
+         -- copy the trusted host key out before chunking it (H6: never chunk an
+         -- array element directly)
+         put gGame["hostPubHex"] into tHostShort
+         put "WARN   ignored a second host-declaring key " & char 1 to 12 of tPubHex \
+               & " (already trust " & char 1 to 12 of tHostShort & ")" & return after gGame["netLog"]
+      end if
    end if
    if tIsNew then
       put "+peer  " & char 1 to 12 of tPubHex & "  (" & tRoleTxt & ")" & return after gGame["netLog"]
@@ -1343,6 +1379,15 @@ command heNetOnMessage pPeer, pPayloadData
          -- connected peer, so an unknown socket cannot trigger a replay.
          put gGame["peerPubA"][pPeer] into tPeerPub
          if gGame["isHost"] is "true" and tPeerPub is not empty then
+            -- rate-limit replays PER PEER: at most one per ~2s, so a flood of "s?"
+            -- cannot amplify into unbounded full-transcript replays (deep-dive DoS).
+            -- Keyed by the peer's pubkey (stable across handle churn), timed off the
+            -- engine clock so no per-tick decrement is needed.
+            if gGame["replayMsByPub"][tPeerPub] is not empty \
+                  and (the milliseconds - gGame["replayMsByPub"][tPeerPub]) < 2000 then
+               exit heNetOnMessage
+            end if
+            put the milliseconds into gGame["replayMsByPub"][tPeerPub]
             put "sync!  replaying transcript to " & char 1 to 8 of tPeerPub & return after gGame["netLog"]
             heNetReplayLogTo pPeer
             heLobbyRefresh
@@ -1355,17 +1400,25 @@ command heHostRelay pPeer, pContentAndSig
    -- host path: take a player's (contentLine TAB senderSig), assign seq + prev,
    -- countersign, advance the chain, and broadcast the sequenced wire to all.
    -- The content's own sender signature is checked before it is relayed.
-   local tContent, tSenderSig, tSaved, tFromHex, tEnvLine, tHostSig, tWire
+   local tContent, tSenderSig, tSaved, tFromHex, tEnvLine, tHostSig, tWire, tTypeTxt
    put the itemDelimiter into tSaved
    set the itemDelimiter to tab
    -- contentLine is items 1..6, senderSig is item 7 of pContentAndSig
    put item 1 to 6 of pContentAndSig into tContent
    put item 7 of pContentAndSig into tSenderSig
    put item 4 of tContent into tFromHex
+   put item 5 of tContent into tTypeTxt
    set the itemDelimiter to tSaved
    -- a player packet is untrusted: reject malformed hex before decoding it
    -- (sxHex2Bin throws) so a corrupt "c" frame cannot kill the host relay (H4)
    if not heIsHex(tFromHex, 64) or not heIsHex(tSenderSig, 128) then
+      exit heHostRelay
+   end if
+   -- host-authority: cfg/roster are host-authored presence; never sequence and
+   -- relay them for a non-host sender, so an admitted player cannot forge table
+   -- config or roster through the relay (deep-dive transport). The host emits
+   -- these from its own key (heNetSendAction uses gGame["idPubHex"]).
+   if (tTypeTxt is "cfg" or tTypeTxt is "roster") and tFromHex is not gGame["hostPubHex"] then
       exit heHostRelay
    end if
    -- verify the sender actually signed this content (host cannot forge content)
@@ -1401,19 +1454,43 @@ command heNetIngestWire pWire
       heLobbyRefresh
       exit heNetIngestWire
    end if
-   put heChainNextHex(pWire) into gGame["chainHeadHex"]
    put heEnvWireParse(pWire) into tA
+   -- bind the envelope to THIS table and protocol version before folding it. Both
+   -- fields sit inside the host-signed span, but a receiver still has to ENFORCE
+   -- them: otherwise a host-signed wire for another table, or a downgraded envelope
+   -- version, would be accepted onto our chain (deep-dive transport). A mismatch is
+   -- a hard drop, NOT a chain gap, so it never triggers a resync.
+   if tA["table"] is not gGame["tableIdHex"] then
+      put "drop:wrong-table " & char 1 to 24 of pWire & return after gGame["netLog"]
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   if tA["v"] is not kHeEnvV then
+      put "drop:bad-version " & char 1 to 24 of pWire & return after gGame["netLog"]
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   put heChainNextHex(pWire) into gGame["chainHeadHex"]
    put pWire & return after gGame["log"]
    put tA["type"] into tTypeTxt
    put tA["seq"] into tSeqTxt
    put "ok     " & tTypeTxt & " seq " & tSeqTxt & return after gGame["netLog"]
    -- lobby presence bodies drive the roster/cfg display; gameplay wires drive
    -- the betting engine (the deal increment). tA fields are plain locals now,
-   -- so heEnvBodyText chunks only plain text (H6-safe).
-   if tTypeTxt is "roster" then
-      put heEnvBodyText(tA["bodyHex"]) into gGame["rosterBody"]
-   else if tTypeTxt is "cfg" then
-      put heEnvBodyText(tA["bodyHex"]) into gGame["cfgBody"]
+   -- so heEnvBodyText chunks only plain text (H6-safe). roster/cfg are HOST-
+   -- authored presence (spec 9): fold them only when the wire's own sender is the
+   -- host, so an admitted player cannot forge table config/roster by getting a
+   -- content line relayed (the host relays any admitted sender's content).
+   if tTypeTxt is "roster" or tTypeTxt is "cfg" then
+      if tA["from"] is gGame["hostPubHex"] then
+         if tTypeTxt is "roster" then
+            put heEnvBodyText(tA["bodyHex"]) into gGame["rosterBody"]
+         else
+            put heEnvBodyText(tA["bodyHex"]) into gGame["cfgBody"]
+         end if
+      else
+         put "drop   non-host " & tTypeTxt & " body ignored" & return after gGame["netLog"]
+      end if
    end if
    heLobbyRefresh
 end heNetIngestWire
@@ -5003,6 +5080,7 @@ command heTestNetSim
    local tSaved, tHostPub, tHostSec, tPlayPub, tPlaySec, tHostPubHex, tPlayPubHex
    local tCfgWire, tWire2, tWire3, tHostLog, tContent, tSenderSig, tPacket
    local tHead1, tHead2, tHead3, tBadPub, tBadSec
+   local tPriorCfg, tForgedWire, tPriorHead, tWrongTable, tWrongWire
    put return & "-- 10. Online orchestration loopback (single machine, no rp1)" & return after gRpt
    if not heHasSodium() then
       heTSkip "netsim: online orchestration", "SodiumXT not installed"
@@ -5091,6 +5169,25 @@ command heTestNetSim
    heNetIngestWire tWire2
    heNetIngestWire tWire3
    heTAssert "netsim: player recovers to the host chain head after replay", gGame["chainHeadHex"], tHead3
+
+   -- host-authority on ingest (deep-dive [1]/[6]): a wire whose cfg content is
+   -- authored by a NON-host key -- even if it is otherwise valid and host-signed --
+   -- must NOT overwrite the cfg body. Build one from the player key and confirm the
+   -- stashed cfg is untouched.
+   put gGame["cfgBody"] into tPriorCfg
+   put heEnvContentLine(kKatTableHex, 0, tPlayPubHex, "cfg", "v=1,level=0,sb=999,bb=999,seats=6,button=1") into tContent
+   put heWireBuild(tContent, tPlaySec, 4, gGame["chainHeadHex"], tHostSec) into tForgedWire
+   heNetIngestWire tForgedWire
+   heTAssert "netsim: a non-host cfg body is not folded (host-authority)", gGame["cfgBody"], tPriorCfg
+
+   -- table binding on ingest (deep-dive [4]/[5]): a host-signed wire for a DIFFERENT
+   -- table is dropped and the chain does not advance.
+   put gGame["chainHeadHex"] into tPriorHead
+   put "1111111111111111111111111111111111111111111111111111111111111111" into tWrongTable
+   put heEnvContentLine(tWrongTable, 0, tHostPubHex, "cfg", kKatLobbyCfgBody) into tContent
+   put heWireBuild(tContent, tHostSec, 5, tPriorHead, tHostSec) into tWrongWire
+   heNetIngestWire tWrongWire
+   heTAssert "netsim: a wire for another table is dropped (chain unchanged)", gGame["chainHeadHex"], tPriorHead
 
    put tSaved into gGame
 end heTestNetSim
