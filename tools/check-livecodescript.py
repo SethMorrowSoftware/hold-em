@@ -35,7 +35,14 @@ It checks every target for:
      ``tab`` constant, gotcha 2).
   8. ``k``-prefixed constant names used but never declared -- OXT resolves the
      bare word to its own text and it throws downstream (this silently broke
-     heTestDealRun when the deal constants were dropped from the block).
+     heTestDealRun when the deal constants were dropped from the block) -- and
+     ``k`` names used *lexically above* their declaration, which OXT silently
+     evaluates to empty at runtime (gotcha 29).
+  9. A ``local`` declared inside an ``if`` / ``repeat`` / ``switch`` / ``try``
+     block -- it breaks compilation of the whole script (gotcha 11); locals must
+     sit at the top of the handler.
+ 10. ``catch VAR`` whose VAR is not a declared local (gotcha H8), and a
+     locally-declared COMMAND invoked with function-call syntax (gotcha 7).
 
 Usage::
 
@@ -182,6 +189,15 @@ def check_structure(text):
             ctrl.append(("switch", lineno))
         elif low == "try":
             ctrl.append(("try", lineno))
+        elif toks[0] == "local" and ctrl:
+            # a 'local' nested inside an if/repeat/switch/try block breaks
+            # compilation of the whole script on OXT (gotcha 11); declarations
+            # must sit at the top of the handler, before any control structure.
+            kind, opened = ctrl[-1]
+            errors.append(
+                f"  L{lineno}: 'local' declared inside '{kind}' (opened L{opened}) in "
+                f"handler '{handler[0]}' -- declare locals at the top of the handler (gotcha 11)"
+            )
 
     if handler is not None:
         errors.append(f"  handler '{handler[0]}' (L{handler[1]}): never closed (missing 'end {handler[0]}')")
@@ -280,19 +296,26 @@ K_CONST_USE = re.compile(r"\b(k[A-Z][A-Za-z0-9]*)\b")
 
 def check_undeclared_kconsts(text):
     """Flag any k-prefixed constant NAME that is used but never declared with
-    ``constant kName = ...`` in the same file. The ``k`` prefix is the family's
-    reserved marker for a constant (CLAUDE.md gotcha 3), so a used ``k...`` name
-    with no declaration is a paste/typo bug: OXT resolves the bare word to its
-    own text (or errors under explicitVariables), which then flows into a hash
-    or hex decode and throws at runtime -- invisible to every other gate. This
-    exact defect silently broke heTestDealRun when the deal constants were
-    dropped from the block (nine kKat... names used, none declared). String
-    literals are stripped first so a k-word inside a message never false-flags."""
-    declared = set()
-    for _, code in logical_lines(text):
+    ``constant kName = ...`` in the same file, OR used *lexically above* its
+    declaration. The ``k`` prefix is the family's reserved marker for a constant
+    (CLAUDE.md gotcha 3), so a used ``k...`` name with no declaration is a
+    paste/typo bug: OXT resolves the bare word to its own text (or errors under
+    explicitVariables), which then flows into a hash or hex decode and throws at
+    runtime -- invisible to every other gate. This exact defect silently broke
+    heTestDealRun when the deal constants were dropped from the block (nine kKat...
+    names used, none declared).
+
+    Use-before-declaration is a SEPARATE, equally invisible defect (gotcha 29):
+    OXT resolves constant names by FILE POSITION, so a use lexically above the
+    ``constant`` line compiles clean and silently evaluates to EMPTY at runtime.
+    We record each name's first declaration line and flag any use whose line is
+    below it. String literals are stripped first so a k-word inside a message
+    never false-flags."""
+    declared = {}  # name -> first declaration lineno
+    for lineno, code in logical_lines(text):
         m = K_CONST_DECL.match(code)
-        if m:
-            declared.add(m.group(1))
+        if m and m.group(1) not in declared:
+            declared[m.group(1)] = lineno
     errors = []
     seen = set()
     for lineno, code in logical_lines(text):
@@ -300,12 +323,21 @@ def check_undeclared_kconsts(text):
         if K_CONST_DECL.match(bare):
             continue  # the declaration line itself
         for name in K_CONST_USE.findall(bare):
-            if name not in declared and name not in seen:
-                seen.add(name)
+            if name not in declared:
+                if name not in seen:
+                    seen.add(name)
+                    errors.append(
+                        f"  L{lineno}: constant '{name}' is used but never declared "
+                        "(a 'k' name with no 'constant ... =' -- OXT reads it as its own "
+                        "text and it throws downstream; complete the --gen-xtalk paste)"
+                    )
+            elif lineno < declared[name] and (name, "order") not in seen:
+                seen.add((name, "order"))
                 errors.append(
-                    f"  L{lineno}: constant '{name}' is used but never declared "
-                    "(a 'k' name with no 'constant ... =' -- OXT reads it as its own "
-                    "text and it throws downstream; complete the --gen-xtalk paste)"
+                    f"  L{lineno}: constant '{name}' is used above its declaration "
+                    f"(L{declared[name]}) -- OXT resolves constants by file position, so "
+                    "a use before the declaration silently evaluates to empty at runtime "
+                    "(gotcha 29); move the declaration up (constants belong at the top)"
                 )
     return errors
 
