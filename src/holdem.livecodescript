@@ -86,8 +86,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.10.6"
-constant kHeHarnessV = "25"
+constant kHeVersion = "0.11.0"
+constant kHeHarnessV = "26"
 constant kUIVersion = "7"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -2917,6 +2917,11 @@ command heHandStart
    if gGame["phase"] is not "idle" and gGame["phase"] is not "between" then
       exit heHandStart
    end if
+   -- a Deal click during the "between" result-pause starts here while the prior
+   -- hand's heNextHandTick is still pending; cancel any in-flight paced step so a
+   -- stale timer cannot fire into this hand and auto-deal an unrequested one
+   -- (deep-dive P1). The HUD/network poll loops are free-running and untouched.
+   heCancelPacedSteps
    put heSeatsAlive() into tOccList
    if heCountItems(tOccList) < 2 then
       heUISetStatus "Game over -- one stack left. Starting a fresh table."
@@ -3014,8 +3019,15 @@ command heHandStart
          heEngineDo "bidAnte", tSeatNum, min(gGame["ante"], gGame["stacksBy"][tSeatNum])
       end repeat
    end if
-   heEngineDo "bidSB", gGame["state"]["sbSeat"], min(gGame["sb"], gGame["stacksBy"][gGame["state"]["sbSeat"]])
-   heEngineDo "bidBB", gGame["state"]["bbSeat"], min(gGame["bb"], gGame["stacksBy"][gGame["state"]["bbSeat"]])
+   -- cap each blind by the seat's POST-ante engine stack, not the pre-ante
+   -- bankroll gGame["stacksBy"]: the ante loop above already moved the antes into
+   -- gGame["state"]["stackBy"] (via heBetPayDead), and heBetApply validates the
+   -- blind against that post-ante stack. Using gGame["stacksBy"] here made a seat
+   -- that is short AFTER its ante over-post the blind, so the engine rejected it
+   -- with bidSB/bidBB-wrong-amount -- silently dropping the small blind or wedging
+   -- the hand in tournament (ante) play (deep-dive P0).
+   heEngineDo "bidSB", gGame["state"]["sbSeat"], min(gGame["sb"], gGame["state"]["stackBy"][gGame["state"]["sbSeat"]])
+   heEngineDo "bidBB", gGame["state"]["bbSeat"], min(gGame["bb"], gGame["state"]["stackBy"][gGame["state"]["bbSeat"]])
    heUIHandStart
    heHudMark
    heUIPromptToAct
@@ -3094,6 +3106,24 @@ command heReactToNotes
       end switch
    end repeat
 end heReactToNotes
+
+command heCancelPacedSteps
+   -- cancel any in-flight paced schedule send (reveal / runout / showdown /
+   -- next-hand) so a stale timer from a prior hand can never fire into a later
+   -- one. Only these hand-paced steps are swept; the free-running HUD and network
+   -- poll loops (heHudTick / heNetPollTick) are deliberately left alone. Called at
+   -- the top of heHandStart. (gotcha 5: pendingMessages is comma-delimited
+   -- id,time,name,target -- set the delimiter before parsing.)
+   local tMsgLine, tName
+   set the itemDelimiter to comma
+   repeat for each line tMsgLine in the pendingMessages
+      put item 3 of tMsgLine into tName
+      if tName is "heRevealStep" or tName is "heRunoutStep" \
+            or tName is "heSettleStep" or tName is "heNextHandTick" then
+         cancel item 1 of tMsgLine
+      end if
+   end repeat
+end heCancelPacedSteps
 
 command heScheduleReveal pStreetName
    -- betting closed and the next street is due: hold a beat with the buttons
@@ -5522,6 +5552,27 @@ command heTestAnteRun
    put heSettleOf(tStateA, tRanksA) into tDeltasA
    heTAssert "ante: winner scoops the 600 pot (each put in its whole 200)", \
          heTDeltasTxt(tDeltasA, tStateA["occ"]), "1:-200|2:-200|3:400"
+
+   -- P0 regression pin (deep-dive): a blind-position seat that is short AFTER its
+   -- ante must be posted from the POST-ante stack, which is exactly what heHandStart
+   -- now caps by (gGame["state"]["stackBy"]). Seat 2 = SB, starts 55, ante 10 ->
+   -- post-ante stack 45, so its all-in small blind is 45, not min(50, pre-ante 55).
+   put heTNewHandAnte(50, 100, 10, "400,55,400", "1,2,3", 1) into tStateA
+   repeat with tSeatNum = 1 to 3
+      put heBetApply(tStateA, "bidAnte", tSeatNum, min(10, tStateA["stackBy"][tSeatNum])) into tStateA
+   end repeat
+   heTAssert "ante: short SB seat is short after its ante", tStateA["stackBy"][2], 45
+   put heBetApply(tStateA, "bidSB", 2, min(50, tStateA["stackBy"][2])) into tStateA
+   heTAssert "ante: short SB posts from the post-ante stack (heHandStart P0 fix)", tStateA["err"], empty
+   heTAssert "ante: short SB is all-in for ante + short blind", tStateA["handBy"][2], 55
+   -- and the OLD pre-ante cap (the bug the fix removes) is what the engine rejects:
+   put heTNewHandAnte(50, 100, 10, "400,55,400", "1,2,3", 1) into tStateA
+   repeat with tSeatNum = 1 to 3
+      put heBetApply(tStateA, "bidAnte", tSeatNum, min(10, tStateA["stackBy"][tSeatNum])) into tStateA
+   end repeat
+   put heBetApply(tStateA, "bidSB", 2, min(50, 55)) into tStateA
+   heTAssert "ante: a pre-ante blind cap is rejected (regression guard)", \
+         tStateA["err"], "bidSB-wrong-amount"
 end heTestAnteRun
 
 command heTestLevelRun
