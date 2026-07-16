@@ -28,6 +28,30 @@ relative to the XML finds it.
 
 The stack maps its internal card ids to these frame names in `heKenneyFrame`
 (`src/holdem.livecodescript`), and `tools/atlas-kat.py` pins in CI that all 52 cards
-resolve to frames that actually exist in this atlas. To enable kit-mode card art in
-OXT, point the stack's `uHeAtlasPath` custom property at `playingCards.xml` (or the
-`.png`, per the Box2Dxt `b2kSheetLoadAtlas` contract) and install the Box2Dxt Kit.
+resolve to frames that actually exist in this atlas.
+
+## Where to put this folder (OXT)
+
+Put the whole `assets/cards/` folder **next to the saved stack file** — i.e. so the
+layout on disk is:
+
+```
+holdem.livecode            <- your saved stack
+assets/
+  cards/
+    playingCards.png
+    playingCards.xml
+    playingCardBacks.png
+    playingCardBacks.xml
+```
+
+`heKitTryInit` derives the atlas path from the stack's own folder
+(`heStackFolder` -> `<that folder>/assets/cards/...`), so with the Box2Dxt Kit
+installed it is found automatically — nothing to configure.
+
+Two caveats: (1) the stack must be **saved to a file** for this to work; a stack
+pasted into the message box and never saved has no folder to be relative to, so set
+`uHeAtlasPath` / `uHeBacksPath` by hand (or just save the stack once). (2) To keep
+the assets somewhere else, set those two custom properties to the explicit file
+paths and they override the default. Point them at the `.xml` (or the `.png`, per the
+Box2Dxt `b2kSheetLoadAtlas` contract — an OXT-pass detail).
