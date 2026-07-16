@@ -30,5 +30,7 @@ jobs:
         run: python3 tools/protocol-kat.py
       - name: transcript-fold KAT (replay-as-audit, hand history)
         run: python3 tools/fold-kat.py
+      - name: card-atlas KAT (kit-mode Kenney frame mapping)
+        run: python3 tools/atlas-kat.py
       - name: independent-reference fuzz (rules, not the port)
         run: python3 tools/logic-fuzz.py

@@ -206,14 +206,23 @@ def main():
     print("PASS  order-independence over %d hands x %d permutations"
           % (len(VECTORS), len(PERMS)))
 
-    # 3. Antisymmetry: comparing packed strings must invert cleanly across
-    #    every pair of vector hands (packed encoding is a total order).
+    # 3. Trichotomy + antisymmetry of the packed comparison over every pair of
+    #    vector hands: exactly one of <, ==, > holds, and the relation inverts
+    #    (a>b iff b<a, a<b iff b>a). The strong ordering guarantee (packed value
+    #    order == true hand strength) is pinned exhaustively by logic-fuzz's
+    #    order-isomorphism pass; this pass guards that the packed encoding compares
+    #    as a consistent total order (a packed() that ever returned an inconsistent
+    #    or non-comparable value would break the count, not silently pass).
+    #    NB: the earlier form -- `(a>b) and not (b<a) or (a==b)!=(b==a)` -- could
+    #    never be true for any strings, so it was a vacuous no-op; this is a real
+    #    assertion.
     vals = [(label, packed(eval_names(names))) for label, names, _ in VECTORS]
     for (la, a), (lb, bv) in itertools.combinations(vals, 2):
-        if (a > bv) and not (bv < a) or (a == bv) != (bv == a):
-            print("FAIL  antisymmetry %s vs %s" % (la, lb))
+        trichotomy = (a < bv) + (a == bv) + (a > bv)
+        if trichotomy != 1 or (a > bv) != (bv < a) or (a < bv) != (bv > a):
+            print("FAIL  antisymmetry %s vs %s (a=%s b=%s)" % (la, lb, a, bv))
             fails += 1
-    print("PASS  antisymmetry over all vector pairs")
+    print("PASS  trichotomy + antisymmetry over all vector pairs")
 
     print()
     if fails:
