@@ -6,6 +6,15 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.12.1 -- card backs. Vendored the Kenney "Playing Cards Pack" card-back sheet
+(assets/cards/playingCardBacks.png + .xml, CC0; 15 designs blue/green/red x5) for
+face-down cards, alongside the faces. Added the kHeCardBackFrame constant (default
+"cardBack_red2") and a guarded backs-atlas load in heKitTryInit (via uHeBacksPath).
+tools/atlas-kat.py now also pins that the chosen back frame exists in the backs
+atlas and that all back rects fit the sheet. Note: Kenney's card collection has
+cards/backs/jokers/dice but NO poker chips -- chips stay procedural (a colored disc)
+unless a dedicated CC0 chip pack is added.
+
 v0.12.0 -- real card art (kit mode). Vendored the Kenney "Playing Cards Pack"
 spritesheet (assets/cards/playingCards.png + .xml, CC0) -- the 52-card TextureAtlas
 Box2Dxt's foreign-sheet loader parses. Added heKenneyFrame, mapping each internal
@@ -133,7 +142,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.12.0"
+constant kHeVersion = "0.12.1"
 constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
@@ -141,6 +150,10 @@ constant kUIVersion = "7"
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
 constant kHeRankChars = "23456789TJQKA"
 constant kHeSuitChars = "cdhs"
+-- kit-mode card back: which frame of the Kenney playingCardBacks atlas to draw for
+-- face-down cards (blue/green/red 1..5). Pinned present by tools/atlas-kat.py; the
+-- OXT pass can swap it once the real designs are visible.
+constant kHeCardBackFrame = "cardBack_red2"
 
 -- Park-Miller MINSTD: x' = 16807 * x mod (2^31 - 1). 16807 * (2^31-1) is
 -- about 3.6e13, well under 2^53, so every step is exact in a double.
@@ -4263,7 +4276,7 @@ command heMakeActionButton pBtnName, pLabelTxt, pLeftX
 end heMakeActionButton
 
 command heKitTryInit
-   local tIdx, tKitErr
+   local tIdx, tKitErr, tBacksErr
    put "flat" into gUIMode
    put 0 into gAnimBusy
    if not heHasKit() then
@@ -4287,6 +4300,18 @@ command heKitTryInit
       repeat with tIdx = 1 to 52
          b2kSheetEnsureIcon "heCards", heKenneyFrame(tIdx) & ".png"
       end repeat
+      -- the face sheet has no back; Kenney ships backs separately. If a backs atlas
+      -- is configured (uHeBacksPath -> assets/cards/playingCardBacks.xml), load it as
+      -- its own sheet and pre-warm the one chosen back design. Guarded in its own try
+      -- so a missing/failed backs sheet never costs us the (loaded) face art.
+      try
+         if the uHeBacksPath of this stack is not empty \
+               and there is a file (the uHeBacksPath of this stack) then
+            b2kSheetLoadAtlas "heCardBacks", the uHeBacksPath of this stack
+            b2kSheetEnsureIcon "heCardBacks", kHeCardBackFrame & ".png"
+         end if
+      catch tBacksErr
+      end try
       put "kit" into gUIMode
    catch tKitErr
       put "flat" into gUIMode
