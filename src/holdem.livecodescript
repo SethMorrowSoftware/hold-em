@@ -6,6 +6,12 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.13.2 -- fix a compile error in heProbeKit (v0.13.1): it used backslash-escaped
+quotes (\"box2dxt-kit\") to print quotes, but xTalk has NO string escapes -- \" is a
+continuation backslash plus a string-terminating quote, which breaks compilation.
+Use the quote constant instead. Added a static gate (check-livecodescript check for
+\") so this class is caught in future -- it was invisible to every existing check.
+
 v0.13.1 -- kit setup debugging. heProbeKit now does LIVE checks (not the cached
 heHasKit) so it reflects the current state right after you load the Kit, reports
 whether the "box2dxt-kit" stack is loaded AND whether the b2k* handlers are on the
@@ -174,7 +180,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.13.1"
+constant kHeVersion = "0.13.2"
 constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
@@ -4445,11 +4451,11 @@ command heProbeKit
       put "true" into tHandlers
    catch tErr
    end try
-   put "stack \"box2dxt-kit\" loaded: " & tHasStack & return after tOut
+   put "stack " & quote & "box2dxt-kit" & quote & " loaded: " & tHasStack & return after tOut
    put "b2k* handlers on the message path: " & tHandlers & return after tOut
    if tHasStack is false and tHandlers is false then
       put return & "==> The Box2Dxt Kit is NOT loaded. It is a SEPARATE stack named" & return after tOut
-      put "    \"box2dxt-kit\" -- open its box2dxt-kit.livecodescript in OXT (File > Open" & return after tOut
+      put "    " & quote & "box2dxt-kit" & quote & " -- open its box2dxt-kit.livecodescript in OXT (File > Open" & return after tOut
       put "    Stack), do not paste it into this script. Then run heKitReload." & return after tOut
       put tOut
       return tOut
