@@ -53,5 +53,10 @@ Two caveats: (1) the stack must be **saved to a file** for this to work; a stack
 pasted into the message box and never saved has no folder to be relative to, so set
 `uHeAtlasPath` / `uHeBacksPath` by hand (or just save the stack once). (2) To keep
 the assets somewhere else, set those two custom properties to the explicit file
-paths and they override the default. Point them at the `.xml` (or the `.png`, per the
-Box2Dxt `b2kSheetLoadAtlas` contract — an OXT-pass detail).
+paths and they override the default. `b2kSheetLoadAtlas` takes the **`.png`** (its
+sibling `.xml` is found automatically), so point them at the PNG — a `.xml` value is
+also accepted and swapped to its `.png`.
+
+Run **`heProbeKit`** in the message box to see exactly what the stack resolved: Kit
+presence, the atlas path and whether it exists, loaded frame counts, and the pooled
+sprite count.

@@ -6,6 +6,31 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.13.1 -- kit setup debugging. heProbeKit now does LIVE checks (not the cached
+heHasKit) so it reflects the current state right after you load the Kit, reports
+whether the "box2dxt-kit" stack is loaded AND whether the b2k* handlers are on the
+message path, and names the exact gap + the fix (the Kit is a SEPARATE stack, not
+pasted into this script). New heKitReload clears the cached probe, removes pooled
+sprites, and re-runs heKitTryInit -- the message-box command to run after loading the
+Kit / saving the stack / moving the assets (heKitTryInit only runs at first build, so
+a freshly-added Kit needs this).
+
+v0.13.0 -- actually RENDER the Kenney card art in kit mode (against the real
+Box2Dxt kit API, read from the sibling repo -- not guessed). Two things were
+missing: (1) b2kSheetLoadAtlas takes the PNG path (the .xml is its optional 2nd
+arg) -- the loader was passing the .xml, so the sheet never loaded; fixed, and it
+now passes PNG + sibling .xml explicitly. (2) Nothing drew sprites: the display
+path still wrote flat glyph fields. Now heKitTryInit resolves the frame ".png"
+suffix at load (b2kSheetHasFrame -- gotcha 24), scales the sheet to the slot width
+(b2kSheetFrameSize), pre-warms every face, and POOLS one bodiless b2kSpriteNew over
+each card slot; heUIShowCardIn swaps the pooled sprite's frame (b2kSpriteSetFrame)
+and shows it (hiding the flat field), heUIClearCards hides them between hands. Every
+kit call is guarded -- any hiccup falls back to the flat glyph card, never breaks a
+deal. New heProbeKit diagnostic (run it in the message box) reports Kit presence,
+the resolved atlas path + existence, loaded frame counts, the suffix, UI mode, and
+the pooled sprite count. Backs sheet is loaded + sized too (face-down is a follow-up).
+NEEDS AN OXT PASS to confirm sprite anchor/scale/z-order; degrades to flat if not.
+
 v0.12.2 -- auto-locate the card atlas. heKitTryInit now defaults the atlas + backs
 paths to assets/cards/ sitting NEXT TO the saved stack file (heStackFolder derives
 the folder from the stack's own filename), so dropping the assets folder beside the
@@ -149,7 +174,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.12.2"
+constant kHeVersion = "0.13.1"
 constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
@@ -249,6 +274,12 @@ local gHudDirty        -- HUD repaints only on change, max 4 Hz (playbook)
 local gHudTickOn
 local gFlipCtxA        -- per-sprite flip context locks (gotcha 19)
 local gAnimBusy
+-- kit-mode card rendering: gSlotCenter[slotName]->"x,y" (recorded as slots build),
+-- gCardSpr[slotName]->the Box2Dxt sprite's long id, gKitSuffix is "" or ".png" (the
+-- Kenney frame-name suffix as this sheet actually exposes it, resolved at load).
+local gSlotCenter
+local gCardSpr
+local gKitSuffix
 
 --------------------------------------------------------------------------
 -- lifecycle (house law H1: sessions bracket the stack's life)
@@ -4212,6 +4243,8 @@ command heMakeCardSlot pSlotName, pCenterX, pCenterY
    set the borderWidth of field pSlotName to 1
    set the borderColor of field pSlotName to "60,60,60"
    set the visible of field pSlotName to false
+   -- remember the centre so heKitTryInit can pool a card sprite over this slot
+   put pCenterX & comma & pCenterY into gSlotCenter[pSlotName]
 end heMakeCardSlot
 
 function heSuitGlyph pSuitVal
@@ -4297,48 +4330,95 @@ function heStackFolder
    return item 1 to -2 of tFile
 end heStackFolder
 
+function heSwapExt pPath, pNewExt
+   -- pPath with its trailing ".<ext>" replaced by pNewExt (e.g. ".xml"), so a .png
+   -- atlas path yields its sibling TextureAtlas .xml. Copied to a local before the
+   -- chunk (H6). A folder name containing a "." is a rare cosmetic edge, not a crash.
+   local tBase
+   put pPath into tBase
+   set the itemDelimiter to "."
+   if the number of items of tBase > 1 then
+      delete last item of tBase
+   end if
+   return tBase & pNewExt
+end heSwapExt
+
 command heKitTryInit
-   local tIdx, tKitErr, tBacksErr, tAtlasPath, tBacksPath, tDir
+   local tIdx, tKitErr, tBacksErr, tPng, tXml, tBackPng, tBackXml, tDir
+   local tSlot, tCtr, tSpr, tFrameW
    put "flat" into gUIMode
    put 0 into gAnimBusy
+   put empty into gCardSpr
+   put empty into gKitSuffix
    if not heHasKit() then
       exit heKitTryInit
    end if
-   -- locate the card atlas. An explicit uHeAtlasPath (or uHeBacksPath) custom
-   -- property always wins; otherwise DEFAULT to assets/cards/ sitting right next to
-   -- the saved stack file -- so "drop the assets folder beside the stack" just works,
-   -- no path to configure. A pasted, unsaved stack has no folder: set the property or
-   -- save the stack first, else kit mode stays on the flat cards.
-   put the uHeAtlasPath of this stack into tAtlasPath
-   put the uHeBacksPath of this stack into tBacksPath
+   -- resolve the atlas PNG path. b2kSheetLoadAtlas takes the PNG (its sibling .xml is
+   -- the optional 2nd arg). An explicit uHeAtlasPath/uHeBacksPath override wins (a .xml
+   -- override is accepted and swapped to .png); otherwise default to assets/cards/ NEXT
+   -- TO the saved stack -- so dropping the assets folder beside the stack just works.
+   -- A pasted, unsaved stack has no folder, so it stays on the flat cards.
+   put the uHeAtlasPath of this stack into tPng
+   put the uHeBacksPath of this stack into tBackPng
    put heStackFolder() into tDir
-   if tAtlasPath is empty and tDir is not empty then
-      put tDir & "/assets/cards/playingCards.xml" into tAtlasPath
+   if tPng is empty and tDir is not empty then
+      put tDir & "/assets/cards/playingCards.png" into tPng
    end if
-   if tBacksPath is empty and tDir is not empty then
-      put tDir & "/assets/cards/playingCardBacks.xml" into tBacksPath
+   if tBackPng is empty and tDir is not empty then
+      put tDir & "/assets/cards/playingCardBacks.png" into tBackPng
    end if
-   if tAtlasPath is empty or there is not a file (tAtlasPath) then
+   if tPng ends with ".xml" then
+      put heSwapExt(tPng, ".png") into tPng
+   end if
+   if tBackPng ends with ".xml" then
+      put heSwapExt(tBackPng, ".png") into tBackPng
+   end if
+   if tPng is empty or there is not a file (tPng) then
       exit heKitTryInit
    end if
+   put heSwapExt(tPng, ".xml") into tXml
+   put heSwapExt(tBackPng, ".xml") into tBackXml
    try
       start using stack "box2dxt-kit"
-      b2kSheetLoadAtlas "heCards", tAtlasPath
-      -- pre-warm every face by its Kenney frame name (card<Suit><Rank>, e.g.
-      -- "cardSpadesA"). The vendored atlas (assets/cards, CC0) carries the ".png"
-      -- suffix on its frame names; if Box2Dxt strips it on load (gotcha 24 -- check
-      -- per sheet), drop the & ".png" here. An OXT pass confirms which form the sheet
-      -- exposes.
+      set the itemDelimiter to comma
+      -- persist the sheets: cards never change, so a saved stack carries the sliced
+      -- art and any teardown reloads it as a no-op (Kit guidance).
+      b2kSheetPersist true
+      b2kSheetLoadAtlas "heCards", tPng, tXml
+      -- Kenney frames are card<Suit><Rank>; some atlas loaders keep the ".png" on the
+      -- frame key and some strip it (gotcha 24) -- ask the sheet which it is.
+      if b2kSheetHasFrame("heCards", "cardSpadesA.png") then
+         put ".png" into gKitSuffix
+      else
+         put empty into gKitSuffix
+      end if
+      -- scale the sheet so a Kenney card (140 px wide) displays at the slot width,
+      -- then pre-warm every face (a lazy first slice costs ~250 ms mid-hand).
+      put item 1 of b2kSheetFrameSize("heCards", "cardSpadesA" & gKitSuffix) into tFrameW
+      if tFrameW is not a number or tFrameW is 0 then
+         put 140 into tFrameW
+      end if
+      b2kSheetScale "heCards", kHeCardW / tFrameW
       repeat with tIdx = 1 to 52
-         b2kSheetEnsureIcon "heCards", heKenneyFrame(tIdx) & ".png"
+         b2kSheetEnsureIcon "heCards", heKenneyFrame(tIdx) & gKitSuffix
       end repeat
-      -- the face sheet has no back; Kenney ships backs separately. Load the backs
-      -- atlas as its own sheet and pre-warm the one chosen back design. Guarded in
-      -- its own try so a missing/failed backs sheet never costs us the (loaded) faces.
+      -- pool ONE bodiless sprite over each card slot (pooled at build, never mid-hand);
+      -- heUIShowCardIn swaps its frame and shows it. Positioned at the slot centre.
+      repeat for each key tSlot in gSlotCenter
+         put gSlotCenter[tSlot] into tCtr
+         b2kSpriteNew "heCards", heKenneyFrame(1) & gKitSuffix, item 1 of tCtr, item 2 of tCtr
+         put the result into tSpr
+         b2kSpriteMoveTo tSpr, item 1 of tCtr, item 2 of tCtr
+         set the visible of tSpr to false
+         put tSpr into gCardSpr[tSlot]
+      end repeat
+      -- the backs sheet (face-down cards): load + size + pre-warm the chosen back.
+      -- Guarded so a missing/failed backs sheet never costs us the loaded faces.
       try
-         if tBacksPath is not empty and there is a file (tBacksPath) then
-            b2kSheetLoadAtlas "heCardBacks", tBacksPath
-            b2kSheetEnsureIcon "heCardBacks", kHeCardBackFrame & ".png"
+         if tBackPng is not empty and there is a file (tBackPng) then
+            b2kSheetLoadAtlas "heCardBacks", tBackPng, tBackXml
+            b2kSheetScale "heCardBacks", kHeCardW / tFrameW
+            b2kSheetEnsureIcon "heCardBacks", kHeCardBackFrame & gKitSuffix
          end if
       catch tBacksErr
       end try
@@ -4347,6 +4427,92 @@ command heKitTryInit
       put "flat" into gUIMode
    end try
 end heKitTryInit
+
+command heProbeKit
+   -- diagnostic (run in the message box): is kit-mode card art wired up? Does LIVE
+   -- checks (not the cached heHasKit -- you may have just added the Kit), so it always
+   -- reflects the current state. Names the exact gap and what to do about it.
+   local tOut, tDir, tPng, tErr, tHasStack, tHandlers
+   put "holde-em kit probe  stack v" & kHeVersion & return & return into tOut
+   -- 1. is the Kit reachable? Two ways: a loaded stack named "box2dxt-kit" (the normal
+   --    install), OR the b2k* handlers already on the message path.
+   put (there is a stack "box2dxt-kit") into tHasStack
+   put "false" into tHandlers
+   -- b2kSheetFrames on an unknown sheet returns 0 (no throw) IF the Kit handlers are
+   -- on the message path; if the Kit is absent the call throws "can't find handler".
+   try
+      get b2kSheetFrames("__he_probe__")
+      put "true" into tHandlers
+   catch tErr
+   end try
+   put "stack \"box2dxt-kit\" loaded: " & tHasStack & return after tOut
+   put "b2k* handlers on the message path: " & tHandlers & return after tOut
+   if tHasStack is false and tHandlers is false then
+      put return & "==> The Box2Dxt Kit is NOT loaded. It is a SEPARATE stack named" & return after tOut
+      put "    \"box2dxt-kit\" -- open its box2dxt-kit.livecodescript in OXT (File > Open" & return after tOut
+      put "    Stack), do not paste it into this script. Then run heKitReload." & return after tOut
+      put tOut
+      return tOut
+   end if
+   -- 2. the atlas
+   put the uHeAtlasPath of this stack into tPng
+   if tPng is empty then
+      put heStackFolder() into tDir
+      if tDir is empty then
+         put "atlas path: this stack is UNSAVED (no folder) and uHeAtlasPath is unset --" & return after tOut
+         put "  save the stack to a file with assets/cards next to it, or set uHeAtlasPath." & return after tOut
+      else
+         put tDir & "/assets/cards/playingCards.png" into tPng
+      end if
+   end if
+   if tPng is not empty then
+      if tPng ends with ".xml" then
+         put heSwapExt(tPng, ".png") into tPng
+      end if
+      put "atlas PNG: " & tPng & return after tOut
+      put "  file exists: " & (there is a file (tPng)) & return after tOut
+   end if
+   -- 3. what the last heKitTryInit achieved
+   put "current UI mode: " & gUIMode & "   frame suffix: '" & gKitSuffix & "'" & return after tOut
+   put "card sprites pooled: " & the number of lines of the keys of gCardSpr & return after tOut
+   try
+      put "heCards frames loaded: " & b2kSheetFrames("heCards") after tOut
+      put "   heCardBacks: " & b2kSheetFrames("heCardBacks") & return after tOut
+   catch tErr
+      put "sheets: not loaded yet" & return after tOut
+   end try
+   if gUIMode is not "kit" then
+      put return & "==> kit mode is OFF. If the checks above look right, run heKitReload" & return after tOut
+      put "    to (re)build the card sprites, then run heProbeKit again." & return after tOut
+   else
+      put return & "==> kit mode is ON. If cards still look flat, it is a sprite anchor/" & return after tOut
+      put "    scale/z-order detail -- send me this probe output and a screenshot." & return after tOut
+   end if
+   put tOut
+   return tOut
+end heProbeKit
+
+command heKitReload
+   -- force a fresh Kit probe + card-sprite rebuild -- run this in the message box after
+   -- loading the Box2Dxt Kit, saving the stack, or moving the assets. Clears the cached
+   -- extension probe, removes any pooled sprites, then re-runs heKitTryInit and reports.
+   local tSlot, tSpr, tRmErr
+   put empty into gHasKitChk
+   if gCardSpr is an array then
+      repeat for each key tSlot in gCardSpr
+         put gCardSpr[tSlot] into tSpr
+         try
+            b2kSpriteRemove tSpr
+         catch tRmErr
+         end try
+      end repeat
+   end if
+   put empty into gCardSpr
+   heKitTryInit
+   heUIClearCards
+   put "kit reload done -- UI mode is now: " & gUIMode & \
+         "   (run heProbeKit for details)"
+end heKitReload
 
 on mouseUp
    local tWho, tSeatNum, tAmt, tCodeTxt
@@ -4795,6 +4961,22 @@ command heUIShowHole pSeatNum, pIdxPair
 end heUIShowHole
 
 command heUIShowCardIn pSlotName, pIdx
+   local tSpr, tShowErr
+   -- kit mode: swap this slot's pooled sprite to the card's Kenney frame and show it,
+   -- hiding the flat field beneath. Guarded so a kit hiccup falls back to the flat
+   -- glyph card and never breaks the deal.
+   if gUIMode is "kit" and gCardSpr[pSlotName] is not empty then
+      try
+         put gCardSpr[pSlotName] into tSpr
+         b2kSpriteSetFrame tSpr, heKenneyFrame(pIdx) & gKitSuffix
+         set the visible of tSpr to true
+         if there is a field pSlotName then
+            set the visible of field pSlotName to false
+         end if
+         exit heUIShowCardIn
+      catch tShowErr
+      end try
+   end if
    if there is not a field pSlotName then
       exit heUIShowCardIn
    end if
@@ -4878,7 +5060,14 @@ function heHandLabel pPacked
 end heHandLabel
 
 command heUIClearCards
-   local tSeatNum, tPos
+   local tSeatNum, tPos, tSlot, tSpr
+   -- kit mode: hide every pooled card sprite between hands
+   if gUIMode is "kit" then
+      repeat for each key tSlot in gCardSpr
+         put gCardSpr[tSlot] into tSpr
+         set the visible of tSpr to false
+      end repeat
+   end if
    repeat with tSeatNum = 1 to kHeDefaultSeats
       if there is a field ("heHole" & tSeatNum & "a") then
          set the visible of field ("heHole" & tSeatNum & "a") to false
