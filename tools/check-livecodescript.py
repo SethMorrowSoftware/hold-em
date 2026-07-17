@@ -15,7 +15,9 @@ embeds a library between sentinels).
 It checks every target for:
 
   1. Smart/curly quotes — U+2018/2019/201C/201D anywhere (even in a comment or
-     string) fail to compile in OXT. Must be zero.
+     string) fail to compile in OXT. Must be zero. Also backslash-escaped quotes
+     (``\\"``): xTalk has no string escapes, so a literal quote is the ``quote``
+     constant, concatenated — ``\\"`` breaks compilation.
   2. Handler balance — every ``on`` / ``command`` / ``function`` / ``getprop`` /
      ``setprop`` / ``before`` / ``after`` has a matching ``end <name>``.
   3. Control-structure balance — every block ``if … then`` / ``repeat`` /
@@ -185,6 +187,23 @@ def check_smart_quotes(text):
         if hits:
             bad.append(f"  L{i}: smart quote(s) {''.join(sorted(set(hits)))} — use straight ASCII")
     return bad
+
+
+def check_escaped_quotes(text):
+    r"""A backslash-escaped quote (\") -- xTalk/LiveCode has NO string escapes, so \"
+    is a line-continuation backslash followed by a string-terminating quote: the
+    string ends early and the rest becomes stray tokens (a compile error). A literal
+    double-quote inside a string is the `quote` constant, concatenated
+    (`"a " & quote & "b" & quote`). Comments are stripped first (via logical_lines),
+    so a \" inside a comment does not flag. This shipped once in heProbeKit."""
+    errors = []
+    for lineno, code in logical_lines(text):
+        if '\\"' in code:
+            errors.append(
+                f"  L{lineno}: backslash-escaped quote (\\\") -- xTalk has no string "
+                "escapes; a literal double-quote is the 'quote' constant, concatenated"
+            )
+    return errors
 
 
 def check_structure(text):
@@ -546,6 +565,7 @@ def main():
         rel = path.relative_to(ROOT)
         problems = []
         problems += check_smart_quotes(text)
+        problems += check_escaped_quotes(text)
         problems += check_structure(text)
         problems += check_dangling_else(text)
         problems += check_chunk_of_element(text)
