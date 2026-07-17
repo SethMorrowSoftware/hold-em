@@ -6,6 +6,19 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.13.4 -- bigger, more legible cards. The rendered cards read small/squished, so
+kHeCardW/kHeCardH grow 50x70 -> 62x84 (kept at the ~140:190 Kenney aspect so flat
+glyph cards and kit sprites match) and the 5-card board re-spaces to stay centred on
+the felt: kHeBoardDX 58 -> 72 (must stay > kHeCardW so cards never overlap), kHeBoardX0
+404 -> 368 (= 512 - 2*kHeBoardDX). Hole-card slots now straddle the seat centre by half
+a card + 2px (tSpotX +/- (kHeCardW div 2 + 2)) so they auto-space with the card size.
+Both render paths key off kHeCardW/kHeCardH already -- the flat slot rect (heMakeCardSlot)
+and the kit sheet scale (b2kSheetScale "heCards", kHeCardW / frameW) -- so one size change
+flows to both. kUIVersion bumped 7 -> 8 so an already-built (saved) stack rebuilds its
+chrome at the new size on next open; to hand-tune, edit kHeCardW/kHeCardH and set
+kHeBoardDX = kHeCardW + 10, kHeBoardX0 = 512 - 2*kHeBoardDX. Verified statically; needs an
+OXT pass to eyeball the final size.
+
 v0.13.3 -- detect the Kit when its handlers are on the message path (fixes kit mode
 staying OFF even with the Kit loaded). A user's heProbeKit showed the b2k* handlers
 present but stack "box2dxt-kit" not loaded under that name (merged into the script /
@@ -189,9 +202,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.13.3"
+constant kHeVersion = "0.13.4"
 constant kHeHarnessV = "28"
-constant kUIVersion = "7"
+constant kUIVersion = "8"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -255,10 +268,13 @@ constant kHeStackRect = "0,0,1024,690"
 constant kHeFeltRect = "40,48,984,566"
 constant kHeSeatSpots = "512,516;196,470;150,250;512,120;874,250;828,470"
 constant kHeBoardY = 300
-constant kHeBoardX0 = 404
-constant kHeBoardDX = 58
-constant kHeCardW = 50
-constant kHeCardH = 70
+-- board of 5 cards, centred on the felt (512): first centre = 512 - 2*kHeBoardDX.
+-- Card size is ~140:190 (the Kenney frame aspect) so flat glyph cards and kit
+-- sprites match; kHeBoardDX must stay > kHeCardW so the board never overlaps.
+constant kHeBoardX0 = 368
+constant kHeBoardDX = 72
+constant kHeCardW = 62
+constant kHeCardH = 84
 constant kHeHudMs = 250
 constant kHeTableCenter = "512,300"
 
@@ -3630,8 +3646,10 @@ command heBuildTable
       set the visible of graphic ("heSeatChip" & tSeatNum) to false
       heMakeLabel "heSeatBet" & tSeatNum, (tBetX - 26) & comma & (tBetY + 12) & comma & (tBetX + 26) & comma & (tBetY + 30), "", kHeWhite, 12
 
-      heMakeCardSlot "heHole" & tSeatNum & "a", tSpotX - 28, tSpotY - 40
-      heMakeCardSlot "heHole" & tSeatNum & "b", tSpotX + 28, tSpotY - 40
+      -- two hole cards straddling the seat centre; the offset scales with the card
+      -- width (half a card + a small gap) so they never overlap as the size changes
+      heMakeCardSlot "heHole" & tSeatNum & "a", tSpotX - (kHeCardW div 2 + 2), tSpotY - 40
+      heMakeCardSlot "heHole" & tSeatNum & "b", tSpotX + (kHeCardW div 2 + 2), tSpotY - 40
    end repeat
 
    create field "heDealerDisc"
