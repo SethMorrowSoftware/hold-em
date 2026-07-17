@@ -6,6 +6,15 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.13.1 -- kit setup debugging. heProbeKit now does LIVE checks (not the cached
+heHasKit) so it reflects the current state right after you load the Kit, reports
+whether the "box2dxt-kit" stack is loaded AND whether the b2k* handlers are on the
+message path, and names the exact gap + the fix (the Kit is a SEPARATE stack, not
+pasted into this script). New heKitReload clears the cached probe, removes pooled
+sprites, and re-runs heKitTryInit -- the message-box command to run after loading the
+Kit / saving the stack / moving the assets (heKitTryInit only runs at first build, so
+a freshly-added Kit needs this).
+
 v0.13.0 -- actually RENDER the Kenney card art in kit mode (against the real
 Box2Dxt kit API, read from the sibling repo -- not guessed). Two things were
 missing: (1) b2kSheetLoadAtlas takes the PNG path (the .xml is its optional 2nd
@@ -165,7 +174,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.13.0"
+constant kHeVersion = "0.13.1"
 constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
@@ -4420,22 +4429,38 @@ command heKitTryInit
 end heKitTryInit
 
 command heProbeKit
-   -- diagnostic (run in the message box): is kit-mode card art wired up? Reports the
-   -- Kit stack, the resolved atlas path + whether it exists, the loaded frame count,
-   -- the resolved frame suffix, the UI mode, and the pooled sprite count. Names any gap.
-   local tOut, tDir, tPng, tErr, tN
+   -- diagnostic (run in the message box): is kit-mode card art wired up? Does LIVE
+   -- checks (not the cached heHasKit -- you may have just added the Kit), so it always
+   -- reflects the current state. Names the exact gap and what to do about it.
+   local tOut, tDir, tPng, tErr, tHasStack, tHandlers
    put "holde-em kit probe  stack v" & kHeVersion & return & return into tOut
-   if not heHasKit() then
-      put "Kit stack 'box2dxt-kit': NOT found -- install Box2Dxt for card art." & return after tOut
+   -- 1. is the Kit reachable? Two ways: a loaded stack named "box2dxt-kit" (the normal
+   --    install), OR the b2k* handlers already on the message path.
+   put (there is a stack "box2dxt-kit") into tHasStack
+   put "false" into tHandlers
+   -- b2kSheetFrames on an unknown sheet returns 0 (no throw) IF the Kit handlers are
+   -- on the message path; if the Kit is absent the call throws "can't find handler".
+   try
+      get b2kSheetFrames("__he_probe__")
+      put "true" into tHandlers
+   catch tErr
+   end try
+   put "stack \"box2dxt-kit\" loaded: " & tHasStack & return after tOut
+   put "b2k* handlers on the message path: " & tHandlers & return after tOut
+   if tHasStack is false and tHandlers is false then
+      put return & "==> The Box2Dxt Kit is NOT loaded. It is a SEPARATE stack named" & return after tOut
+      put "    \"box2dxt-kit\" -- open its box2dxt-kit.livecodescript in OXT (File > Open" & return after tOut
+      put "    Stack), do not paste it into this script. Then run heKitReload." & return after tOut
       put tOut
       return tOut
    end if
-   put "Kit stack 'box2dxt-kit': present" & return after tOut
+   -- 2. the atlas
    put the uHeAtlasPath of this stack into tPng
    if tPng is empty then
       put heStackFolder() into tDir
       if tDir is empty then
-         put "atlas path: stack is UNSAVED and uHeAtlasPath is unset -- save the stack (assets/cards next to it) or set uHeAtlasPath." & return after tOut
+         put "atlas path: this stack is UNSAVED (no folder) and uHeAtlasPath is unset --" & return after tOut
+         put "  save the stack to a file with assets/cards next to it, or set uHeAtlasPath." & return after tOut
       else
          put tDir & "/assets/cards/playingCards.png" into tPng
       end if
@@ -4447,18 +4472,47 @@ command heProbeKit
       put "atlas PNG: " & tPng & return after tOut
       put "  file exists: " & (there is a file (tPng)) & return after tOut
    end if
-   put "UI mode: " & gUIMode & "   frame suffix: '" & gKitSuffix & "'" & return after tOut
-   try
-      put b2kSheetFrames("heCards") into tN
-      put "heCards frames loaded: " & tN after tOut
-      put "   heCardBacks frames: " & b2kSheetFrames("heCardBacks") & return after tOut
-   catch tErr
-      put "sheets: not loaded (" & tErr & ")" & return after tOut
-   end try
+   -- 3. what the last heKitTryInit achieved
+   put "current UI mode: " & gUIMode & "   frame suffix: '" & gKitSuffix & "'" & return after tOut
    put "card sprites pooled: " & the number of lines of the keys of gCardSpr & return after tOut
+   try
+      put "heCards frames loaded: " & b2kSheetFrames("heCards") after tOut
+      put "   heCardBacks: " & b2kSheetFrames("heCardBacks") & return after tOut
+   catch tErr
+      put "sheets: not loaded yet" & return after tOut
+   end try
+   if gUIMode is not "kit" then
+      put return & "==> kit mode is OFF. If the checks above look right, run heKitReload" & return after tOut
+      put "    to (re)build the card sprites, then run heProbeKit again." & return after tOut
+   else
+      put return & "==> kit mode is ON. If cards still look flat, it is a sprite anchor/" & return after tOut
+      put "    scale/z-order detail -- send me this probe output and a screenshot." & return after tOut
+   end if
    put tOut
    return tOut
 end heProbeKit
+
+command heKitReload
+   -- force a fresh Kit probe + card-sprite rebuild -- run this in the message box after
+   -- loading the Box2Dxt Kit, saving the stack, or moving the assets. Clears the cached
+   -- extension probe, removes any pooled sprites, then re-runs heKitTryInit and reports.
+   local tSlot, tSpr, tRmErr
+   put empty into gHasKitChk
+   if gCardSpr is an array then
+      repeat for each key tSlot in gCardSpr
+         put gCardSpr[tSlot] into tSpr
+         try
+            b2kSpriteRemove tSpr
+         catch tRmErr
+         end try
+      end repeat
+   end if
+   put empty into gCardSpr
+   heKitTryInit
+   heUIClearCards
+   put "kit reload done -- UI mode is now: " & gUIMode & \
+         "   (run heProbeKit for details)"
+end heKitReload
 
 on mouseUp
    local tWho, tSeatNum, tAmt, tCodeTxt
