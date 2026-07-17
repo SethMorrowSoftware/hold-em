@@ -6,6 +6,22 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.12.2 -- auto-locate the card atlas. heKitTryInit now defaults the atlas + backs
+paths to assets/cards/ sitting NEXT TO the saved stack file (heStackFolder derives
+the folder from the stack's own filename), so dropping the assets folder beside the
+stack just works with no path to configure. An explicit uHeAtlasPath/uHeBacksPath
+still overrides; an unsaved paste-and-run stack (no folder) needs the manual path or
+a one-time save. Placement documented in assets/cards/NOTICE.md.
+
+v0.12.1 -- card backs. Vendored the Kenney "Playing Cards Pack" card-back sheet
+(assets/cards/playingCardBacks.png + .xml, CC0; 15 designs blue/green/red x5) for
+face-down cards, alongside the faces. Added the kHeCardBackFrame constant (default
+"cardBack_red2") and a guarded backs-atlas load in heKitTryInit (via uHeBacksPath).
+tools/atlas-kat.py now also pins that the chosen back frame exists in the backs
+atlas and that all back rects fit the sheet. Note: Kenney's card collection has
+cards/backs/jokers/dice but NO poker chips -- chips stay procedural (a colored disc)
+unless a dedicated CC0 chip pack is added.
+
 v0.12.0 -- real card art (kit mode). Vendored the Kenney "Playing Cards Pack"
 spritesheet (assets/cards/playingCards.png + .xml, CC0) -- the 52-card TextureAtlas
 Box2Dxt's foreign-sheet loader parses. Added heKenneyFrame, mapping each internal
@@ -133,7 +149,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.12.0"
+constant kHeVersion = "0.12.2"
 constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
@@ -141,6 +157,10 @@ constant kUIVersion = "7"
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
 constant kHeRankChars = "23456789TJQKA"
 constant kHeSuitChars = "cdhs"
+-- kit-mode card back: which frame of the Kenney playingCardBacks atlas to draw for
+-- face-down cards (blue/green/red 1..5). Pinned present by tools/atlas-kat.py; the
+-- OXT pass can swap it once the real designs are visible.
+constant kHeCardBackFrame = "cardBack_red2"
 
 -- Park-Miller MINSTD: x' = 16807 * x mod (2^31 - 1). 16807 * (2^31-1) is
 -- about 3.6e13, well under 2^53, so every step is exact in a double.
@@ -4262,31 +4282,66 @@ command heMakeActionButton pBtnName, pLabelTxt, pLeftX
    set the label of button pBtnName to pLabelTxt
 end heMakeActionButton
 
+function heStackFolder
+   -- the folder that holds the SAVED stack file, so an assets/ folder sitting next
+   -- to the stack is found automatically. Empty when the stack was pasted into the
+   -- message box and never saved (there is no file to be relative to) -- then set
+   -- uHeAtlasPath/uHeBacksPath by hand, or just save the stack once. LiveCode reports
+   -- filenames with "/" separators on every platform, so item 1 to -2 is the folder.
+   local tFile
+   put the filename of this stack into tFile
+   if tFile is empty then
+      return ""
+   end if
+   set the itemDelimiter to "/"
+   return item 1 to -2 of tFile
+end heStackFolder
+
 command heKitTryInit
-   local tIdx, tKitErr
+   local tIdx, tKitErr, tBacksErr, tAtlasPath, tBacksPath, tDir
    put "flat" into gUIMode
    put 0 into gAnimBusy
    if not heHasKit() then
       exit heKitTryInit
    end if
-   if the uHeAtlasPath of this stack is empty then
-      exit heKitTryInit
+   -- locate the card atlas. An explicit uHeAtlasPath (or uHeBacksPath) custom
+   -- property always wins; otherwise DEFAULT to assets/cards/ sitting right next to
+   -- the saved stack file -- so "drop the assets folder beside the stack" just works,
+   -- no path to configure. A pasted, unsaved stack has no folder: set the property or
+   -- save the stack first, else kit mode stays on the flat cards.
+   put the uHeAtlasPath of this stack into tAtlasPath
+   put the uHeBacksPath of this stack into tBacksPath
+   put heStackFolder() into tDir
+   if tAtlasPath is empty and tDir is not empty then
+      put tDir & "/assets/cards/playingCards.xml" into tAtlasPath
    end if
-   if there is not a file (the uHeAtlasPath of this stack) then
+   if tBacksPath is empty and tDir is not empty then
+      put tDir & "/assets/cards/playingCardBacks.xml" into tBacksPath
+   end if
+   if tAtlasPath is empty or there is not a file (tAtlasPath) then
       exit heKitTryInit
    end if
    try
       start using stack "box2dxt-kit"
-      b2kSheetLoadAtlas "heCards", the uHeAtlasPath of this stack
+      b2kSheetLoadAtlas "heCards", tAtlasPath
       -- pre-warm every face by its Kenney frame name (card<Suit><Rank>, e.g.
       -- "cardSpadesA"). The vendored atlas (assets/cards, CC0) carries the ".png"
       -- suffix on its frame names; if Box2Dxt strips it on load (gotcha 24 -- check
       -- per sheet), drop the & ".png" here. An OXT pass confirms which form the sheet
-      -- exposes. Kenney's face sheet has NO card-back frame (the old "back" ensure
-      -- threw on it), so the back is drawn separately in kit mode -- a follow-up.
+      -- exposes.
       repeat with tIdx = 1 to 52
          b2kSheetEnsureIcon "heCards", heKenneyFrame(tIdx) & ".png"
       end repeat
+      -- the face sheet has no back; Kenney ships backs separately. Load the backs
+      -- atlas as its own sheet and pre-warm the one chosen back design. Guarded in
+      -- its own try so a missing/failed backs sheet never costs us the (loaded) faces.
+      try
+         if tBacksPath is not empty and there is a file (tBacksPath) then
+            b2kSheetLoadAtlas "heCardBacks", tBacksPath
+            b2kSheetEnsureIcon "heCardBacks", kHeCardBackFrame & ".png"
+         end if
+      catch tBacksErr
+      end try
       put "kit" into gUIMode
    catch tKitErr
       put "flat" into gUIMode

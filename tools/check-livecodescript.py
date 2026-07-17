@@ -102,10 +102,63 @@ def strip_strings(code):
     return "".join(out)
 
 
+def strip_block_comments(text):
+    """Blank ``/* ... */`` block comments (LiveCode supports them), preserving
+    newlines so line numbers stay aligned. Respects string literals and ``--``
+    line comments: a ``/*`` inside either is not a block-comment start. Without
+    this, prose in the file's header ``/* ... */`` block is scanned as code -- a
+    constant name or a ``name (`` in a comment then false-positives the
+    gotcha-29 / command-as-function checks. Returns text with block-comment
+    characters replaced by spaces (newlines kept)."""
+    out = []
+    i, n = 0, len(text)
+    in_string = in_block = in_line = False
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if c == "\n":
+            in_line = False
+            out.append("\n")
+            i += 1
+        elif in_block:
+            if c == "*" and nxt == "/":
+                in_block = False
+                out.append("  ")
+                i += 2
+            else:
+                out.append(" ")
+                i += 1
+        elif in_line:                      # inside a -- comment: leave as-is for strip_comment
+            out.append(c)
+            i += 1
+        elif in_string:
+            out.append(c)
+            if c == '"':
+                in_string = False
+            i += 1
+        elif c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+        elif c == "-" and nxt == "-":      # -- line comment: keep, per-line strip_comment removes it
+            in_line = True
+            out.append(c)
+            i += 1
+        elif c == "/" and nxt == "*":
+            in_block = True
+            out.append("  ")
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def logical_lines(text):
     """Yield ``(lineno, code)`` logical lines: comments stripped, and physical
     lines joined across a trailing ``\\`` continuation. ``lineno`` is the first
     physical line of the logical line, for reporting."""
+    text = strip_block_comments(text)
     out = []
     buf = ""
     start = None
