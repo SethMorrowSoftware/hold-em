@@ -6,6 +6,15 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.13.3 -- detect the Kit when its handlers are on the message path (fixes kit mode
+staying OFF even with the Kit loaded). A user's heProbeKit showed the b2k* handlers
+present but stack "box2dxt-kit" not loaded under that name (merged into the script /
+differently-named host) -- yet heHasKit required the named stack and heKitTryInit did
+an unconditional start using stack "box2dxt-kit" that would throw. heHasKit now also
+accepts the Kit when b2kSheetFrames responds on the message path, and heKitTryInit only
+start-uses the named stack when it actually exists. So after heKitReload the atlas
+loads and the card sprites pool.
+
 v0.13.2 -- fix a compile error in heProbeKit (v0.13.1): it used backslash-escaped
 quotes (\"box2dxt-kit\") to print quotes, but xTalk has NO string escapes -- \" is a
 continuation backslash plus a string-terminating quote, which breaks compilation.
@@ -180,7 +189,7 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.13.2"
+constant kHeVersion = "0.13.3"
 constant kHeHarnessV = "28"
 constant kUIVersion = "7"
 
@@ -3510,11 +3519,22 @@ end heNextHandTick
 --------------------------------------------------------------------------
 
 function heHasKit
+   -- the Box2Dxt Kit counts as present if its stack is loaded UNDER THAT NAME, or if
+   -- its b2k* handlers are simply on the message path already -- merged into this stack's
+   -- script, or hosted by a differently-named stack. b2kSheetFrames on an unknown sheet
+   -- returns 0 without throwing when the handler exists; it throws "can't find handler"
+   -- when the Kit is absent. (Probe cached in gHasKitChk; heKitReload clears it.)
+   local tProbeErr
    if gHasKitChk is empty then
+      put "false" into gHasKitChk
       if there is a stack "box2dxt-kit" then
          put "true" into gHasKitChk
       else
-         put "false" into gHasKitChk
+         try
+            get b2kSheetFrames("__he_probe__")
+            put "true" into gHasKitChk
+         catch tProbeErr
+         end try
       end if
    end if
    return gHasKitChk is "true"
@@ -4385,7 +4405,12 @@ command heKitTryInit
    put heSwapExt(tPng, ".xml") into tXml
    put heSwapExt(tBackPng, ".xml") into tBackXml
    try
-      start using stack "box2dxt-kit"
+      -- put the Kit's handlers on the message path IF it is a separately-loaded stack;
+      -- if they are already here (merged in / differently-named host), skip it -- a
+      -- start-using of a non-existent stack would throw and drop us back to flat.
+      if there is a stack "box2dxt-kit" then
+         start using stack "box2dxt-kit"
+      end if
       set the itemDelimiter to comma
       -- persist the sheets: cards never change, so a saved stack carries the sliced
       -- art and any teardown reloads it as a no-op (Kit guidance).
