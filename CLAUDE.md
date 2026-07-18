@@ -331,6 +331,15 @@ House additions for THIS repo (earned in the siblings, restated as law here):
   instead of reporting). Every `catch <var>` must have a matching `local … <var>` (the
   family pattern; `heTableNew` does it right). The static gate flags any undeclared catch
   variable (check 9).
+- **H9. No parenthesised dynamic property names.** `the (expr) of obj` /
+  `set the (expr) of obj to ...` — building a property NAME at runtime — is not
+  portable xTalk: property names are compile-time tokens, and the computed-name form
+  is engine-shaky on OXT. It shipped once (v0.14.0 stored avatar paths in per-seat
+  props named `"uHeAvatarPath" & N`) and was caught in the pre-OXT-pass re-audit
+  (v0.14.1). The portable shape is ONE property holding a line-/item-indexed list
+  (`uHeAvatarPaths`, line N = seat N — paths cannot contain a newline, so the index
+  is safe); copy the property into a local before chunking it (H6 corollary). The
+  static gate flags any `the (` in code (check 11).
 
 ## The single-threaded performance playbook (condensed for a card game)
 
