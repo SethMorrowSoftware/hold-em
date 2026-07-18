@@ -6,6 +6,33 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.14.0 -- UI polish pack (local, hotseat-first -- online avatar/logo delivery to
+peers is the next increment). Four additions, all pure-engine, gated behind kUIVersion
+9 so a saved v8 stack rebuilds its chrome on next open:
+  * SEAT AVATARS -- each seat gets a round portrait at the left of its name plate.
+    Click it to pick an image (answer file -> the filename of an image control, so no
+    image BINARY ever crosses into script -- H3/H6 safe); the path persists in a
+    uHeAvatarPathN custom prop. No picture -> a coloured disc with the seat's initial,
+    so an unset seat still looks intentional. heSeatAvatarRender picks image vs initial;
+    gAvatarOn[seat] caches which so the 4Hz HUD toggles visibility without re-loading
+    the file. Three stacked controls per seat: disc (heSeatAvN), initial (heSeatAvTxN),
+    image (heSeatAvImgN).
+  * TABLE LOGO -- the host picks a centre-table watermark in Settings (new "Table Logo"
+    button). One image "heTableLogo" created BELOW the pot/board so it never hides them,
+    faint via blendLevel; path in uHeTableLogoPath. heTableLogoRender loads it.
+  * ACTING-SEAT GLOW -- the acting seat's panel gains a gold ring: a constant 2px
+    outline whose foregroundColor is the ring when acting and the panel colour (so it
+    disappears) otherwise. Keeps the existing bg-colour highlight underneath, so worst
+    case it still highlights.
+  * BET SLIDER -- a horizontal scrollbar above the action row; drag to set the raise-to
+    between the minimum legal raise and all-in, feeding the heAmount box the Bet/Raise
+    buttons read. Shown only on a bet/raise turn (heUIPromptToAct), synced by the
+    Min/1/2/Pot quick buttons. scrollbarDrag updates the amount live.
+All four are visual/timed and need an OXT pass to eyeball (avatar round-crop of a picked
+image wants an alpha mask; logo scale/blend; glow ring stroke; slider placement in the
+thin margin). Every path degrades gracefully -- a missing file / hidden control never
+breaks a deal. Static gates + KATs green.
+
 v0.13.4 -- bigger, more legible cards. The rendered cards read small/squished, so
 kHeCardW/kHeCardH grow 50x70 -> 62x84 (kept at the ~140:190 Kenney aspect so flat
 glyph cards and kit sprites match) and the 5-card board re-spaces to stay centred on
@@ -202,9 +229,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.13.4"
+constant kHeVersion = "0.14.0"
 constant kHeHarnessV = "28"
-constant kUIVersion = "8"
+constant kUIVersion = "9"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -290,6 +317,15 @@ constant kHeInk = "24,24,24"
 constant kHeRed = "196,36,36"
 constant kHeWhite = "246,246,246"
 
+-- v0.14.0 UI pack: avatars, table logo, acting-seat glow, bet slider. Sizes are
+-- literal (gotcha 6); all placement geometry derives at runtime in heBuildTable.
+constant kHeAvatarSize = 46            -- seat portrait diameter (px); fits the name plate
+constant kHeLogoBox = 240              -- table-centre host-logo square (px)
+constant kHeLogoDim = 60               -- logo blendLevel (0 opaque..100 gone): a faint watermark
+constant kHeGlowColor = "248,224,120"  -- acting-seat ring colour
+-- six seat-portrait fallback fill colours (initials disc), one per seat, ";"-separated
+constant kHeAvatarFills = "196,58,58;58,120,196;72,168,96;198,150,44;150,96,196;54,170,180"
+
 --------------------------------------------------------------------------
 -- script-local state (g prefix per the family convention)
 --------------------------------------------------------------------------
@@ -311,6 +347,9 @@ local gAnimBusy
 local gSlotCenter
 local gCardSpr
 local gKitSuffix
+-- v0.14.0 UI pack: gAvatarOn[seat] caches whether a seat shows a custom image ("true")
+-- or the initial fallback, so the 4Hz HUD toggles visibility without re-loading files.
+local gAvatarOn
 
 --------------------------------------------------------------------------
 -- lifecycle (house law H1: sessions bracket the stack's life)
@@ -3581,6 +3620,16 @@ command heBuildTable
    set the backgroundColor of graphic "heFelt" to kHeFeltColor
    set the opaque of graphic "heFelt" to true
 
+   -- host table logo: a faint centred watermark, created HERE (before the pot and
+   -- board) so it sits UNDERNEATH them and never hides a card or the pot. Hidden until
+   -- the host picks one in Settings; heTableLogoRender loads it. NEEDS AN OXT PASS.
+   create image "heTableLogo"
+   set the rect of image "heTableLogo" to \
+         (512 - kHeLogoBox div 2) & comma & (300 - kHeLogoBox div 2) & comma \
+         & (512 + kHeLogoBox div 2) & comma & (300 + kHeLogoBox div 2)
+   set the blendLevel of image "heTableLogo" to kHeLogoDim
+   set the visible of image "heTableLogo" to false
+
    -- header + pot
    create field "heHeader"
    set the rect of field "heHeader" to "40,10,884,38"
@@ -3629,9 +3678,17 @@ command heBuildTable
             (tSpotX - 76) & comma & (tSpotY - 4) & comma & (tSpotX + 76) & comma & (tSpotY + 54)
       set the backgroundColor of graphic ("hePanel" & tSeatNum) to kHePanelColor
       set the opaque of graphic ("hePanel" & tSeatNum) to true
+      -- acting-seat glow: a constant 2px outline whose colour is the ring (gold) when
+      -- acting and the panel colour (so it vanishes) otherwise -- toggled in heSeatFace.
+      set the lineSize of graphic ("hePanel" & tSeatNum) to 2
+      set the foregroundColor of graphic ("hePanel" & tSeatNum) to kHePanelColor
 
-      heMakeLabel "heSeatName" & tSeatNum, (tSpotX - 72) & comma & (tSpotY - 2) & comma & (tSpotX + 72) & comma & (tSpotY + 22), tName, kHeWhite, 14
-      heMakeLabel "heSeatStack" & tSeatNum, (tSpotX - 72) & comma & (tSpotY + 24) & comma & (tSpotX + 72) & comma & (tSpotY + 50), "", kHeGoldColor, 15
+      -- seat portrait at the left of the plate: disc + initial fallback + picked image.
+      -- heSeatAvatarRender chooses which to show; click any of the three to re-pick.
+      heMakeAvatar tSeatNum, tSpotX - 52, tSpotY + 25
+
+      heMakeLabel "heSeatName" & tSeatNum, (tSpotX - 24) & comma & (tSpotY - 2) & comma & (tSpotX + 72) & comma & (tSpotY + 22), tName, kHeWhite, 14
+      heMakeLabel "heSeatStack" & tSeatNum, (tSpotX - 24) & comma & (tSpotY + 24) & comma & (tSpotX + 72) & comma & (tSpotY + 50), "", kHeGoldColor, 15
       heMakeLabel "heSeatBadge" & tSeatNum, (tSpotX + 20) & comma & (tSpotY - 26) & comma & (tSpotX + 76) & comma & (tSpotY - 6), "", kHeInk, 11
       heMakeLabel "heSeatState" & tSeatNum, (tSpotX - 54) & comma & (tSpotY - 74) & comma & (tSpotX + 54) & comma & (tSpotY - 54), "", kHeGoldColor, 12
 
@@ -3651,6 +3708,12 @@ command heBuildTable
       heMakeCardSlot "heHole" & tSeatNum & "a", tSpotX - (kHeCardW div 2 + 2), tSpotY - 40
       heMakeCardSlot "heHole" & tSeatNum & "b", tSpotX + (kHeCardW div 2 + 2), tSpotY - 40
    end repeat
+
+   -- paint each seat portrait (custom image or coloured initial disc) + the host logo
+   repeat with tSeatNum = 1 to kHeDefaultSeats
+      heSeatAvatarRender tSeatNum
+   end repeat
+   heTableLogoRender
 
    create field "heDealerDisc"
    set the rect of field "heDealerDisc" to "0,0,26,26"
@@ -3681,6 +3744,12 @@ command heBuildTable
    set the rect of field "heAmount" to "528,596,600,620"
    set the textAlign of field "heAmount" to "center"
    set the text of field "heAmount" to "0"
+   -- bet-sizing slider: drag to set the raise-to between the minimum legal raise and
+   -- all-in; feeds the heAmount box (the Bet/Raise buttons read that). Sits in the thin
+   -- margin above the action row. Shown only on a bet/raise turn (heUIPromptToAct).
+   create scrollbar "heBetSlider"
+   set the rect of scrollbar "heBetSlider" to "528,575,1004,591"
+   set the visible of scrollbar "heBetSlider" to false
    heMakeActionButton "heBtnMin", "Min", 608
    heMakeActionButton "heBtnHalf", "1/2 Pot", 688
    heMakeActionButton "heBtnPot", "Pot", 768
@@ -3860,6 +3929,10 @@ command heBuildSettings
    create button "heBtnSetCancel"
    set the rect of button "heBtnSetCancel" to "592,502,792,540"
    set the label of button "heBtnSetCancel" to "Cancel"
+   -- host picks a centre-table logo image (any format the engine reads); heTableLogoPick
+   create button "heBtnSetLogo"
+   set the rect of button "heBtnSetLogo" to "482,502,582,540"
+   set the label of button "heBtnSetLogo" to "Table Logo"
 
    heSettingsHide
 end heBuildSettings
@@ -3893,7 +3966,7 @@ command heSettingsSetVisible pOn
    put "heSetTitle,heSetHint,heSetLevelInfo,heSetStackLbl,heSetSBLbl,heSetBBLbl," \
          & "heSetAnteLbl,heSetSeatsLbl,heSetLevelLbl,heSetIntervalLbl,heSetSpeedLbl," \
          & "heSetStack,heSetSB,heSetBB,heSetAnte,heSetSeats,heSetInterval" into tFields
-   put "heBtnSetLevel,heBtnSetSpeed,heBtnSetApply,heBtnSetCancel" into tButtons
+   put "heBtnSetLevel,heBtnSetSpeed,heBtnSetApply,heBtnSetCancel,heBtnSetLogo" into tButtons
    repeat for each item tNm in tFields
       if there is a field tNm then
          set the visible of field tNm to pOn
@@ -4359,6 +4432,168 @@ command heMakeActionButton pBtnName, pLabelTxt, pLeftX
    set the label of button pBtnName to pLabelTxt
 end heMakeActionButton
 
+--------------------------------------------------------------------------
+-- v0.14.0 UI pack: seat avatars, host table logo, bet slider (all local).
+-- Every path is guarded so a missing file or hidden control never breaks a
+-- deal; the visual details (round crop, scale, blend, placement) are what an
+-- OXT pass tunes. No image binary ever crosses into script (H3/H6): we only
+-- ever set "the filename" of an image control to a plain path string.
+--------------------------------------------------------------------------
+
+command heMakeAvatar pSeatNum, pCx, pCy
+   -- three stacked controls at (pCx,pCy): the disc, the initial fallback, the image
+   local tRad, tRect
+   put kHeAvatarSize div 2 into tRad
+   put (pCx - tRad) & comma & (pCy - tRad) & comma & (pCx + tRad) & comma & (pCy + tRad) into tRect
+   create graphic ("heSeatAv" & pSeatNum)
+   set the style of graphic ("heSeatAv" & pSeatNum) to "oval"
+   set the rect of graphic ("heSeatAv" & pSeatNum) to tRect
+   set the opaque of graphic ("heSeatAv" & pSeatNum) to true
+   set the lineSize of graphic ("heSeatAv" & pSeatNum) to 2
+   set the foregroundColor of graphic ("heSeatAv" & pSeatNum) to kHeGoldColor
+   heMakeLabel "heSeatAvTx" & pSeatNum, tRect, "", kHeWhite, 20
+   set the textStyle of field ("heSeatAvTx" & pSeatNum) to "bold"
+   create image ("heSeatAvImg" & pSeatNum)
+   set the rect of image ("heSeatAvImg" & pSeatNum) to tRect
+   set the visible of image ("heSeatAvImg" & pSeatNum) to false
+end heMakeAvatar
+
+command heSeatAvatarRender pSeatNum
+   -- choose picked-image vs coloured-initial for one seat; caches the choice in
+   -- gAvatarOn so heSeatChromeVisible (the 4Hz hot path) never reloads the file
+   local tPath, tName, tInitial, tFill
+   set the itemDelimiter to ";"
+   put item pSeatNum of kHeAvatarFills into tFill
+   set the itemDelimiter to comma
+   if there is a graphic ("heSeatAv" & pSeatNum) then
+      set the backgroundColor of graphic ("heSeatAv" & pSeatNum) to tFill
+   end if
+   put the ("uHeAvatarPath" & pSeatNum) of this stack into tPath
+   if tPath is not empty and there is a file tPath then
+      put "true" into gAvatarOn[pSeatNum]
+      if there is an image ("heSeatAvImg" & pSeatNum) then
+         set the filename of image ("heSeatAvImg" & pSeatNum) to tPath
+         if there is a graphic ("heSeatAv" & pSeatNum) then
+            set the rect of image ("heSeatAvImg" & pSeatNum) to \
+                  the rect of graphic ("heSeatAv" & pSeatNum)
+         end if
+         set the visible of image ("heSeatAvImg" & pSeatNum) to true
+      end if
+      if there is a field ("heSeatAvTx" & pSeatNum) then
+         set the visible of field ("heSeatAvTx" & pSeatNum) to false
+      end if
+   else
+      put "false" into gAvatarOn[pSeatNum]
+      if there is an image ("heSeatAvImg" & pSeatNum) then
+         set the visible of image ("heSeatAvImg" & pSeatNum) to false
+      end if
+      put item pSeatNum of kHeSeatNames into tName
+      put toUpper(char 1 of tName) into tInitial
+      if there is a field ("heSeatAvTx" & pSeatNum) then
+         set the text of field ("heSeatAvTx" & pSeatNum) to tInitial
+         set the visible of field ("heSeatAvTx" & pSeatNum) to true
+      end if
+   end if
+end heSeatAvatarRender
+
+command heSeatAvatarPick pSeatNum
+   local tFile, tPropNm, tName, tPrompt
+   set the itemDelimiter to comma
+   put item pSeatNum of kHeSeatNames into tName
+   put "Choose an avatar image for " & tName into tPrompt
+   answer file tPrompt with type "Images|png,jpg,jpeg,gif,bmp"
+   put it into tFile
+   if tFile is empty then
+      exit heSeatAvatarPick   -- cancelled
+   end if
+   put "uHeAvatarPath" & pSeatNum into tPropNm
+   set the (tPropNm) of this stack to tFile
+   heSeatAvatarRender pSeatNum
+   heUISetStatus tName && "portrait updated."
+end heSeatAvatarPick
+
+command heTableLogoPick
+   local tFile
+   answer file "Choose a table logo image" with type "Images|png,jpg,jpeg,gif,bmp"
+   put it into tFile
+   if tFile is empty then
+      exit heTableLogoPick   -- cancelled
+   end if
+   set the uHeTableLogoPath of this stack to tFile
+   heTableLogoRender
+   heUISetStatus "Table logo updated."
+end heTableLogoPick
+
+command heTableLogoRender
+   local tPath
+   if there is not an image "heTableLogo" then
+      exit heTableLogoRender
+   end if
+   put the uHeTableLogoPath of this stack into tPath
+   if tPath is not empty and there is a file tPath then
+      set the filename of image "heTableLogo" to tPath
+      set the rect of image "heTableLogo" to \
+            (512 - kHeLogoBox div 2) & comma & (300 - kHeLogoBox div 2) & comma \
+            & (512 + kHeLogoBox div 2) & comma & (300 + kHeLogoBox div 2)
+      set the blendLevel of image "heTableLogo" to kHeLogoDim
+      set the visible of image "heTableLogo" to true
+   else
+      set the visible of image "heTableLogo" to false
+   end if
+end heTableLogoRender
+
+command heBetSliderShow pMinTo, pMaxTo
+   if there is not a scrollbar "heBetSlider" then
+      exit heBetSliderShow
+   end if
+   if pMaxTo <= pMinTo then
+      -- nothing to slide (only an all-in is available): hide it
+      set the visible of scrollbar "heBetSlider" to false
+      exit heBetSliderShow
+   end if
+   set the startValue of scrollbar "heBetSlider" to pMinTo
+   set the endValue of scrollbar "heBetSlider" to pMaxTo
+   set the thumbPosition of scrollbar "heBetSlider" to pMinTo
+   set the visible of scrollbar "heBetSlider" to true
+end heBetSliderShow
+
+command heBetSliderHide
+   if there is a scrollbar "heBetSlider" then
+      set the visible of scrollbar "heBetSlider" to false
+   end if
+end heBetSliderHide
+
+command heBetSliderSync
+   -- move the thumb to match the amount box (after a Min/1/2/Pot button), clamped
+   local tVal
+   if there is not a scrollbar "heBetSlider" then
+      exit heBetSliderSync
+   end if
+   if not the visible of scrollbar "heBetSlider" then
+      exit heBetSliderSync
+   end if
+   put word 1 of the text of field "heAmount" into tVal
+   if tVal is not a number then
+      exit heBetSliderSync
+   end if
+   if tVal < the startValue of scrollbar "heBetSlider" then
+      put the startValue of scrollbar "heBetSlider" into tVal
+   end if
+   if tVal > the endValue of scrollbar "heBetSlider" then
+      put the endValue of scrollbar "heBetSlider" into tVal
+   end if
+   set the thumbPosition of scrollbar "heBetSlider" to tVal
+end heBetSliderSync
+
+on scrollbarDrag pNewPos
+   -- the bet slider feeds the amount box live; any other scrollbar passes through
+   if the short name of the target is "heBetSlider" then
+      set the text of field "heAmount" to round(the thumbPosition of the target)
+      exit scrollbarDrag
+   end if
+   pass scrollbarDrag
+end scrollbarDrag
+
 function heStackFolder
    -- the folder that holds the SAVED stack file, so an assets/ folder sitting next
    -- to the stack is found automatically. Empty when the stack was pasted into the
@@ -4629,9 +4864,19 @@ on mouseUp
       case "heBtnSetCancel"
          heSettingsHide
          exit mouseUp
+      case "heBtnSetLogo"
+         heTableLogoPick
+         exit mouseUp
    end switch
    -- while an overlay is up, the table/action buttons are inert
    if heLobbyVisible() or heHistVisible() or heSettingsVisible() then
+      exit mouseUp
+   end if
+   -- clicking a seat portrait (disc, initial, or picked image) re-picks that avatar;
+   -- allowed any time (not just on your turn), so route it before the phase gate
+   if tWho begins with "heSeatAv" then
+      put the last char of tWho into tSeatNum
+      heSeatAvatarPick tSeatNum
       exit mouseUp
    end if
    if tWho is "heBtnDeal" then
@@ -4649,12 +4894,15 @@ on mouseUp
    switch tWho
       case "heBtnMin"
          set the text of field "heAmount" to heQuickAmount(tSeatNum, "min")
+         heBetSliderSync
          exit mouseUp
       case "heBtnHalf"
          set the text of field "heAmount" to heQuickAmount(tSeatNum, "half")
+         heBetSliderSync
          exit mouseUp
       case "heBtnPot"
          set the text of field "heAmount" to heQuickAmount(tSeatNum, "pot")
+         heBetSliderSync
          exit mouseUp
    end switch
    put word 1 of the text of field "heAmount" into tAmt
@@ -4779,9 +5027,14 @@ command heUIPromptToAct
          set the label of button "heBtnCall" to "Call"
       end if
    end if
-   -- seed the amount box with the minimum legal bet/raise-to
+   -- seed the amount box with the minimum legal bet/raise-to, and arm the slider
+   -- between that minimum and all-in (streetBy + stackBy). No bet/raise -> hide it.
    if (tHasBet or tHasRaise) and there is a field "heAmount" then
       set the text of field "heAmount" to heQuickAmount(tSeatNum, "min")
+      heBetSliderShow heQuickAmount(tSeatNum, "min"), \
+            (gGame["state"]["streetBy"][tSeatNum] + gGame["state"]["stackBy"][tSeatNum])
+   else
+      heBetSliderHide
    end if
    put item tSeatNum of kHeSeatNames into tName
    heUISetStatus tName & " to act  --  " & toUpper(gGame["state"]["street"]) \
@@ -4804,6 +5057,7 @@ command heDisableActions
    if there is a button "heBtnCall" then
       set the label of button "heBtnCall" to "Call"
    end if
+   heBetSliderHide
 end heDisableActions
 
 function heCurrentPot
@@ -4924,6 +5178,17 @@ command heSeatChromeVisible pSeatNum, pOn
          set the visible of field (tCtl & pSeatNum) to pOn
       end if
    end repeat
+   -- seat portrait: the disc always follows the seat; the image vs initial follows the
+   -- cached gAvatarOn (set by heSeatAvatarRender) so this hot path never reloads a file
+   if there is a graphic ("heSeatAv" & pSeatNum) then
+      set the visible of graphic ("heSeatAv" & pSeatNum) to pOn
+   end if
+   if there is a field ("heSeatAvTx" & pSeatNum) then
+      set the visible of field ("heSeatAvTx" & pSeatNum) to (pOn and gAvatarOn[pSeatNum] is not "true")
+   end if
+   if there is an image ("heSeatAvImg" & pSeatNum) then
+      set the visible of image ("heSeatAvImg" & pSeatNum) to (pOn and gAvatarOn[pSeatNum] is "true")
+   end if
    if not pOn then
       -- unseated: also drop the bet chip and any hole cards
       if there is a graphic ("heSeatChip" & pSeatNum) then
@@ -4948,8 +5213,10 @@ command heSeatFace pSeatNum, pActing
    end if
    if pActing then
       set the backgroundColor of graphic ("hePanel" & pSeatNum) to kHePanelActive
+      set the foregroundColor of graphic ("hePanel" & pSeatNum) to kHeGlowColor
    else
       set the backgroundColor of graphic ("hePanel" & pSeatNum) to kHePanelColor
+      set the foregroundColor of graphic ("hePanel" & pSeatNum) to kHePanelColor
    end if
    if tFolded is "true" then
       set the text of field ("heSeatState" & pSeatNum) to "FOLDED"
@@ -5134,6 +5401,7 @@ command heUIClearCards
       end if
       if there is a graphic ("hePanel" & tSeatNum) then
          set the backgroundColor of graphic ("hePanel" & tSeatNum) to kHePanelColor
+         set the foregroundColor of graphic ("hePanel" & tSeatNum) to kHePanelColor
       end if
    end repeat
    repeat with tPos = 1 to 5
