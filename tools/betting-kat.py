@@ -377,6 +377,29 @@ def bet_legal(st, seat):
     return out
 
 
+def quick_amount(st, seat, kind):
+    """Mirror of heQuickAmountOf: the raise-TO the Min / 1/2 Pot / Pot buttons
+    put in the amount box, clamped to [minTo, maxTo].
+
+    Pot-limit sizing, the standard definition: the maximum raise is "the pot
+    after you call" -- everything already committed plus the amount you must
+    first put in to call -- and that is the raise INCREMENT, laid on top of the
+    current bet. So raiseTo = betCur + (committed + owe). Adding `owe` a second
+    time (as the xTalk did before v0.14.1) counts the call twice, because
+    betCur already equals streetBy + owe."""
+    owe = st["betCur"] - st["streetBy"][seat]
+    pot_after = sum(st["handBy"][s] for s in st["occ"]) + owe
+    max_to = st["streetBy"][seat] + st["stackBy"][seat]
+    min_to = min(st["betCur"] + st["raiseFull"], max_to)
+    if kind == "half":
+        to = st["betCur"] + pot_after // 2
+    elif kind == "pot":
+        to = st["betCur"] + pot_after
+    else:
+        to = min_to
+    return max(min_to, min(to, max_to))
+
+
 # --------------------------------------------------------------------------
 # The pinned scenarios (each one is duplicated on-engine in the harness)
 # --------------------------------------------------------------------------
@@ -677,8 +700,40 @@ def case_levels():
     check("level: period clamps at the top", level_for_period(999, lv), "50,100,10")
 
 
+def case_quick_amounts():
+    """Pot / half-pot / min sizing (heQuickAmountOf), including the case the
+    v0.14.1 fix was about: facing a bet, where the old formula double-counted
+    the call and over-sized every quick raise."""
+    # 3-handed 1/2, folded to the button preflop: pot 3, button owes 2.
+    # Pot-limit max raise = pot after the call (3+2=5) on top of betCur (2) -> 7.
+    st = run_blinds(new_hand(1, 2, {1: 100, 2: 100, 3: 100}, [1, 2, 3], 1))
+    check("quick: pot raise facing the BB is a true pot raise", quick_amount(st, 1, "pot"), 7)
+    check("quick: half-pot facing the BB", quick_amount(st, 1, "half"), 4)
+    check("quick: min is the min legal raise-to", quick_amount(st, 1, "min"), 4)
+    # the chips actually pushed = call + pot-after-call
+    check("quick: pot raise pushes owe + potAfterCall", 7 - st["streetBy"][1], 2 + 5)
+
+    # Opening a street with no bet in front: pot-sized BET = the pot. (This case
+    # was always right -- owe is 0, so the double-count vanished. It pins that
+    # the fix did NOT change it.)
+    st2 = apply_msg(st, "act", 1, "call,2")
+    st2 = apply_msg(st2, "act", 2, "call,1")
+    st2 = apply_msg(st2, "act", 3, "check,0")
+    check("quick: flop opened", st2["street"], "flop")
+    check("quick: pot-sized opening bet is the pot", quick_amount(st2, st2["toAct"], "pot"), 6)
+    check("quick: half-pot opening bet", quick_amount(st2, st2["toAct"], "half"), 3)
+
+    # Clamped by the stack: a short seat's pot raise is capped at all-in.
+    st3 = run_blinds(new_hand(1, 2, {1: 5, 2: 100, 3: 100}, [1, 2, 3], 1))
+    check("quick: pot raise clamps to all-in on a short stack", quick_amount(st3, 1, "pot"), 5)
+    # ...and never below the minimum legal raise-to.
+    st4 = run_blinds(new_hand(1, 2, {1: 100, 2: 100, 3: 100}, [1, 2, 3], 1))
+    check("quick: half-pot never under the min raise", quick_amount(st4, 1, "half") >= 4, True)
+
+
 def main():
     case_blind_schedule()
+    case_quick_amounts()
     case_min_raise()
     case_under_raise_no_reopen()
     case_three_way_side_pots()

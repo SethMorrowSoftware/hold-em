@@ -6,6 +6,57 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.14.1 -- bug-fix pass. Six defects found by review; the first two are gameplay-
+visible, the rest are correctness/robustness. No new controls, so kUIVersion stays 9
+(a saved v9 stack keeps its chrome); kHeHarnessV 28 -> 29.
+  * POT / 1/2 POT OVER-SIZED EVERY RAISE MADE FACING A BET. heQuickAmount computed
+    raiseTo = betCur + owe + potAfterCall, but betCur ALREADY equals streetBy + owe,
+    so the call was counted twice. Blinds 1/2 folded to the button: Pot offered a
+    raise to 9 where a pot-sized raise is 7 (and 1/2 Pot offered 6 for 4). With
+    owe = 0 -- opening a street -- the extra term vanished, which is why the
+    opening-bet case always looked correct and this survived. The sizing is now a
+    PURE handler, heQuickAmountOf(state, seat, kind) (H5), so it is pinned in
+    tools/betting-kat.py (case_quick_amounts) and on-engine in heTestLegalRun
+    instead of being eyeballed; heQuickAmount is a one-line gGame wrapper.
+  * THE TABLE WENT BLANK FOR THE WHOLE RUNOUT AND SHOWDOWN. heCurrentPot,
+    heHandByOf, heSeatFace, heHeaderTxt and heHudRefresh all gated their reads of
+    gGame["state"] on phase "hand" -- but the paced beats that follow betting are
+    phases "reveal", "runout" and "showdown". So from the moment betting closed:
+    the pot read 0 and its chip vanished, every seat showed its pre-hand bankroll
+    instead of chips behind, street bets and the SB/BB badges disappeared, and the
+    FOLDED / ALL-IN markers went blank -- for the entire all-in runout and the 2.9 s
+    showdown hold. Worse, heUIShowdownReveal writes "WINNER" into the seat state
+    fields and the very next 4 Hz HUD tick (<= 250 ms later) cleared it, so the
+    winner was never actually readable. New heHandLive() names the live set
+    (hand / reveal / runout / showdown -- deliberately NOT "between", where the
+    deltas are already in gGame["stacksBy"] and handBy would double-count), and
+    heSeatFace now leaves a WINNER badge alone through the showdown and the result
+    pause; heUIClearCards still clears it when the next hand is dealt.
+  * GOING ONLINE MID-HAND CORRUPTED THE SIGNED TRANSCRIPT. heTableCreate/heTableJoin
+    empty gGame["log"] and refill it with signed wires, but the hotseat hand runs on
+    timer sends that only gate on gGame["phase"] -- which they left untouched. Press
+    Lobby -> Create during a hand and the pending heSettleStep / heNextHandTick still
+    matched their phase: they fired into the online table, appended raw 4-field
+    hotseat lines into the wire log, and heNetReplayLogTo then shipped that junk to
+    every joining peer as "w" frames. New heNetParkHotseat (called by both) sweeps
+    the paced sends and drops the phase to "idle" so a send that already escaped the
+    sweep hits its own stale-guard.
+  * THE POLL LOOP COULD DIE SILENTLY. heNetPollTick guarded the per-event dispatch
+    but not the drain itself, so a throw out of btRp1Poll/btPoll (stale session
+    handle, extension fault) escaped the handler, skipped the re-arm, and killed the
+    250 ms loop with no error anywhere -- online play simply stopped receiving. Both
+    drains are now in their own try and the re-arm really always runs (H4).
+  * HISTORY CLAIMED "AUDIT PASSED" OVER AN UNAUDITED TRANSCRIPT. heHistRefresh folded
+    gGame["log"] unconditionally, but online that log holds 10-field signed wires,
+    not 4-field hotseat lines: every line fell through heFoldTranscript's switch, so
+    the fold returned no history AND no errors -- which the panel read as a clean
+    audit. It now gates on heLogIsCleanHotseat (the predicate that already existed
+    for exactly this, used by Leave) and says what is actually there.
+  * ITEMDELIMITER LEAKS (gotcha 5). heStackFolder returned with it set to "/" and
+    heSwapExt with it set to "." -- heKitTryInit's early exit on a missing atlas
+    returned to its caller carrying a foreign delimiter. heTestEvaluatorRun left it
+    as "|" for the next harness section. All three now save and restore.
+
 v0.14.0 -- UI polish pack (local, hotseat-first -- online avatar/logo delivery to
 peers is the next increment). Four additions, all pure-engine, gated behind kUIVersion
 9 so a saved v8 stack rebuilds its chrome on next open:
@@ -229,8 +280,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.14.0"
-constant kHeHarnessV = "28"
+constant kHeVersion = "0.14.1"
+constant kHeHarnessV = "29"
 constant kUIVersion = "9"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -1318,6 +1369,24 @@ command heNetStop
    btStopSession gGame["session"]
 end heNetStop
 
+command heNetParkHotseat
+   -- Going online CLOBBERS gGame["log"] (heTableCreate/heTableJoin empty it and
+   -- refill it with signed wires), but the hotseat game is driven by paced timer
+   -- sends that only gate on gGame["phase"]. Pressing Lobby -> Create/Join mid-hand
+   -- therefore left heRevealStep / heRunoutStep / heSettleStep / heNextHandTick
+   -- armed with their phase still matching: they would fire into the online table,
+   -- append raw 4-field hotseat lines (settle, handStart, holeDeliver, bids...)
+   -- into the signed wire log, and heNetReplayLogTo would then ship those junk
+   -- lines to every joining peer as "w" frames. Park the hand first: sweep the
+   -- paced sends and drop the phase to "idle" so any send that already escaped the
+   -- sweep hits its own stale-guard and exits. The hand in progress is abandoned
+   -- (its transcript is about to be replaced), which is what going online means.
+   heCancelPacedSteps
+   put "idle" into gGame["phase"]
+   heDisableActions
+   heUIClearCards
+end heNetParkHotseat
+
 command heNetJoinSwarm pIsHost
    -- add the phantom swarm on the table's rendezvous id, then announce (host)
    -- or discover (player) on the DHT (spec 10). The DHT carries zero game data.
@@ -1355,6 +1424,7 @@ command heTableCreate
    end if
    -- tear down any prior session first so a re-create starts a clean swarm
    heNetStop
+   heNetParkHotseat
    heIdentitySetup
    if heHasSodium() then
       put heBin2HexS(sxRandomBytes(32)) into gGame["tableIdHex"]
@@ -1402,6 +1472,7 @@ command heTableJoin pCodeTxt
    end if
    -- tear down any prior session first so a re-join starts clean
    heNetStop
+   heNetParkHotseat
    heIdentitySetup
    put tCode into gGame["tableIdHex"]
    put heTableInfohash(tCode) into gGame["infohashHex"]
@@ -1438,7 +1509,17 @@ on heNetPollTick
    if gGame["syncCooldown"] > 0 then
       subtract 1 from gGame["syncCooldown"]
    end if
-   put btRp1Poll(gGame["session"]) into tEvents
+   -- The DRAIN ITSELF has to be guarded too, not just the per-event dispatch: a
+   -- throw out of btRp1Poll/btPoll (a torn-down or stale session handle, an
+   -- extension-side fault) escaped this handler entirely, so the re-arm below never
+   -- ran and the poll loop died silently -- online play just stopped receiving,
+   -- with no error anywhere. Empty events on a failed drain, then carry on (H4).
+   put empty into tEvents
+   try
+      put btRp1Poll(gGame["session"]) into tEvents
+   catch tPollErr
+      put "poll   btRp1Poll threw: " & tPollErr & return after gGame["netLog"]
+   end try
    -- an inbound rp1 event is attacker-controlled: a single throwing dispatch must
    -- drop-and-log (H4), never abort the drain or -- worse -- skip the re-arm below
    -- and silently kill the poll loop (deep-dive transport). The re-arm always runs.
@@ -1449,7 +1530,11 @@ on heNetPollTick
          put "poll   dropped a throwing rp1 event: " & tPollErr & return after gGame["netLog"]
       end try
    end repeat
-   get btPoll(gGame["session"])
+   try
+      get btPoll(gGame["session"])
+   catch tPollErr
+      put "poll   btPoll threw: " & tPollErr & return after gGame["netLog"]
+   end try
    send "heNetPollTick" to me in 250 milliseconds
 end heNetPollTick
 
@@ -4302,14 +4387,40 @@ command heHistRefresh
    -- logged one) and, for Level 0 hands, the DEAL (heAuditDealsFromLog
    -- re-derives the committed shuffle from the revealed seeds). An all-verified
    -- transcript is the legitimacy proof.
-   local tFold, tHistTxt, tErrs, tAuditTxt, tDealAudit
+   local tFold, tHistTxt, tErrs, tAuditTxt, tDealAudit, tLogTxt
    if not (there is a field "heHistList") then
       exit heHistRefresh
    end if
-   put heFoldTranscript(gGame["log"]) into tFold
+   -- copy the transcript to a plain local before measuring/chunking it (H6)
+   put gGame["log"] into tLogTxt
+   -- The lobby and the hotseat game share gGame["log"] in two INCOMPATIBLE formats
+   -- (heLogIsCleanHotseat spells out why). Folding an online wire log reads field 3
+   -- as the message type when it is really the hand number, so every line falls
+   -- through the switch: no history, no errors -- and the panel then claimed "AUDIT
+   -- PASSED" over a transcript it had not audited at all. Say what is actually
+   -- there instead; the online chain is verified continuously on ingest
+   -- (heEnvVerify), which is a different proof from the hotseat settlement fold.
+   if not heLogIsCleanHotseat(tLogTxt) then
+      if tLogTxt is empty then
+         set the text of field "heHistList" to \
+               "No transcript yet. Play a hand (Deal), then re-open History."
+      else
+         set the text of field "heHistList" to \
+               "This transcript is the ONLINE signed chain (" \
+               & the number of lines of tLogTxt & " wires), not a hotseat hand log." & return \
+               & "Every wire was signature- and chain-verified as it arrived; the" & return \
+               & "settlement fold below applies to hotseat play. Leave the lobby to" & return \
+               & "play hotseat, or use Copy transcript to export the signed chain."
+      end if
+      set the text of field "heHistAudit" to \
+            "NOT AUDITED HERE -- online chain (verified on ingest), no hotseat hands to replay."
+      set the textColor of field "heHistAudit" to kHeGoldColor
+      exit heHistRefresh
+   end if
+   put heFoldTranscript(tLogTxt) into tFold
    put tFold["history"] into tHistTxt
    put tFold["errors"] into tErrs
-   put heAuditDealsFromLog(gGame["log"]) into tDealAudit
+   put heAuditDealsFromLog(tLogTxt) into tDealAudit
    if tHistTxt is empty then
       put "No completed hands yet. Play a hand (Deal), then re-open History." into tHistTxt
    end if
@@ -4600,25 +4711,36 @@ function heStackFolder
    -- message box and never saved (there is no file to be relative to) -- then set
    -- uHeAtlasPath/uHeBacksPath by hand, or just save the stack once. LiveCode reports
    -- filenames with "/" separators on every platform, so item 1 to -2 is the folder.
-   local tFile
+   -- gotcha 5: the itemDelimiter is global mutable state, so it is saved and
+   -- restored here. Leaving it as "/" (pre-v0.14.1) leaked a foreign delimiter out
+   -- to every caller -- heKitTryInit's early exit on a missing atlas returned with
+   -- it still set, and the next handler to chunk items without setting it first
+   -- would have parsed with "/".
+   local tFile, tSaved, tOut
    put the filename of this stack into tFile
    if tFile is empty then
       return ""
    end if
+   put the itemDelimiter into tSaved
    set the itemDelimiter to "/"
-   return item 1 to -2 of tFile
+   put item 1 to -2 of tFile into tOut
+   set the itemDelimiter to tSaved
+   return tOut
 end heStackFolder
 
 function heSwapExt pPath, pNewExt
    -- pPath with its trailing ".<ext>" replaced by pNewExt (e.g. ".xml"), so a .png
    -- atlas path yields its sibling TextureAtlas .xml. Copied to a local before the
    -- chunk (H6). A folder name containing a "." is a rare cosmetic edge, not a crash.
-   local tBase
+   -- saves/restores the itemDelimiter (gotcha 5) -- it used to leave it as "."
+   local tBase, tSaved
    put pPath into tBase
+   put the itemDelimiter into tSaved
    set the itemDelimiter to "."
    if the number of items of tBase > 1 then
       delete last item of tBase
    end if
+   set the itemDelimiter to tSaved
    return tBase & pNewExt
 end heSwapExt
 
@@ -4939,25 +5061,43 @@ function heCallAmountFor pSeatNum
 end heCallAmountFor
 
 function heQuickAmount pSeatNum, pKind
-   -- a convenience "raise to" amount, clamped to [minTo, maxTo]. Pot-sized
-   -- uses the pot after this player calls (standard pot-raise definition).
-   local tState, tOwe, tPotAfter, tMaxTo, tMinTo, tTo, tSeat
+   -- thin shell wrapper: the sizing itself is pure (heQuickAmountOf) so it is
+   -- KAT-pinned in tools/betting-kat.py and the harness, not just eyeballed
+   return heQuickAmountOf(gGame["state"], pSeatNum, pKind)
+end heQuickAmount
+
+function heQuickAmountOf pStateA, pSeatNum, pKind
+   -- a convenience "raise to" amount, clamped to [minTo, maxTo]. PURE (H5):
+   -- values in, value out, no UI reads -- pinned by tools/betting-kat.py.
+   --
+   -- The pot-limit definition (spec 8.1 sizing, the standard one): the maximum
+   -- raise is "the pot AFTER you call" -- the money already committed plus the
+   -- amount you must first put in to call -- and that is the raise INCREMENT,
+   -- laid on top of the current bet. So
+   --     raiseTo = betCur + potAfterCall,   potAfterCall = committed + owe
+   -- and the chips the seat actually pushes are owe + potAfterCall.
+   -- v0.14.1 fix: this used to read betCur + owe + potAfterCall, which counts
+   -- the call TWICE (betCur already equals streetBy + owe). Facing a 2 into a
+   -- pot of 3 it offered a raise to 9 where a pot-sized raise is 7 -- the Pot
+   -- and 1/2 Pot buttons over-sized every raise made while facing a bet. With
+   -- owe = 0 (opening a street) the extra term vanished, which is why the
+   -- opening-bet case always looked right.
+   local tOwe, tPotAfter, tMaxTo, tMinTo, tTo, tSeat
    set the itemDelimiter to comma
-   put gGame["state"] into tState
-   put tState["betCur"] - tState["streetBy"][pSeatNum] into tOwe
+   put pStateA["betCur"] - pStateA["streetBy"][pSeatNum] into tOwe
    put 0 into tPotAfter
-   repeat for each item tSeat in tState["occ"]
-      add tState["handBy"][tSeat] to tPotAfter
+   repeat for each item tSeat in pStateA["occ"]
+      add pStateA["handBy"][tSeat] to tPotAfter
    end repeat
    add tOwe to tPotAfter
-   put tState["streetBy"][pSeatNum] + tState["stackBy"][pSeatNum] into tMaxTo
-   put min(tState["betCur"] + tState["raiseFull"], tMaxTo) into tMinTo
+   put pStateA["streetBy"][pSeatNum] + pStateA["stackBy"][pSeatNum] into tMaxTo
+   put min(pStateA["betCur"] + pStateA["raiseFull"], tMaxTo) into tMinTo
    switch pKind
       case "half"
-         put tState["betCur"] + tOwe + (tPotAfter div 2) into tTo
+         put pStateA["betCur"] + (tPotAfter div 2) into tTo
          break
       case "pot"
-         put tState["betCur"] + tOwe + tPotAfter into tTo
+         put pStateA["betCur"] + tPotAfter into tTo
          break
       default
          put tMinTo into tTo
@@ -4969,7 +5109,7 @@ function heQuickAmount pSeatNum, pKind
       put tMaxTo into tTo
    end if
    return tTo
-end heQuickAmount
+end heQuickAmountOf
 
 command heUISetStatus pTxt
    if there is a field "heStatus" then
@@ -5060,11 +5200,31 @@ command heDisableActions
    heBetSliderHide
 end heDisableActions
 
+function heHandLive
+   -- true while a dealt hand still owns gGame["state"]: the acting phase AND the
+   -- paced beats that follow it (the board reveal, an all-in runout, the showdown
+   -- hold). Everything the HUD reads out of the hand -- pot, chips behind, street
+   -- bets, blind badges, FOLDED/ALL-IN -- is valid for ALL of these, and gating it
+   -- on "hand" alone (pre-v0.14.1) blanked the table exactly when the hand was at
+   -- its most dramatic: the pot read 0, every seat showed its pre-hand bankroll,
+   -- and the folded/all-in markers vanished for the whole runout and showdown.
+   -- "between" is NOT live: heHandSettle has already paid the deltas into
+   -- gGame["stacksBy"], so the hand's handBy would double-count.
+   switch gGame["phase"]
+      case "hand"
+      case "reveal"
+      case "runout"
+      case "showdown"
+         return true
+   end switch
+   return false
+end heHandLive
+
 function heCurrentPot
    local tSeatNum, tPot
    set the itemDelimiter to comma
    put 0 into tPot
-   if gGame["phase"] is "hand" then
+   if heHandLive() then
       repeat for each item tSeatNum in gGame["state"]["occ"]
          add gGame["state"]["handBy"][tSeatNum] to tPot
       end repeat
@@ -5108,7 +5268,9 @@ command heHudRefresh
    put 0 into tActing
    put 0 into tSbSeat
    put 0 into tBbSeat
-   if gGame["phase"] is "hand" then
+   if heHandLive() then
+      -- toAct is already 0 in the reveal/runout/showdown beats, so no seat glows
+      -- during them; the blind badges stay up for the whole hand, as they should
       put gGame["state"]["toAct"] into tActing
       put gGame["state"]["sbSeat"] into tSbSeat
       put gGame["state"]["bbSeat"] into tBbSeat
@@ -5129,7 +5291,7 @@ command heHudRefresh
       end if
       -- bet in front this street
       put 0 into tStreetBy
-      if gGame["phase"] is "hand" and gGame["state"]["streetBy"][tSeatNum] is a number then
+      if heHandLive() and gGame["state"]["streetBy"][tSeatNum] is a number then
          put gGame["state"]["streetBy"][tSeatNum] into tStreetBy
       end if
       if tStreetBy > 0 then
@@ -5203,10 +5365,10 @@ end heSeatChromeVisible
 
 command heSeatFace pSeatNum, pActing
    -- panel colour + state label: acting (gold), folded (dim), all-in (gold text)
-   local tState, tFolded, tAllin
+   local tState, tFolded, tAllin, tCurTxt
    put "false" into tFolded
    put "false" into tAllin
-   if gGame["phase"] is "hand" then
+   if heHandLive() then
       put gGame["state"] into tState
       put tState["foldedBy"][pSeatNum] into tFolded
       put tState["allinBy"][pSeatNum] into tAllin
@@ -5217,6 +5379,19 @@ command heSeatFace pSeatNum, pActing
    else
       set the backgroundColor of graphic ("hePanel" & pSeatNum) to kHePanelColor
       set the foregroundColor of graphic ("hePanel" & pSeatNum) to kHePanelColor
+   end if
+   if there is not a field ("heSeatState" & pSeatNum) then
+      exit heSeatFace
+   end if
+   -- a showdown WINNER badge outranks the folded/all-in state and must survive the
+   -- repaints that follow: heUIShowdownReveal writes it, then the very next 4 Hz
+   -- HUD tick used to wipe it (pre-v0.14.1 this handler cleared the state field
+   -- outside phase "hand"), so the winner flashed for at most one tick. It stays
+   -- up through the showdown hold and the between-hands result pause, and
+   -- heUIClearCards clears it when the next hand is dealt.
+   put the text of field ("heSeatState" & pSeatNum) into tCurTxt
+   if tCurTxt is "WINNER" and (gGame["phase"] is "showdown" or gGame["phase"] is "between") then
+      exit heSeatFace
    end if
    if tFolded is "true" then
       set the text of field ("heSeatState" & pSeatNum) to "FOLDED"
@@ -5235,7 +5410,7 @@ function heHeaderTxt
    if gGame["handNum"] > 0 then
       put "     Hand " & gGame["handNum"] after tTxt
    end if
-   if gGame["phase"] is "hand" then
+   if heHandLive() then
       put "     " & toUpper(gGame["state"]["street"]) after tTxt
    end if
    put "     Blinds " & gGame["sb"] & "/" & gGame["bb"] after tTxt
@@ -5249,7 +5424,10 @@ function heHeaderTxt
 end heHeaderTxt
 
 function heHandByOf pSeatNum
-   if gGame["phase"] is "hand" and gGame["state"]["handBy"][pSeatNum] is a number then
+   -- what this seat has committed to the LIVE hand, so the HUD can show chips
+   -- BEHIND (bankroll - committed). Valid for every live phase; at "between" the
+   -- deltas are already in gGame["stacksBy"] and this must read 0.
+   if heHandLive() and gGame["state"]["handBy"][pSeatNum] is a number then
       return gGame["state"]["handBy"][pSeatNum]
    end if
    return 0
@@ -6140,6 +6318,9 @@ command heTestEvaluatorRun
       end repeat
    end repeat
    heTAssert "eval: antisymmetry over all vector pairs", tBad, 0
+   -- leave the delimiter as the house default, not the "|" this section parses
+   -- vectors with (gotcha 5: it is global state and the next section inherits it)
+   set the itemDelimiter to comma
 end heTestEvaluatorRun
 
 function heTNewHand pSB, pBB, pStacksList, pOccList, pButtonSeat
@@ -6440,6 +6621,33 @@ command heTestLegalRun
    put tStateA["toAct"] into tSeatNum
    heTAssert "legal: short-stack menu is all accepted", \
          heTLegalAllAccepted(tStateA, tSeatNum), "ok"
+
+   -- quick-bet sizing (heQuickAmountOf), mirror of betting-kat case_quick_amounts.
+   -- v0.14.1 regression pin: FACING a bet, the pot raise-to must be
+   -- betCur + (committed + owe) -- 2 + (3 + 2) = 7 with 1/2 blinds folded to the
+   -- button. The old formula added the call a second time and offered 9.
+   put heTNewHand(1, 2, "100,100,100", "1,2,3", 1) into tStateA
+   put heTBlinds(tStateA) into tStateA
+   heTAssert "quick: pot raise facing the BB is a true pot raise", \
+         heQuickAmountOf(tStateA, 1, "pot"), 7
+   heTAssert "quick: half-pot facing the BB", heQuickAmountOf(tStateA, 1, "half"), 4
+   heTAssert "quick: min is the min legal raise-to", heQuickAmountOf(tStateA, 1, "min"), 4
+   -- opening a street with nothing in front: a pot-sized BET is the pot itself
+   -- (owe is 0 here, so this case never showed the bug -- it pins that the fix
+   -- left it alone)
+   put heTAct(tStateA, 1, "call,2", "", "quick: button calls") into tStateA
+   put heTAct(tStateA, 2, "call,1", "", "quick: sb completes") into tStateA
+   put heTAct(tStateA, 3, "check,0", "", "quick: bb checks to the flop") into tStateA
+   heTAssert "quick: flop opened", tStateA["street"], "flop"
+   heTAssert "quick: pot-sized opening bet is the pot", \
+         heQuickAmountOf(tStateA, tStateA["toAct"], "pot"), 6
+   heTAssert "quick: half-pot opening bet", \
+         heQuickAmountOf(tStateA, tStateA["toAct"], "half"), 3
+   -- clamped by the stack: a short seat's pot raise caps at all-in
+   put heTNewHand(1, 2, "5,100,100", "1,2,3", 1) into tStateA
+   put heTBlinds(tStateA) into tStateA
+   heTAssert "quick: pot raise clamps to all-in on a short stack", \
+         heQuickAmountOf(tStateA, 1, "pot"), 5
 end heTestLegalRun
 
 function heTButtonSchedule pLiveList, pLastBB
