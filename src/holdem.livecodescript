@@ -6,6 +6,96 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.15.0 -- fold of the two outstanding review branches (PRs #25 + #33), rebased onto
+the v0.14.1 fixes so nothing already merged is lost. kUIVersion 9 -> 10 (the bet
+slider control changes style, so saved chrome rebuilds); kHeHarnessV 29 -> 30 (the
+netsim section gains reorder/duplicate vectors).
+  * ONLINE: THE CHAIN-BREAK RESYNC STORM IS FIXED (PR #25, seq-classified wires).
+    rp1 is lossy AND redelivers/reorders, but heNetIngestWire treated every
+    duplicate as a chain gap: each redelivered wire triggered another full-
+    transcript replay, whose own replayed wires re-triggered it, so the client
+    resync-looped forever and an online game never started. A verified wire is now
+    classified by its host-signed seq against gGame["lastSeq"]: seq <= lastSeq is
+    an already-applied duplicate -> dropped SILENTLY; seq = lastSeq+1 must chain
+    onto the head and is applied (heNetApplyWire), then any buffered successors
+    drain behind it (heNetDrainBuffer); seq > lastSeq+1 is a real gap -> the wire
+    is HELD in a bounded reorder buffer (heNetBufferWire, kHeWireBufMax) and one
+    debounced replay is requested. The table/version binding and the host-authority
+    fold of roster/cfg bodies (both v0.14.1 hardening) are enforced before / inside
+    apply exactly as before -- and dedup makes the full-log replay idempotent: a
+    caught-up client just sheds the replayed prefix instead of storming. The netsim
+    section now drives reorder, cascade-drain and duplicate vectors through the
+    real handlers.
+  * DYNAMIC PROPERTY NAMES REMOVED (PR #33, the big syntax find). v0.14.0 stored
+    avatar paths in per-seat props via the parenthesised computed-name form, which
+    is NOT portable xTalk: property names are compile-time tokens, and the dynamic
+    form is engine-shaky on OXT. Replaced with ONE uHeAvatarPaths property, line N
+    = seat N's path: plain line-chunk syntax, and paths cannot contain a newline.
+    New house rule H9 + static-gate check 11 flag the form so it can never ship
+    again. (A previously saved stack's per-seat paths are orphaned -- avatars
+    re-pick once; acceptable pre-OXT-pass.)
+  * BET SLIDER is now style "scale" (a real slider: no arrow chrome), the drag
+    handler uses its documented pNewPos parameter, track clicks step by one big
+    blind (page = 4 blinds) via lineInc/pageInc, and the scrollbarLineInc/LineDec/
+    PageInc/PageDec messages sync the amount box on a deferred send THEN pass --
+    never swallowing the engine's default thumb move.
+  * IMAGES ASPECT-FIT (PR #33). Setting an image's filename resets the control to
+    the picture's natural size; v0.14.0 re-rected after (correct) but into a
+    square, stretching non-square pictures. Both avatar and logo now aspect-fit
+    via formatWidth/Height (new pure heFitRect), letterboxing on the disc / felt
+    instead of distorting.
+Plus a four-agent full-file review; the verified findings, all fixed here:
+  * H1 LEAK: Settings -> Apply (and the game-over auto-reset) called heTableNew
+    while ONLINE, emptying gGame with the TorrentXT session still running -- the
+    poll loop died, and Leave/closeStack became no-ops (flag and handle gone), so
+    the session was unstoppable and a re-create forked a second one. heTableNew
+    now heNetStop's first (a no-op for hotseat).
+  * ONLINE LOG CORRUPTION: Settings/History dismiss the lobby overlay without
+    restoring it, leaving Deal clickable while online -- a hotseat hand then
+    appended raw 4-field lines into the signed wire log, which heNetReplayLogTo
+    shipped to every joining peer as junk. heHandStart now refuses to deal while
+    online (heHudRefresh also keeps the button disabled).
+  * CHIP MINTING: a typed fractional amount ("2.5" is a number) flowed through
+    heBetApply into heSettleOf's div/mod accounting, where a fractional remainder
+    hands a whole chip to EVERY winner -- chips minted, stacks fractional forever,
+    and the replay audit blessed it (it re-derives the same wrong payout). Fixed
+    at BOTH ends: the shell truncs the box, and heBetApply rejects non-integer /
+    non-numeric wagers (act-bad-amount; a non-number previously THREW mid-
+    arithmetic). Pinned in betting-kat case_bad_amounts + heTestLegalRun.
+  * REPLAY-AS-AUDIT HARDENING: duplicate bidSB / bidAnte posts (phase stays
+    "blinds" until the BB, so repeats replayed clean and audited clean) and
+    antes from seats outside the hand are now engine-rejected (sbPosted /
+    antePostedBy flags; betting-kat case_duplicate_posts). A truncated or
+    hand-edited transcript reaching a contested settle with a short/garbage
+    board or hole list is named settle-bad-cards and skipped (new heIsCardList
+    guard) instead of THROWING mid-fold and killing the whole History audit.
+  * SPEC 6 UNKNOWN-FROM: inbound wires never checked the sender against the
+    host-signed roster, so a malicious host could sequence a never-seated key.
+    heNetApplyWire now marks unrostered senders and folds NOTHING from them
+    (the chain link itself is host-authentic and still advances -- wedging the
+    table on it would only punish the honest client). heHostEmitRoster is now
+    exercised by the netsim, which also pins the ghost-sender case.
+  * HARNESS SELF-PROTECTION: a mid-section throw (netsim above all) used to
+    leave the user's REAL gGame replaced by the section's synthetic context;
+    heRunSection now snapshots gGame and restores it in its catch. Copy-invite
+    fixed to test online-ness (heTableNew fills tableIdHex for hotseat too, so
+    the old empty-check handed out a dead code a joiner would wait on forever).
+    Game-over reset now clears the finished game's cards. Saved-stack reopen
+    rehydrates the runtime state the version-match exit skipped (gSlotCenter
+    from the controls' locs, avatar caches, logo fit, kit probe) -- kit mode
+    used to be silently unrecoverable after a save/reopen because heKitReload
+    pooled zero sprites from the empty slot map. The backs sheet now probes its
+    OWN frame-name suffix and width (gotcha 24 is per-sheet); the kit-init
+    catch records WHY it dropped to flat (gKitLastErr, shown by heProbeKit).
+    Time-based tournaments now show their level in the header (was hands-mode
+    only). Mirror-drift gaps closed both ways: BB-option raise, out-of-turn,
+    the second reopen probe, burns, the losing showdown name, the ante fold
+    transcript, and a REAL draw-bounds loop now run on-engine; the short-SB-
+    ante P0 pin and a level-count pin now run in betting-kat. Harness sections
+    renumbered 1..14 in run order (two claimed "2b"). heShuffleDeck clamps a
+    sub-1 state (MINSTD has no 0 state; the mirror wraps where the engine
+    yields 0 -- latent divergence, now clamped identically on both sides).
+
 v0.14.1 -- bug-fix pass. Six defects found by review; the first two are gameplay-
 visible, the rest are correctness/robustness. No new controls, so kUIVersion stays 9
 (a saved v9 stack keeps its chrome); kHeHarnessV 28 -> 29.
@@ -280,9 +370,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.14.1"
-constant kHeHarnessV = "29"
-constant kUIVersion = "9"
+constant kHeVersion = "0.15.0"
+constant kHeHarnessV = "30"
+constant kUIVersion = "10"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -323,6 +413,10 @@ constant kHeDefaultSB = 1
 constant kHeDefaultBB = 2
 constant kHeDefaultAnte = 0
 constant kHeDefaultStack = 400
+-- how many out-of-order future wires the online client will hold while it waits
+-- for the gap before them to fill (rp1 is lossy and reorders/duplicates). A wire
+-- further than this ahead of what we have applied is left to the full-log replay.
+constant kHeWireBufMax = 64
 -- blind-level schedule (tournament option). One level = "sb/bb/ante"; levels are
 -- ";"-separated. A literal single-line string (gotcha 6: constants must be
 -- literal, so no & lf building). The level advances every kHeDefaultLevelEvery
@@ -398,6 +492,8 @@ local gAnimBusy
 local gSlotCenter
 local gCardSpr
 local gKitSuffix
+local gKitBackSuffix   -- the BACKS sheet's own frame-name suffix (gotcha 24: per-sheet)
+local gKitLastErr      -- why the last heKitTryInit dropped to flat (for heProbeKit)
 -- v0.14.0 UI pack: gAvatarOn[seat] caches whether a seat shows a custom image ("true")
 -- or the initial fallback, so the 4Hz HUD toggles visibility without re-loading files.
 local gAvatarOn
@@ -1437,6 +1533,9 @@ command heTableCreate
    put 0 into gGame["handNum"]
    put 0 into gGame["seqCounter"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
@@ -1480,6 +1579,9 @@ command heTableJoin pCodeTxt
    put empty into gGame["hostPubHex"]
    put 0 into gGame["handNum"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
@@ -1692,20 +1794,34 @@ command heHostRelay pPeer, pContentAndSig
 end heHostRelay
 
 command heNetIngestWire pWire
-   -- everyone's inbound path: verify-or-drop against the host key and local
-   -- chain head, then advance the chain and fold the message (spec 6/8).
-   local tVerdict, tA, tTypeTxt, tSeqTxt
-   put heEnvVerify(pWire, empty, gGame["hostPubHex"], gGame["chainHeadHex"]) into tVerdict
+   -- everyone's inbound path. rp1 is lossy AND redelivers/reorders wires, so a
+   -- verified wire is classified by its host-signed seq against the last we
+   -- applied (gGame["lastSeq"]), NOT by a bare prev==head test:
+   --   seq <= lastSeq     : already applied -> drop SILENTLY. This is the fix
+   --                        for the networked chain-break storm -- the host
+   --                        re-broadcasts and rp1 redelivers constantly, and
+   --                        treating every duplicate as a "chain gap" made the
+   --                        client resync-loop forever and the game never start.
+   --                        It also makes the full-log replay idempotent: a
+   --                        caught-up client just sheds the replayed prefix.
+   --   seq  = lastSeq + 1 : the expected next wire -> chain-check + apply, then
+   --                        drain any buffered successors now in order.
+   --   seq  > lastSeq + 1 : a real gap -> buffer it and ask the host to replay.
+   -- Signatures/shape are verified FIRST, and the table/version binding is
+   -- enforced BEFORE the seq is even read (a wire for another table must never
+   -- touch the buffer or lastSeq), so a duplicate/reordered wire is judged by
+   -- its seq, never mistaken for a signature failure. Never raises (H4).
+   local tVerdict, tA, tSeq
+   if gGame["lastSeq"] is not a number then
+      put 0 into gGame["lastSeq"]   -- unset on old saves / hand-rolled contexts
+   end if
+   if gGame["wireBufN"] is not a number then
+      put 0 into gGame["wireBufN"]
+   end if
+   put heEnvVerify(pWire, empty, gGame["hostPubHex"], empty) into tVerdict
    if tVerdict is not "ok" then
-      -- drop and log; a bad/replayed/reordered message is not an exception
+      -- drop and log; a bad/forged message is a real rejection, never a resync
       put tVerdict && char 1 to 24 of pWire & return after gGame["netLog"]
-      -- a chain break means we missed a wire (rp1 is lossy/reorders): ask the
-      -- host to replay the transcript so we catch up, instead of wedging here
-      -- forever (spec 9). Debounced in heNetRequestSync. Other drops are real
-      -- rejections and must NOT trigger a resync.
-      if tVerdict is "drop:chain-break" then
-         heNetRequestSync
-      end if
       heLobbyRefresh
       exit heNetIngestWire
    end if
@@ -1725,30 +1841,140 @@ command heNetIngestWire pWire
       heLobbyRefresh
       exit heNetIngestWire
    end if
+   put tA["seq"] into tSeq
+   if tSeq is not a number then
+      put "drop:bad-seq " & char 1 to 24 of pWire & return after gGame["netLog"]
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   if tSeq <= gGame["lastSeq"] then
+      exit heNetIngestWire   -- duplicate / already applied: drop, no resync loop
+   end if
+   if tSeq > gGame["lastSeq"] + 1 then
+      heNetBufferWire tSeq, pWire
+      put "gap    seq " & tSeq & " held (need " & (gGame["lastSeq"] + 1) & ")" \
+            & return after gGame["netLog"]
+      heNetRequestSync
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   -- tSeq is exactly lastSeq+1: it must chain onto our head, or the host's stream
+   -- is inconsistent (should not happen) -- ask for a replay rather than wedge.
+   if tA["prev"] is not gGame["chainHeadHex"] then
+      put "drop:chain-break" && char 1 to 24 of pWire & return after gGame["netLog"]
+      heNetRequestSync
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   heNetApplyWire pWire, tA
+   heNetDrainBuffer
+   heLobbyRefresh
+end heNetIngestWire
+
+command heNetApplyWire pWire, pA
+   -- apply one verified, in-order wire: advance the chain head, record the seq,
+   -- append to the transcript, and fold presence bodies into the display. pA is
+   -- a parsed wire (heEnvWireParse); its fields are copied into plain locals
+   -- first, so heEnvBodyText and the log lines chunk only plain text (H6-safe).
+   local tTypeTxt, tSeqTxt, tFromHex, tBodyHex
+   put pA["type"] into tTypeTxt
+   put pA["seq"] into tSeqTxt
+   put pA["from"] into tFromHex
+   put pA["bodyHex"] into tBodyHex
    put heChainNextHex(pWire) into gGame["chainHeadHex"]
+   put tSeqTxt into gGame["lastSeq"]
    put pWire & return after gGame["log"]
-   put tA["type"] into tTypeTxt
-   put tA["seq"] into tSeqTxt
    put "ok     " & tTypeTxt & " seq " & tSeqTxt & return after gGame["netLog"]
+   -- spec 6: an unknown "from" is never ACTED on -- no exceptions, including
+   -- via the host. The relay refuses unadmitted senders, so a sequenced wire
+   -- whose sender is neither the host nor in the host-signed roster can only
+   -- mean a malicious or corrupted host stream. The chain still advances (the
+   -- link is host-authentic and refusing it would wedge the table), but the
+   -- body is marked and NOTHING folds from it -- the same accept-the-link,
+   -- ignore-the-body treatment a non-host cfg gets. In-order apply guarantees
+   -- the roster wire admitting a sender lands before that sender's first
+   -- relayed action, so an honest stream never trips this.
+   if tFromHex is not gGame["hostPubHex"] and not heRosterHasKey(tFromHex) then
+      put "note   unrostered sender " & char 1 to 8 of tFromHex \
+            & " -- body ignored (seq " & tSeqTxt & ")" & return after gGame["netLog"]
+      exit heNetApplyWire
+   end if
    -- lobby presence bodies drive the roster/cfg display; gameplay wires drive
-   -- the betting engine (the deal increment). tA fields are plain locals now,
-   -- so heEnvBodyText chunks only plain text (H6-safe). roster/cfg are HOST-
-   -- authored presence (spec 9): fold them only when the wire's own sender is the
-   -- host, so an admitted player cannot forge table config/roster by getting a
+   -- the betting engine (the deal increment). roster/cfg are HOST-authored
+   -- presence (spec 9): fold them only when the wire's own sender is the host,
+   -- so an admitted player cannot forge table config/roster by getting a
    -- content line relayed (the host relays any admitted sender's content).
    if tTypeTxt is "roster" or tTypeTxt is "cfg" then
-      if tA["from"] is gGame["hostPubHex"] then
+      if tFromHex is gGame["hostPubHex"] then
          if tTypeTxt is "roster" then
-            put heEnvBodyText(tA["bodyHex"]) into gGame["rosterBody"]
+            put heEnvBodyText(tBodyHex) into gGame["rosterBody"]
          else
-            put heEnvBodyText(tA["bodyHex"]) into gGame["cfgBody"]
+            put heEnvBodyText(tBodyHex) into gGame["cfgBody"]
          end if
       else
          put "drop   non-host " & tTypeTxt & " body ignored" & return after gGame["netLog"]
       end if
    end if
-   heLobbyRefresh
-end heNetIngestWire
+end heNetApplyWire
+
+function heRosterHasKey pPubHex
+   -- TRUE when the host-signed roster body (heRosterBody format: "pub:role"
+   -- comma-items) lists pPubHex as a member. Membership is judged on the pub
+   -- field alone; an empty roster has no members (the host itself is exempted
+   -- at the call site, so the pre-roster cfg wire still folds).
+   local tRoster, tItem, tColonPos, tPub
+   set the itemDelimiter to comma
+   put gGame["rosterBody"] into tRoster
+   repeat for each item tItem in tRoster
+      put offset(":", tItem) into tColonPos
+      if tColonPos > 0 then
+         put char 1 to (tColonPos - 1) of tItem into tPub
+      else
+         put tItem into tPub
+      end if
+      if tPub is pPubHex then
+         return true
+      end if
+   end repeat
+   return false
+end heRosterHasKey
+
+command heNetBufferWire pSeq, pWire
+   -- hold an out-of-order future wire until the gap before it fills. Bounded: a
+   -- wire more than kHeWireBufMax ahead of what we have applied is left to the
+   -- full-log replay, so a flood of far-future seqs cannot grow the buffer.
+   if pSeq <= gGame["lastSeq"] + kHeWireBufMax and gGame["wireBuf"][pSeq] is empty then
+      put pWire into gGame["wireBuf"][pSeq]
+      add 1 to gGame["wireBufN"]
+   end if
+end heNetBufferWire
+
+command heNetDrainBuffer
+   -- after applying a wire, apply any buffered wires that are now consecutive.
+   -- Each is emptied as it is applied; when none remain (wireBufN back to 0) the
+   -- whole buffer is reset so emptied keys never accumulate across a long game.
+   -- Buffered wires were signature-verified and table/version-bound at ingest;
+   -- the prev link is re-checked here because the head has moved since.
+   local tNext, tWire, tA
+   repeat forever
+      put gGame["lastSeq"] + 1 into tNext
+      if gGame["wireBuf"][tNext] is empty then
+         exit repeat
+      end if
+      put gGame["wireBuf"][tNext] into tWire
+      put empty into gGame["wireBuf"][tNext]
+      subtract 1 from gGame["wireBufN"]
+      put heEnvWireParse(tWire) into tA
+      if tA["prev"] is not gGame["chainHeadHex"] then
+         exit repeat   -- a buffered wire that no longer chains: leave it for replay
+      end if
+      heNetApplyWire tWire, tA
+   end repeat
+   if gGame["wireBufN"] <= 0 then
+      put empty into gGame["wireBuf"]
+      put 0 into gGame["wireBufN"]
+   end if
+end heNetDrainBuffer
 
 command heNetSendAction pTypeTxt, pBodyTxt
    -- a player emits a signed content line to the host (or, if we are the host,
@@ -2174,6 +2400,15 @@ function heShuffleDeck pState
       put tPos into tDeckA[tPos]
    end repeat
    put pState into tState
+   -- defensive: MINSTD has no 0 state (0 maps to 0 forever, and the -1 draw
+   -- value under LiveCode's sign-of-dividend mod then yields swap position 0,
+   -- corrupting the deck where the Python mirror would wrap to n). Every
+   -- caller seeds via heFreshPrngState (already >= 1); clamp so a raw future
+   -- caller cannot silently diverge from the mirror. Mirrored in
+   -- tools/shuffle-kat.py.
+   if tState is not a number or tState < 1 then
+      put 1 into tState
+   end if
    repeat with tPos = 52 down to 2
       put heDrawInt(tState, tPos) into tDrawPair
       put item 1 of tDrawPair into tSwapPos
@@ -2419,7 +2654,7 @@ end heBetAfterAction
 function heBetApply pStateA, pMsgType, pSeatNum, pAmount
    -- THE transition function: every blind, action, and board message
    local tStateA, tOwe, tPay, tTargetAmt, tIncrement, tSeatNum, tIsAllin
-   local tVerb, tAmt
+   local tVerb, tAmt, tOccList
    set the itemDelimiter to comma
    put pStateA into tStateA
    put empty into tStateA["err"]
@@ -2434,12 +2669,26 @@ function heBetApply pStateA, pMsgType, pSeatNum, pAmount
             put "bidAnte-out-of-phase" into tStateA["err"]
             return tStateA
          end if
+         -- replay-as-audit hardening: a seat outside the hand, or a REPEATED
+         -- ante from the same seat, must be engine-rejected -- without these a
+         -- hand-edited transcript replays an illegal posting sequence clean
+         -- (and the foreign-seat case does arithmetic on an absent stack)
+         put tStateA["occ"] into tOccList   -- copy before chunking (H6)
+         if pSeatNum is not among the items of tOccList then
+            put "bidAnte-wrong-seat" into tStateA["err"]
+            return tStateA
+         end if
+         if tStateA["antePostedBy"][pSeatNum] is "true" then
+            put "bidAnte-duplicate" into tStateA["err"]
+            return tStateA
+         end if
          put min(tStateA["ante"], tStateA["stackBy"][pSeatNum]) into tPay
          if pAmount is not tPay then
             put "bidAnte-wrong-amount" into tStateA["err"]
             return tStateA
          end if
          put heBetPayDead(tStateA, pSeatNum, tPay) into tStateA
+         put "true" into tStateA["antePostedBy"][pSeatNum]
          return tStateA
 
       case "bidSB"
@@ -2451,12 +2700,20 @@ function heBetApply pStateA, pMsgType, pSeatNum, pAmount
             put "bidSB-wrong-seat" into tStateA["err"]
             return tStateA
          end if
+         -- phase stays "blinds" until the BB posts, so without this flag a
+         -- transcript with two bidSB lines double-charged the small blind and
+         -- still audited clean
+         if tStateA["sbPosted"] is "true" then
+            put "bidSB-duplicate" into tStateA["err"]
+            return tStateA
+         end if
          put min(tStateA["sb"], tStateA["stackBy"][pSeatNum]) into tPay
          if pAmount is not tPay then
             put "bidSB-wrong-amount" into tStateA["err"]
             return tStateA
          end if
          put heBetPay(tStateA, pSeatNum, tPay) into tStateA
+         put "true" into tStateA["sbPosted"]
          return tStateA
 
       case "bidBB"
@@ -2580,6 +2837,17 @@ function heBetApply pStateA, pMsgType, pSeatNum, pAmount
             end if
          else
             put tAmt into tTargetAmt
+            -- chips are integers and the amount arrives as TEXT (the UI box
+            -- today, the wire in Phase 2). A non-number passes the string-
+            -- fallback compares below and then THROWS in the arithmetic; a
+            -- fractional target flows into heSettleOf's div/mod accounting,
+            -- where a fractional remainder hands a whole chip to EVERY winner
+            -- and mints chips -- and the replay audit re-derives the same
+            -- wrong payout, so it stamps the minting hand clean. Reject both.
+            if tTargetAmt is not a number or tTargetAmt is not trunc(tTargetAmt) then
+               put "act-bad-amount" into tStateA["err"]
+               return tStateA
+            end if
             if tVerb is "bet" and tStateA["betCur"] > 0 then
                put "bet-facing-bet-use-raise" into tStateA["err"]
                return tStateA
@@ -2828,6 +3096,28 @@ function heLogIsCleanHotseat pLogTxt
    return false
 end heLogIsCleanHotseat
 
+function heIsCardList pListTxt, pCount
+   -- pure guard for the fold: TRUE only when pListTxt is exactly pCount
+   -- comma-items, each a whole card index 1..52. Keeps a truncated or
+   -- hand-edited transcript from feeding heEval7 short/garbage card lists
+   -- (heCardRankVal on empty or non-numeric text throws). Mirrored in
+   -- tools/fold-kat.py.
+   local tItem
+   set the itemDelimiter to comma
+   if heCountItems(pListTxt) is not pCount then
+      return false
+   end if
+   repeat for each item tItem in pListTxt
+      if tItem is not a number then
+         return false
+      end if
+      if tItem is not trunc(tItem) or tItem < 1 or tItem > 52 then
+         return false
+      end if
+   end repeat
+   return true
+end heIsCardList
+
 function heFoldTranscript pLogTxt
    -- pure fold: replay a transcript and RE-DERIVE everything (engine state,
    -- showdown ranks, settlements); logged settle lines are verified against
@@ -2836,7 +3126,7 @@ function heFoldTranscript pLogTxt
    local tOutA, tLogLine, tType, tBodyTxt, tBodyA, tStateA, tHaveHand
    local tSeatNum, tHolesA, tBoardList, tRanksA, tDeltasA, tDeltasTxt
    local tSevenList, tOccList, tButtonSeat, tSB, tBB, tAnte, tFromTxt, tStacksTxt
-   local tPos, tCardTxt, tOneCard
+   local tPos, tCardTxt, tOneCard, tSettleBad
    local tHistLine, tBoardNames, tPotTotal, tWinnersTxt, tShownTxt, tHolePair, tAuditPart
    set the itemDelimiter to comma
    put 0 into tOutA["handNum"]
@@ -2954,6 +3244,26 @@ function heFoldTranscript pLogTxt
             split tBodyA by comma and "="
             put empty into tRanksA
             if heCountItems(heBetInHandList(tStateA)) > 1 then
+               -- drop-and-log (spec 16 posture): a contested showdown needs 5
+               -- valid board cards and a valid hole pair per unfolded seat. A
+               -- truncated or hand-edited transcript would otherwise feed
+               -- heEval7 short/garbage card lists here and THROW mid-replay,
+               -- killing the whole History fold on exactly the tampered input
+               -- the audit exists to catch. Name it and skip this settle.
+               put "false" into tSettleBad
+               if not heIsCardList(tBoardList, 5) then
+                  put "true" into tSettleBad
+               end if
+               repeat for each item tSeatNum in heBetInHandList(tStateA)
+                  put tHolesA[tSeatNum] into tHolePair
+                  if not heIsCardList(tHolePair, 2) then
+                     put "true" into tSettleBad
+                  end if
+               end repeat
+               if tSettleBad is "true" then
+                  put "settle-bad-cards-hand-" & heLogField(tLogLine, 1) & return after tOutA["errors"]
+                  break
+               end if
                repeat for each item tSeatNum in heBetInHandList(tStateA)
                   put tHolesA[tSeatNum] & comma & tBoardList into tSevenList
                   put heEval7(tSevenList) into tRanksA[tSeatNum]
@@ -3080,6 +3390,14 @@ end heSpeedPace
 
 command heTableNew
    local tSeatNum, tErr
+   -- H1: a fresh hotseat table while an online session is live must stop that
+   -- session FIRST -- "put empty into gGame" below destroys the handle and the
+   -- online flag, after which heNetStop is a no-op forever and the libtorrent
+   -- session (with its poll loop already dead) outlives every teardown path,
+   -- even closeStack. Reached via Settings -> Apply and the game-over
+   -- auto-reset; Leave's own explicit heNetStop stays a harmless second call
+   -- (it exits on the cleared flag).
+   heNetStop
    heCfgEnsure
    put empty into gGame
    put gCfg["sb"] into gGame["sb"]
@@ -3275,6 +3593,18 @@ command heHandStart
    if gGame["phase"] is not "idle" and gGame["phase"] is not "between" then
       exit heHandStart
    end if
+   -- while ONLINE the hotseat engine must never run: gGame["log"] holds the
+   -- signed wire chain, and heLogAppend'ing raw 4-field hotseat lines into it
+   -- would be shipped to every joining peer as junk "w" frames by
+   -- heNetReplayLogTo (the corruption heNetParkHotseat guards in the OTHER
+   -- direction). Reachable because Settings/History dismiss the lobby overlay
+   -- without restoring it, leaving the Deal button clickable. Online
+   -- dealing arrives with the Phase 2 orchestration increment; until then the
+   -- deal is a hotseat-only verb.
+   if gGame["online"] is "true" then
+      heUISetStatus "Online dealing is not wired yet -- press Leave for a hotseat game."
+      exit heHandStart
+   end if
    -- a Deal click during the "between" result-pause starts here while the prior
    -- hand's heNextHandTick is still pending; cancel any in-flight paced step so a
    -- stale timer cannot fire into this hand and auto-deal an unrequested one
@@ -3284,6 +3614,10 @@ command heHandStart
    if heCountItems(tOccList) < 2 then
       heUISetStatus "Game over -- one stack left. Starting a fresh table."
       heTableNew
+      -- the finished game's board/hole cards are still painted (the pending
+      -- heNextHandTick that would have cleared them was cancelled above, and
+      -- no new deal follows to overwrite them) -- clear them with the reset
+      heUIClearCards
       exit heHandStart
    end if
    add 1 to gGame["handNum"]
@@ -3684,6 +4018,12 @@ command heBuildTable
    local tSeatNum, tSpotTxt, tSpotX, tSpotY, tPos, tBetX, tBetY, tName
    set the defaultStack to the short name of this stack
    if there is a graphic "heFelt" and the uHeUIVersion of this stack is kUIVersion then
+      -- the chrome persists in a SAVED stack but script locals do not: without
+      -- re-deriving them here, a reopened stack had an empty gSlotCenter (so
+      -- heKitTryInit -- and heKitReload after it -- pooled ZERO card sprites
+      -- and kit mode was silently unrecoverable), stale avatar caches, and an
+      -- unfitted logo. Rebuild the runtime state from the existing controls.
+      heRehydrateChrome
       exit heBuildTable
    end if
    lock screen
@@ -3833,6 +4173,8 @@ command heBuildTable
    -- all-in; feeds the heAmount box (the Bet/Raise buttons read that). Sits in the thin
    -- margin above the action row. Shown only on a bet/raise turn (heUIPromptToAct).
    create scrollbar "heBetSlider"
+   -- a scale, not a scrollbar: no arrow buttons, a draggable thumb on a track
+   set the style of scrollbar "heBetSlider" to "scale"
    set the rect of scrollbar "heBetSlider" to "528,575,1004,591"
    set the visible of scrollbar "heBetSlider" to false
    heMakeActionButton "heBtnMin", "Min", 608
@@ -3853,6 +4195,36 @@ command heBuildTable
    heKitTryInit
    unlock screen
 end heBuildTable
+
+command heRehydrateChrome
+   -- a REOPENED saved stack keeps its built chrome and its uHeUIVersion, so
+   -- heBuildTable's version-match exit skips the whole build -- but script
+   -- locals (gSlotCenter, gUIMode, gCardSpr, the sheet suffixes, gAvatarOn)
+   -- do NOT persist in a saved stack. Re-derive everything the skipped build
+   -- would have set: slot centres from the existing controls' locs (a slot
+   -- field's loc IS the centre heMakeCardSlot recorded), the avatar
+   -- image-vs-initial caches, the logo fit, then the kit probe itself.
+   local tSeatNum, tPos, tSlotName
+   repeat with tPos = 1 to 5
+      put "heBoard" & tPos into tSlotName
+      if there is a field tSlotName then
+         put the loc of field tSlotName into gSlotCenter[tSlotName]
+      end if
+   end repeat
+   repeat with tSeatNum = 1 to kHeDefaultSeats
+      put "heHole" & tSeatNum & "a" into tSlotName
+      if there is a field tSlotName then
+         put the loc of field tSlotName into gSlotCenter[tSlotName]
+      end if
+      put "heHole" & tSeatNum & "b" into tSlotName
+      if there is a field tSlotName then
+         put the loc of field tSlotName into gSlotCenter[tSlotName]
+      end if
+      heSeatAvatarRender tSeatNum
+   end repeat
+   heTableLogoRender
+   heKitTryInit
+end heRehydrateChrome
 
 command heBuildLobby
    -- the online lobby overlay: Create/Join a table, watch peers connect over
@@ -4572,21 +4944,31 @@ end heMakeAvatar
 command heSeatAvatarRender pSeatNum
    -- choose picked-image vs coloured-initial for one seat; caches the choice in
    -- gAvatarOn so heSeatChromeVisible (the 4Hz hot path) never reloads the file
-   local tPath, tName, tInitial, tFill
+   local tPath, tName, tInitial, tFill, tPaths, tLocTxt, tCx, tCy, tNatW, tNatH
    set the itemDelimiter to ";"
    put item pSeatNum of kHeAvatarFills into tFill
    set the itemDelimiter to comma
    if there is a graphic ("heSeatAv" & pSeatNum) then
       set the backgroundColor of graphic ("heSeatAv" & pSeatNum) to tFill
    end if
-   put the ("uHeAvatarPath" & pSeatNum) of this stack into tPath
+   put the uHeAvatarPaths of this stack into tPaths
+   put line pSeatNum of tPaths into tPath
    if tPath is not empty and there is a file tPath then
       put "true" into gAvatarOn[pSeatNum]
       if there is an image ("heSeatAvImg" & pSeatNum) then
+         -- setting the filename resets the control to the picture's natural size,
+         -- so re-rect AFTER it -- aspect-fit inside the disc (formatWidth/Height are
+         -- the loaded picture's natural pixels) so a non-square photo letterboxes
+         -- on the coloured disc instead of stretching
          set the filename of image ("heSeatAvImg" & pSeatNum) to tPath
          if there is a graphic ("heSeatAv" & pSeatNum) then
+            put the loc of graphic ("heSeatAv" & pSeatNum) into tLocTxt
+            put item 1 of tLocTxt into tCx
+            put item 2 of tLocTxt into tCy
+            put the formatWidth of image ("heSeatAvImg" & pSeatNum) into tNatW
+            put the formatHeight of image ("heSeatAvImg" & pSeatNum) into tNatH
             set the rect of image ("heSeatAvImg" & pSeatNum) to \
-                  the rect of graphic ("heSeatAv" & pSeatNum)
+                  heFitRect(tNatW, tNatH, tCx, tCy, kHeAvatarSize)
          end if
          set the visible of image ("heSeatAvImg" & pSeatNum) to true
       end if
@@ -4608,7 +4990,7 @@ command heSeatAvatarRender pSeatNum
 end heSeatAvatarRender
 
 command heSeatAvatarPick pSeatNum
-   local tFile, tPropNm, tName, tPrompt
+   local tFile, tName, tPrompt, tPaths
    set the itemDelimiter to comma
    put item pSeatNum of kHeSeatNames into tName
    put "Choose an avatar image for " & tName into tPrompt
@@ -4617,8 +4999,12 @@ command heSeatAvatarPick pSeatNum
    if tFile is empty then
       exit heSeatAvatarPick   -- cancelled
    end if
-   put "uHeAvatarPath" & pSeatNum into tPropNm
-   set the (tPropNm) of this stack to tFile
+   -- ONE uHeAvatarPaths property, line N = seat N's path (paths cannot contain a
+   -- newline, so the line index is safe). A computed property NAME would need the
+   -- parenthesised dynamic-property form, which is not portable xTalk -- H9.
+   put the uHeAvatarPaths of this stack into tPaths
+   put tFile into line pSeatNum of tPaths
+   set the uHeAvatarPaths of this stack to tPaths
    heSeatAvatarRender pSeatNum
    heUISetStatus tName && "portrait updated."
 end heSeatAvatarPick
@@ -4636,22 +5022,43 @@ command heTableLogoPick
 end heTableLogoPick
 
 command heTableLogoRender
-   local tPath
+   local tPath, tNatW, tNatH
    if there is not an image "heTableLogo" then
       exit heTableLogoRender
    end if
    put the uHeTableLogoPath of this stack into tPath
    if tPath is not empty and there is a file tPath then
+      -- filename first (it resets the control to the picture's natural size),
+      -- then aspect-fit the rect into the logo box centred on the felt
       set the filename of image "heTableLogo" to tPath
-      set the rect of image "heTableLogo" to \
-            (512 - kHeLogoBox div 2) & comma & (300 - kHeLogoBox div 2) & comma \
-            & (512 + kHeLogoBox div 2) & comma & (300 + kHeLogoBox div 2)
+      put the formatWidth of image "heTableLogo" into tNatW
+      put the formatHeight of image "heTableLogo" into tNatH
+      set the rect of image "heTableLogo" to heFitRect(tNatW, tNatH, 512, 300, kHeLogoBox)
       set the blendLevel of image "heTableLogo" to kHeLogoDim
       set the visible of image "heTableLogo" to true
    else
       set the visible of image "heTableLogo" to false
    end if
 end heTableLogoRender
+
+function heFitRect pNatW, pNatH, pCx, pCy, pBox
+   -- the largest aspect-preserving rect that fits a pBox square centred on
+   -- (pCx,pCy). Pure values-in/values-out (H5); integer div keeps it exact.
+   -- Bad/missing natural sizes (image not loaded yet) fall back to the full box.
+   local tW, tH
+   if pNatW is not a number or pNatH is not a number or pNatW <= 0 or pNatH <= 0 then
+      put pBox into tW
+      put pBox into tH
+   else if pNatW >= pNatH then
+      put pBox into tW
+      put round(pBox * pNatH / pNatW) into tH
+   else
+      put pBox into tH
+      put round(pBox * pNatW / pNatH) into tW
+   end if
+   return (pCx - tW div 2) & comma & (pCy - tH div 2) & comma \
+         & (pCx + tW div 2) & comma & (pCy + tH div 2)
+end heFitRect
 
 command heBetSliderShow pMinTo, pMaxTo
    if there is not a scrollbar "heBetSlider" then
@@ -4665,6 +5072,12 @@ command heBetSliderShow pMinTo, pMaxTo
    set the startValue of scrollbar "heBetSlider" to pMinTo
    set the endValue of scrollbar "heBetSlider" to pMaxTo
    set the thumbPosition of scrollbar "heBetSlider" to pMinTo
+   -- track clicks step by a big blind (page = 4 blinds), so keyboard-free sizing
+   -- lands on natural amounts
+   if gGame["bb"] is a number and gGame["bb"] > 0 then
+      set the lineInc of scrollbar "heBetSlider" to gGame["bb"]
+      set the pageInc of scrollbar "heBetSlider" to gGame["bb"] * 4
+   end if
    set the visible of scrollbar "heBetSlider" to true
 end heBetSliderShow
 
@@ -4699,11 +5112,56 @@ end heBetSliderSync
 on scrollbarDrag pNewPos
    -- the bet slider feeds the amount box live; any other scrollbar passes through
    if the short name of the target is "heBetSlider" then
-      set the text of field "heAmount" to round(the thumbPosition of the target)
+      set the text of field "heAmount" to round(pNewPos)
       exit scrollbarDrag
    end if
    pass scrollbarDrag
 end scrollbarDrag
+
+-- track/step clicks on the scale: the engine moves the thumb as its DEFAULT
+-- action, so these always pass, and the field syncs on a short deferred send
+-- (after the default has landed) -- the house defer-out-of-dispatch pattern.
+on scrollbarLineInc
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarLineInc
+end scrollbarLineInc
+
+on scrollbarLineDec
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarLineDec
+end scrollbarLineDec
+
+on scrollbarPageInc
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarPageInc
+end scrollbarPageInc
+
+on scrollbarPageDec
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarPageDec
+end scrollbarPageDec
+
+command heBetSliderFromThumb
+   -- deferred: read wherever the engine left the thumb and mirror it into the
+   -- amount box. Guarded against the slider having been hidden since the send.
+   if there is not a scrollbar "heBetSlider" then
+      exit heBetSliderFromThumb
+   end if
+   if not the visible of scrollbar "heBetSlider" then
+      exit heBetSliderFromThumb
+   end if
+   if there is a field "heAmount" then
+      set the text of field "heAmount" to round(the thumbPosition of scrollbar "heBetSlider")
+   end if
+end heBetSliderFromThumb
 
 function heStackFolder
    -- the folder that holds the SAVED stack file, so an assets/ folder sitting next
@@ -4746,11 +5204,13 @@ end heSwapExt
 
 command heKitTryInit
    local tIdx, tKitErr, tBacksErr, tPng, tXml, tBackPng, tBackXml, tDir
-   local tSlot, tCtr, tSpr, tFrameW
+   local tSlot, tCtr, tSpr, tFrameW, tBackFrameW
    put "flat" into gUIMode
    put 0 into gAnimBusy
    put empty into gCardSpr
    put empty into gKitSuffix
+   put empty into gKitBackSuffix
+   put empty into gKitLastErr
    if not heHasKit() then
       exit heKitTryInit
    end if
@@ -4820,16 +5280,32 @@ command heKitTryInit
       end repeat
       -- the backs sheet (face-down cards): load + size + pre-warm the chosen back.
       -- Guarded so a missing/failed backs sheet never costs us the loaded faces.
+      -- Suffix and frame width are probed PER SHEET (gotcha 24: frame-name
+      -- conventions vary per sheet -- a custom uHeBacksPath atlas may keep or
+      -- strip ".png" and carry a different card width than the faces sheet).
       try
          if tBackPng is not empty and there is a file (tBackPng) then
             b2kSheetLoadAtlas "heCardBacks", tBackPng, tBackXml
-            b2kSheetScale "heCardBacks", kHeCardW / tFrameW
-            b2kSheetEnsureIcon "heCardBacks", kHeCardBackFrame & gKitSuffix
+            if b2kSheetHasFrame("heCardBacks", kHeCardBackFrame & ".png") then
+               put ".png" into gKitBackSuffix
+            else
+               put empty into gKitBackSuffix
+            end if
+            put item 1 of b2kSheetFrameSize("heCardBacks", kHeCardBackFrame & gKitBackSuffix) \
+                  into tBackFrameW
+            if tBackFrameW is not a number or tBackFrameW is 0 then
+               put tFrameW into tBackFrameW
+            end if
+            b2kSheetScale "heCardBacks", kHeCardW / tBackFrameW
+            b2kSheetEnsureIcon "heCardBacks", kHeCardBackFrame & gKitBackSuffix
          end if
       catch tBacksErr
       end try
       put "kit" into gUIMode
    catch tKitErr
+      -- keep the reason: heProbeKit's whole job is naming the exact gap, and a
+      -- silent drop to flat left it able to say only "kit mode is OFF"
+      put tKitErr into gKitLastErr
       put "flat" into gUIMode
    end try
 end heKitTryInit
@@ -4888,6 +5364,11 @@ command heProbeKit
       put "sheets: not loaded yet" & return after tOut
    end try
    if gUIMode is not "kit" then
+      -- the recorded reason the last init dropped to flat (self-diagnosing:
+      -- without it this probe could only say OFF, never why)
+      if gKitLastErr is not empty then
+         put "last kit-init error: " & gKitLastErr & return after tOut
+      end if
       put return & "==> kit mode is OFF. If the checks above look right, run heKitReload" & return after tOut
       put "    to (re)build the card sprites, then run heProbeKit again." & return after tOut
    else
@@ -4936,8 +5417,12 @@ on mouseUp
          heTableJoin tCodeTxt
          exit mouseUp
       case "heBtnCopyCode"
-         if gGame["tableIdHex"] is empty then
-            heUISetStatus "No table yet -- Create one first."
+         -- the invite is only real once a table is HOSTED/JOINED: heTableNew
+         -- also fills tableIdHex (the Level 0 deal domain) for every hotseat
+         -- table when SodiumXT is present, so testing it for empty handed out
+         -- a dead code nobody announces -- a joiner would wait forever
+         if gGame["online"] is not "true" or gGame["tableIdHex"] is empty then
+            heUISetStatus "No online table yet -- Create one first."
          else
             set the clipboardData["text"] to gGame["tableIdHex"]
             heUISetStatus "Invite code copied to the clipboard."
@@ -5031,6 +5516,14 @@ on mouseUp
    if tAmt is not a number then
       put 0 into tAmt
    end if
+   -- chips are integers: a typed "2.5" is a number, and a fractional wager
+   -- would flow through heBetApply into heSettleOf's div/mod chip accounting,
+   -- where a fractional remainder hands a whole chip to every winner and MINTS
+   -- chips (conservation break that then audits clean, because the fold
+   -- re-derives the same wrong payout). The engine now also rejects
+   -- non-integers (act-bad-amount) as the Phase 2 wire backstop; this trunc
+   -- keeps the local UX forgiving instead of surfacing a rejection.
+   put trunc(tAmt) into tAmt
    switch tWho
       case "heBtnFold"
          heActionDo tSeatNum, "fold", 0
@@ -5119,7 +5612,7 @@ end heUISetStatus
 
 command heUIPromptToAct
    local tSeatNum, tLegalTxt, tLine, tHasCheck, tHasCall, tHasBet, tHasRaise
-   local tHasAllin, tCallAmt, tName
+   local tHasAllin, tCallAmt, tName, tMinTo, tMaxTo
    set the itemDelimiter to comma
    if gGame["phase"] is not "hand" then
       exit heUIPromptToAct
@@ -5170,9 +5663,11 @@ command heUIPromptToAct
    -- seed the amount box with the minimum legal bet/raise-to, and arm the slider
    -- between that minimum and all-in (streetBy + stackBy). No bet/raise -> hide it.
    if (tHasBet or tHasRaise) and there is a field "heAmount" then
-      set the text of field "heAmount" to heQuickAmount(tSeatNum, "min")
-      heBetSliderShow heQuickAmount(tSeatNum, "min"), \
-            (gGame["state"]["streetBy"][tSeatNum] + gGame["state"]["stackBy"][tSeatNum])
+      put heQuickAmount(tSeatNum, "min") into tMinTo
+      put gGame["state"]["streetBy"][tSeatNum] + gGame["state"]["stackBy"][tSeatNum] \
+            into tMaxTo
+      set the text of field "heAmount" to tMinTo
+      heBetSliderShow tMinTo, tMaxTo
    else
       heBetSliderHide
    end if
@@ -5259,8 +5754,11 @@ command heHudRefresh
    set the visible of graphic "hePotChip" to (tPotAmt > 0)
    set the text of field "heHeader" to heHeaderTxt()
    -- Deal is offered only from a settled table; during reveal/runout/showdown
-   -- beats it stays inert so a click cannot cut a paced sequence short
-   heEnableBtn "heBtnDeal", (gGame["phase"] is "idle" or gGame["phase"] is "between")
+   -- beats it stays inert so a click cannot cut a paced sequence short -- and
+   -- never while online (the hotseat engine would corrupt the signed wire log;
+   -- heHandStart carries the same gate as the backstop)
+   heEnableBtn "heBtnDeal", ((gGame["phase"] is "idle" or gGame["phase"] is "between") \
+         and gGame["online"] is not "true")
    if gGame["phase"] is not "hand" then
       heDisableActions
    end if
@@ -5417,7 +5915,7 @@ function heHeaderTxt
    if gGame["ante"] > 0 then
       put "     Ante " & gGame["ante"] after tTxt
    end if
-   if gGame["levelMode"] is "hands" and gGame["curLevel"] > 0 then
+   if gGame["levelMode"] is not "off" and gGame["curLevel"] > 0 then
       put "     Level " & gGame["curLevel"] after tTxt
    end if
    return tTxt
@@ -5699,12 +6197,20 @@ command heRunSection pName
    -- run one test section under a guard: a runtime fault is caught, counted as a
    -- FAIL with its error text, and the remaining sections still run. Keeps a
    -- first-contact arithmetic error in a new section from aborting the harness.
-   local tErr
+   -- gGame is snapshotted around the section: several sections (netsim above
+   -- all) swap gGame for a synthetic context and restore it on their LAST line,
+   -- so a mid-section throw used to leave the user's REAL game replaced by the
+   -- sim corpse (fake keys, online "true") -- the next Deal click acted on it.
+   -- On a throw, the pre-section gGame comes back; a clean section keeps its
+   -- own (already restored) state.
+   local tErr, tGameSaved
+   put gGame into tGameSaved
    try
       do pName
    catch tErr
       add 1 to gFailN
       put "FAIL  " & pName & " THREW: " & tErr & return after gRpt
+      put tGameSaved into gGame
    end try
 end heRunSection
 
@@ -5743,7 +6249,7 @@ command heTestDealRun
    -- commit-reveal dealing protocol the online game uses.
    local tSeedsA, tXorHex, tKeyData, tDeckList, tDealA, tCommitsA, tTableData
    local tDealLog, tHoles1, tHoles2, tHoles3, tFlopP, tAuditOut
-   put return & "-- 7. Level 0 keyed-stream deal (spec 7.1, crypto path)" & return after gRpt
+   put return & "-- 11. Level 0 keyed-stream deal (spec 7.1, crypto path)" & return after gRpt
    if not heHasSodium() then
       heTSkip "deal: Level 0 keyed-stream", "SodiumXT not installed"
       exit heTestDealRun
@@ -5765,6 +6271,9 @@ command heTestDealRun
    heTAssert "deal: flop", heTNamesOf(tDealA["flopList"]), kKatFlop
    heTAssert "deal: turn", heCardName(tDealA["turnIx"]), kKatTurn
    heTAssert "deal: river", heCardName(tDealA["riverIx"]), kKatRiver
+   -- the burns were pinned in protocol-kat all along but never re-checked
+   -- on-engine; a consumption-order drift would shift every later card
+   heTAssert "deal: burn cards (KAT-pinned)", heTNamesOf(tDealA["burnsList"]), "Jd,9d,3d"
    -- end-of-hand audit: honest deal passes; a corrupted commit is named
    put heSeedCommitHex(kKatSeed1) into tCommitsA[1]
    put heSeedCommitHex(kKatSeed2) into tCommitsA[2]
@@ -5874,7 +6383,7 @@ command heTestLobbyRun
    -- the exact wires the transport carries, with no network. SKIPs w/o SodiumXT.
    local tPub, tSec, tHostPubHex, tContent, tWire1, tWire2, tWire3, tHead1, tHead2, tHead3
    local tMembers, tMembersRev, tRoster, tClientHead, tVerdict
-   put return & "-- 8. Online lobby: signed presence + transcript replay (spec 9)" & return after gRpt
+   put return & "-- 13. Online lobby: signed presence + transcript replay (spec 9)" & return after gRpt
    if not heHasSodium() then
       heTSkip "lobby: signed presence + replay", "SodiumXT not installed"
       exit heTestLobbyRun
@@ -5944,10 +6453,10 @@ command heTestNetSim
    -- resync request finds no host peer). gGame is saved and restored so the sim
    -- never disturbs the live game. SKIPs without SodiumXT.
    local tSaved, tHostPub, tHostSec, tPlayPub, tPlaySec, tHostPubHex, tPlayPubHex
-   local tCfgWire, tWire2, tWire3, tHostLog, tContent, tSenderSig, tPacket
-   local tHead1, tHead2, tHead3, tBadPub, tBadSec
+   local tCfgWire, tRosterWire, tActWire, tCfg2Wire, tHostLog, tContent, tSenderSig, tPacket
+   local tHead1, tHead2, tHead3, tHead4, tBadPub, tBadSec, tBadPubHex, tGhostWire
    local tPriorCfg, tForgedWire, tPriorHead, tWrongTable, tWrongWire
-   put return & "-- 10. Online orchestration loopback (single machine, no rp1)" & return after gRpt
+   put return & "-- 14. Online orchestration loopback (single machine, no rp1)" & return after gRpt
    if not heHasSodium() then
       heTSkip "netsim: online orchestration", "SodiumXT not installed"
       exit heTestNetSim
@@ -5957,8 +6466,10 @@ command heTestNetSim
 
    sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tHostPub, tHostSec
    sxSignKeypairFromSeed heHex2BinD(kKatIdSeed2), tPlayPub, tPlaySec
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed3), tBadPub, tBadSec
    put heBin2HexS(tHostPub) into tHostPubHex
    put heBin2HexS(tPlayPub) into tPlayPubHex
+   put heBin2HexS(tBadPub) into tBadPubHex
 
    -- ===== HOST context =====
    put empty into gGame
@@ -5972,6 +6483,9 @@ command heTestNetSim
    put 0 into gGame["seqCounter"]
    put 0 into gGame["syncCooldown"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put "true" into gGame["admittedA"][tHostPubHex]
    put "true" into gGame["admittedA"][tPlayPubHex]     -- as if the player already handshook
    put "host" into gGame["roleByPub"][tHostPubHex]
@@ -5984,32 +6498,40 @@ command heTestNetSim
    put line 1 of tHostLog into tCfgWire
    put gGame["chainHeadHex"] into tHead1
 
-   -- a player's signed action arrives; the host relays it (seq 2). This is the
+   -- host publishes the roster (seq 2) through the REAL emitter, exactly as it
+   -- does after every admission -- this is what makes the player's later action
+   -- a ROSTERED sender on every client (the spec 6 unknown-from rule)
+   heHostEmitRoster
+   put gGame["log"] into tHostLog
+   heTAssert "netsim: host emitted the roster (seq 2)", the number of lines of tHostLog, 2
+   put line 2 of tHostLog into tRosterWire
+   put gGame["chainHeadHex"] into tHead2
+
+   -- a player's signed action arrives; the host relays it (seq 3). This is the
    -- real star-topology path minus the rp1 hop (peerPubA is empty, no broadcast).
    put heEnvContentLine(kKatTableHex, 0, tPlayPubHex, "act", "verb=check,amount=0") into tContent
    put heEnvSenderSigHex(tContent, tPlaySec) into tSenderSig
    put tContent & tab & tSenderSig into tPacket
    heHostRelay 0, tPacket
    put gGame["log"] into tHostLog
-   heTAssert "netsim: host verified + relayed a player action (seq 2)", the number of lines of tHostLog, 2
-   put line 2 of tHostLog into tWire2
-   put gGame["chainHeadHex"] into tHead2
+   heTAssert "netsim: host verified + relayed a player action (seq 3)", the number of lines of tHostLog, 3
+   put line 3 of tHostLog into tActWire
+   put gGame["chainHeadHex"] into tHead3
 
-   -- host emits a third wire (seq 3)
+   -- host emits a fourth wire (a cfg refresh)
    heNetSendAction "cfg", kKatLobbyCfgBody
    put gGame["log"] into tHostLog
-   put line 3 of tHostLog into tWire3
-   put gGame["chainHeadHex"] into tHead3
+   put line 4 of tHostLog into tCfg2Wire
+   put gGame["chainHeadHex"] into tHead4
 
    -- a validly-signed action from an UNADMITTED key must be dropped by the relay
    -- (admission is enforced, not just the signature) -- no new wire is produced
-   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed3), tBadPub, tBadSec
-   put heEnvContentLine(kKatTableHex, 0, heBin2HexS(tBadPub), "act", "verb=bet,amount=99") into tContent
+   put heEnvContentLine(kKatTableHex, 0, tBadPubHex, "act", "verb=bet,amount=99") into tContent
    put heEnvSenderSigHex(tContent, tBadSec) into tSenderSig
    put tContent & tab & tSenderSig into tPacket
    heHostRelay 0, tPacket
    put gGame["log"] into tHostLog
-   heTAssert "netsim: host drops an unadmitted sender (no new wire)", the number of lines of tHostLog, 3
+   heTAssert "netsim: host drops an unadmitted sender (no new wire)", the number of lines of tHostLog, 4
 
    -- ===== PLAYER context =====
    put empty into gGame
@@ -6021,28 +6543,60 @@ command heTestNetSim
    put kKatTableHex into gGame["tableIdHex"]
    put 0 into gGame["syncCooldown"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
 
-   -- player ingests the host cfg wire -> chain advances, cfg body stashed
+   -- player ingests the host cfg wire (seq 1) -> chain advances, cfg body stashed
    heNetIngestWire tCfgWire
    heTAssert "netsim: player accepts host cfg + advances chain to head1", gGame["chainHeadHex"], tHead1
    heTAssert "netsim: player stashed the cfg body", gGame["cfgBody"], kKatLobbyCfgBody
+   heTAssert "netsim: player lastSeq is 1 after cfg", gGame["lastSeq"], 1
 
-   -- GAP: player misses wire 2, receives wire 3 -> chain break, head unchanged
-   heNetIngestWire tWire3
-   heTAssert "netsim: player drops the ahead-of-gap wire (chain unchanged)", gGame["chainHeadHex"], tHead1
+   -- the roster (seq 2) folds and now lists the player as a member
+   heNetIngestWire tRosterWire
+   heTAssert "netsim: player accepts the roster, chain at head2", gGame["chainHeadHex"], tHead2
+   heTContains "netsim: the roster body lists the player", gGame["rosterBody"], tPlayPubHex
 
-   -- RESYNC replay: host replays 2 then 3 -> player recovers to head3
-   heNetIngestWire tWire2
-   heNetIngestWire tWire3
-   heTAssert "netsim: player recovers to the host chain head after replay", gGame["chainHeadHex"], tHead3
+   -- REORDER: the player receives wire 4 (seq 4) BEFORE wire 3 -- rp1 reorders.
+   -- It must be HELD (buffered), not dropped, and the chain must stay put.
+   heNetIngestWire tCfg2Wire
+   heTAssert "netsim: out-of-order future wire is held, chain unchanged", gGame["chainHeadHex"], tHead2
+   heTAssert "netsim: the gap wire is buffered (not dropped)", gGame["wireBufN"], 1
+
+   -- the missing wire 3 arrives: it applies (a rostered sender's action) AND the
+   -- buffered wire 4 drains behind it, so the chain jumps straight to head4.
+   heNetIngestWire tActWire
+   heTAssert "netsim: filling the gap cascades the buffered wire to head4", gGame["chainHeadHex"], tHead4
+   heTAssert "netsim: buffer emptied after the cascade", gGame["wireBufN"], 0
+
+   -- DUPLICATES: rp1 redelivers wires constantly. An already-applied wire must be
+   -- dropped SILENTLY -- no chain change, no resync -- or the client resync-loops
+   -- forever and the game never starts (the actual networked bug this fixes).
+   heNetIngestWire tCfgWire
+   heTAssert "netsim: a duplicate cfg (seq 1) is dropped, chain unchanged", gGame["chainHeadHex"], tHead4
+   heNetIngestWire tActWire
+   heNetIngestWire tCfg2Wire
+   heTAssert "netsim: duplicate wires 3 and 4 are dropped, chain stays head4", gGame["chainHeadHex"], tHead4
+   heTAssert "netsim: lastSeq stays 4 through the duplicates", gGame["lastSeq"], 4
+
+   -- spec 6 unknown-from (deep-dive transport): a host-SIGNED wire whose sender
+   -- is not in the host-signed roster can only mean a corrupt host stream. The
+   -- chain link is authentic so it advances (refusing it would wedge the
+   -- table), but the body is marked and never folds.
+   put heEnvContentLine(kKatTableHex, 0, tBadPubHex, "act", "verb=bet,amount=99") into tContent
+   put heWireBuild(tContent, tBadSec, 5, gGame["chainHeadHex"], tHostSec) into tGhostWire
+   heNetIngestWire tGhostWire
+   heTAssert "netsim: an unrostered sender's wire still advances the chain (seq 5)", gGame["lastSeq"], 5
+   heTContains "netsim: the unrostered sender is marked in the net feed", gGame["netLog"], "unrostered sender"
 
    -- host-authority on ingest (deep-dive [1]/[6]): a wire whose cfg content is
-   -- authored by a NON-host key -- even if it is otherwise valid and host-signed --
-   -- must NOT overwrite the cfg body. Build one from the player key and confirm the
-   -- stashed cfg is untouched.
+   -- authored by a NON-host key -- even if it is otherwise valid, host-signed,
+   -- and from a ROSTERED member -- must NOT overwrite the cfg body. Build one
+   -- from the player key and confirm the stashed cfg is untouched.
    put gGame["cfgBody"] into tPriorCfg
    put heEnvContentLine(kKatTableHex, 0, tPlayPubHex, "cfg", "v=1,level=0,sb=999,bb=999,seats=6,button=1") into tContent
-   put heWireBuild(tContent, tPlaySec, 4, gGame["chainHeadHex"], tHostSec) into tForgedWire
+   put heWireBuild(tContent, tPlaySec, 6, gGame["chainHeadHex"], tHostSec) into tForgedWire
    heNetIngestWire tForgedWire
    heTAssert "netsim: a non-host cfg body is not folded (host-authority)", gGame["cfgBody"], tPriorCfg
 
@@ -6051,7 +6605,7 @@ command heTestNetSim
    put gGame["chainHeadHex"] into tPriorHead
    put "1111111111111111111111111111111111111111111111111111111111111111" into tWrongTable
    put heEnvContentLine(tWrongTable, 0, tHostPubHex, "cfg", kKatLobbyCfgBody) into tContent
-   put heWireBuild(tContent, tHostSec, 5, tPriorHead, tHostSec) into tWrongWire
+   put heWireBuild(tContent, tHostSec, 7, tPriorHead, tHostSec) into tWrongWire
    heNetIngestWire tWrongWire
    heTAssert "netsim: a wire for another table is dropped (chain unchanged)", gGame["chainHeadHex"], tPriorHead
 
@@ -6064,7 +6618,7 @@ command heTestCryptoRun
    -- foundation runs on this engine with the corrected sxHash/sign calls.
    local tPub, tSec, tHostPub, tHostSec, tContent, tWire, tPrevHex, tChainData
    local tSenderSeeds, tHands, tTypes, tBodies, tSeq, tTampered
-   put return & "-- 6. SodiumXT crypto: hash / identity / signed envelope (spec 6)" & return after gRpt
+   put return & "-- 9. SodiumXT crypto: hash / identity / signed envelope (spec 6)" & return after gRpt
    if not heHasSodium() then
       heTSkip "crypto: all SodiumXT KATs", "SodiumXT not installed"
       exit heTestCryptoRun
@@ -6159,7 +6713,7 @@ command heTestReceiptRun
    -- simulated with the KAT identities, so the MULTI-PARTY signed ledger is
    -- verified on one machine. SKIPs without SodiumXT.
    local tPub1, tSec1, tPub2, tSec2, tPub3, tSec3, tSh2, tRh1, tRh2, tSig1, tSig2, tSig3
-   put return & "-- 13. Host trust: checkpoints + multi-signed settlement receipts" & return after gRpt
+   put return & "-- 10. Host trust: checkpoints + multi-signed settlement receipts" & return after gRpt
    if not heHasSodium() then
       heTSkip "receipts: ckpt + settlement receipts", "SodiumXT not installed"
       exit heTestReceiptRun
@@ -6292,7 +6846,7 @@ command heTestEvaluatorRun
          end if
       end repeat
    end repeat
-   heTAssert "eval: order independence (24 hands x 4 permutations)", tBad, 0
+   heTAssert "eval: order independence (26 hands x 4 permutations)", tBad, 0
 
    put 0 into tPos
    repeat for each line tVecLine in heTVectors()
@@ -6398,11 +6952,36 @@ command heTestBettingRun
    put heTAct(tStateA, 3, "bet,10", empty, "bet: flop bet 10") into tStateA
    put heTAct(tStateA, 1, "call,10", empty, "bet: flop call") into tStateA
    put heTAct(tStateA, 2, "allin,11", empty, "bet: under-raise all-in accepted") into tStateA
+   heTAssert "bet: betCur moves to 11 on the under-raise", tStateA["betCur"], 11
    heTAssert "bet: raiseFull stays 10 after under-raise", tStateA["raiseFull"], 10
    put heTAct(tStateA, 3, "raise,25", "raise-not-reopened", "bet: bettor cannot re-raise under-raise") into tStateA
    put heTAct(tStateA, 3, "call,1", empty, "bet: bettor calls the extra") into tStateA
+   put heTAct(tStateA, 1, "raise,25", "raise-not-reopened", "bet: caller cannot re-raise either") into tStateA
    put heTAct(tStateA, 1, "call,1", empty, "bet: caller calls the extra") into tStateA
    heTAssert "bet: street closes to turn", tStateA["street"], "turn"
+
+   -- BB option: limps come back to the BB, who may RAISE its option, and the
+   -- limpers must then respond (mirror of betting-kat case_bb_option -- the
+   -- old harness only ever had the BB CHECK its option)
+   put heTBlinds(heTNewHand(1, 2, "100,100,100", "1,2,3", 1)) into tStateA
+   put heTAct(tStateA, 1, "call,2", empty, "opt: utg limps") into tStateA
+   put heTAct(tStateA, 2, "call,1", empty, "opt: sb completes") into tStateA
+   heTAssert "opt: action returns to the BB (option)", tStateA["toAct"], 3
+   put heTAct(tStateA, 3, "raise,6", empty, "opt: BB raises its option") into tStateA
+   heTAssert "opt: limpers must respond to the option raise", tStateA["toAct"], 1
+
+   -- checked-around street + the out-of-turn rejection (mirror of betting-kat
+   -- case_check_around -- the only out-of-turn pin, previously CI-only)
+   put heTBlinds(heTNewHand(1, 2, "100,100,100", "1,2,3", 1)) into tStateA
+   put heTAct(tStateA, 1, "call,2", empty, "chk: limp") into tStateA
+   put heTAct(tStateA, 2, "call,1", empty, "chk: sb completes") into tStateA
+   put heTAct(tStateA, 3, "check,0", empty, "chk: bb checks its option") into tStateA
+   heTAssert "chk: flop opens on the sb", tStateA["toAct"], 2
+   put heTAct(tStateA, 3, "check,0", "act-out-of-turn", "chk: acting out of turn is rejected") into tStateA
+   put heTAct(tStateA, 2, "check,0", empty, "chk: flop check 1") into tStateA
+   put heTAct(tStateA, 3, "check,0", empty, "chk: flop check 2") into tStateA
+   put heTAct(tStateA, 1, "check,0", empty, "chk: flop check 3") into tStateA
+   heTAssert "chk: a checked-around street advances", tStateA["street"], "turn"
 
    put heTBlinds(heTNewHand(1, 2, "100,50,20", "1,2,3", 1)) into tStateA
    put heTAct(tStateA, 1, "allin,100", empty, "pot: open shove") into tStateA
@@ -6472,7 +7051,7 @@ command heTestAnteRun
    -- antes are dead money: into the pot (handBy), NEVER the street bet, so a seat
    -- still owes the full blind. Mirror of betting-kat case_antes / conservation.
    local tStateA, tDeltasA, tRanksA, tSeatNum
-   put return & "-- 2b. antes (dead money) + chip conservation" & return after gRpt
+   put return & "-- 3. antes (dead money) + chip conservation" & return after gRpt
    set the itemDelimiter to comma
 
    put heTNewHandAnte(1, 2, 1, "100,100,100", "1,2,3", 1) into tStateA
@@ -6539,13 +7118,29 @@ command heTestAnteRun
    put heBetApply(tStateA, "bidSB", 2, min(50, 55)) into tStateA
    heTAssert "ante: a pre-ante blind cap is rejected (regression guard)", \
          tStateA["err"], "bidSB-wrong-amount"
+
+   -- duplicate-post rejection (mirror of betting-kat case_duplicate_posts):
+   -- phase stays "blinds" until the BB posts, so without the posted flags a
+   -- transcript repeating a bidSB/bidAnte replayed clean AND audited clean
+   put heTNewHandAnte(1, 2, 1, "100,100,100", "1,2,3", 1) into tStateA
+   repeat with tSeatNum = 1 to 3
+      put heBetApply(tStateA, "bidAnte", tSeatNum, 1) into tStateA
+   end repeat
+   put heBetApply(tStateA, "bidAnte", 1, 1) into tStateA
+   heTAssert "ante: a repeated ante is rejected", tStateA["err"], "bidAnte-duplicate"
+   put heBetApply(tStateA, "bidAnte", 4, 1) into tStateA
+   heTAssert "ante: an ante from outside the hand is rejected", tStateA["err"], "bidAnte-wrong-seat"
+   put heBetApply(tStateA, "bidSB", 2, 1) into tStateA
+   heTAssert "ante: the first SB still posts clean", tStateA["err"], empty
+   put heBetApply(tStateA, "bidSB", 2, 1) into tStateA
+   heTAssert "ante: a repeated SB is rejected", tStateA["err"], "bidSB-duplicate"
 end heTestAnteRun
 
 command heTestLevelRun
    -- tournament blind schedule: pure level selection by hand number (heLevelFor).
    -- Mirror of betting-kat case_levels.
    local tLv
-   put return & "-- 2c. tournament blind levels (heLevelFor)" & return after gRpt
+   put return & "-- 4. tournament blind levels (heLevelFor)" & return after gRpt
    put "1/2/0;2/4/0;3/6/0;5/10/0;10/20/0;15/30/0;25/50/0;50/100/10" into tLv
    heTAssert "level: hand 1 is level 1", heLevelFor(1, tLv, 8), "1,2,0"
    heTAssert "level: last hand of level 1", heLevelFor(8, tLv, 8), "1,2,0"
@@ -6600,7 +7195,7 @@ command heTestLegalRun
    -- heBetApply and must be accepted. A bug here would show a player an illegal
    -- move or hide a legal one -- a fairness bug.
    local tStateA, tSeatNum
-   put return & "-- 11. heBetLegal: every offered action is accepted (spec 8.1)" & return after gRpt
+   put return & "-- 5. heBetLegal: every offered action is accepted (spec 8.1)" & return after gRpt
    set the itemDelimiter to comma
    -- preflop, 3-handed, 100 each, button 1: first-to-act faces the big blind
    put heTNewHand(1, 2, "100,100,100", "1,2,3", 1) into tStateA
@@ -6648,6 +7243,15 @@ command heTestLegalRun
    put heTBlinds(tStateA) into tStateA
    heTAssert "quick: pot raise clamps to all-in on a short stack", \
          heQuickAmountOf(tStateA, 1, "pot"), 5
+
+   -- integer-only wagers (mirror of betting-kat case_bad_amounts): a
+   -- fractional target would mint chips in heSettleOf's div/mod accounting
+   -- and a non-number would throw mid-arithmetic -- both engine-rejected
+   put heTNewHand(1, 2, "100,100,100", "1,2,3", 1) into tStateA
+   put heTBlinds(tStateA) into tStateA
+   put heTAct(tStateA, 1, "raise,4.5", "act-bad-amount", "legal: fractional raise rejected") into tStateA
+   put heTAct(tStateA, 1, "raise,abc", "act-bad-amount", "legal: non-numeric raise rejected") into tStateA
+   put heTAct(tStateA, 1, "raise,4", empty, "legal: the integer raise still lands") into tStateA
 end heTestLegalRun
 
 function heTButtonSchedule pLiveList, pLastBB
@@ -6666,7 +7270,7 @@ end heTButtonSchedule
 command heTestScheduleRun
    local tSeq, tLastBB, tRound, tOne
    set the itemDelimiter to comma
-   put return & "-- 2b. blind schedule (dead-button; TDA rule 10)" & return after gRpt
+   put return & "-- 6. blind schedule (dead-button; TDA rule 10)" & return after gRpt
    -- 3-handed no-bust: button and BB each advance one seat per hand
    put empty into tSeq
    put 0 into tLastBB
@@ -6685,12 +7289,26 @@ end heTestScheduleRun
 
 command heTestShuffleRun
    local tDeckList, tDealA, tPos, tSeenA, tDup, tSecond
+   local tRangeN, tDrawPair, tDrawVal, tDrawState, tOutOfRange
    set the itemDelimiter to comma
-   put return & "-- 3. integer shuffle (binary-free deal)" & return after gRpt
+   put return & "-- 7. integer shuffle (binary-free deal)" & return after gRpt
 
-   -- draw bounds: every draw is within 1..n
    heTAssert "draw: minstd step is deterministic", heRngStep(1), 16807
    heTAssert "draw: uniform in range returns value,state", item 1 of heDrawInt(1, 52) is a number, "true"
+   -- draw bounds, actually checked: for every range 2..52, a chained draw
+   -- lands in 1..n (mirror of shuffle-kat's range loop -- the old assert only
+   -- checked "is a number", which a 0 or 53 would have passed)
+   put 0 into tOutOfRange
+   put 1 into tDrawState
+   repeat with tRangeN = 2 to 52
+      put heDrawInt(tDrawState, tRangeN) into tDrawPair
+      put item 1 of tDrawPair into tDrawVal
+      put item 2 of tDrawPair into tDrawState
+      if tDrawVal < 1 or tDrawVal > tRangeN or tDrawVal is not trunc(tDrawVal) then
+         add 1 to tOutOfRange
+      end if
+   end repeat
+   heTAssert "draw: every chained draw lands in 1..n (n = 2..52)", tOutOfRange, 0
 
    -- pinned deck for a fixed seed (mirrored in tools; MINSTD from seed 1)
    put heShuffleDeck(1) into tDeckList
@@ -6765,14 +7383,37 @@ function heTKatLog pTamper
    return tLog
 end heTKatLog
 
+function heTKatAnteLog
+   -- canned ante session (mirror of fold-kat ante_transcript): 3-handed, ante
+   -- 2 each, blinds 1/2, folds to the BB. Pot = 3 antes (6) + SB (1) + BB (2)
+   -- = 9; the fold must re-derive the settle from the bidAnte lines alone --
+   -- if it ignored antes the logged deltas would mismatch on replay.
+   local tLog
+   put empty into tLog
+   put heLogLine(0, "table", "cfg", "sb=1,bb=2,ante=2,seats=1|2|3,stacks=400|400|400,button=1,levelMode=off,speed=normal") & return after tLog
+   put heLogLine(1, "table", "handStart", "seats=1|2|3,button=1") & return after tLog
+   put heLogLine(1, "table", "holeDeliver", "seat=1,cards=3d|5d") & return after tLog
+   put heLogLine(1, "table", "holeDeliver", "seat=2,cards=Ac|5h") & return after tLog
+   put heLogLine(1, "table", "holeDeliver", "seat=3,cards=Kc|Kh") & return after tLog
+   put heLogLine(1, "seat1", "bidAnte", "amount=2") & return after tLog
+   put heLogLine(1, "seat2", "bidAnte", "amount=2") & return after tLog
+   put heLogLine(1, "seat3", "bidAnte", "amount=2") & return after tLog
+   put heLogLine(1, "seat2", "bidSB", "amount=1") & return after tLog
+   put heLogLine(1, "seat3", "bidBB", "amount=2") & return after tLog
+   put heLogLine(1, "seat1", "act", "verb=fold,amount=0") & return after tLog
+   put heLogLine(1, "seat2", "act", "verb=fold,amount=0") & return after tLog
+   put heLogLine(1, "table", "settle", "deltas=1:-2|2:-3|3:5") & return after tLog
+   return tLog
+end heTKatAnteLog
+
 function heTFoldTxt pFoldA
    return pFoldA["stacksBy"][1] & "/" & pFoldA["stacksBy"][2] & "/" & pFoldA["stacksBy"][3] \
          & " hand=" & pFoldA["handNum"] & " errs=[" & pFoldA["errors"] & "]"
 end heTFoldTxt
 
 command heTestFoldRun
-   local tFoldA, tFoldB
-   put return & "-- 4. transcript fold: determinism + replay-as-audit" & return after gRpt
+   local tFoldA, tFoldB, tShortLog, tRiverLine
+   put return & "-- 8. transcript fold: determinism + replay-as-audit" & return after gRpt
    put heFoldTranscript(heTKatLog(empty)) into tFoldA
    heTAssert "fold: canned session settles to the pinned stacks", \
          heTFoldTxt(tFoldA), "442/394/364 hand=1 errs=[]"
@@ -6782,6 +7423,7 @@ command heTestFoldRun
    heTContains "history: board, pot, and winner recorded", tFoldA["history"], \
          "hand 1: board 3h 2h 5c 4h Tc; pot 78; winner seat 1"
    heTContains "history: showdown names the winning hand", tFoldA["history"], "1=3d 5d two pair"
+   heTContains "history: showdown names the losing hand too", tFoldA["history"], "3=Kc Kh one pair"
    heTContains "history: settlement marked verified on replay", tFoldA["history"], "settle-verified"
    put heFoldTranscript(heTKatLog("settle")) into tFoldA
    heTContains "history: tampered settle shows MISMATCH not verified", tFoldA["history"], "settle-MISMATCH"
@@ -6789,6 +7431,22 @@ command heTestFoldRun
    heTContains "fold: tampered settle line is caught", tFoldA["errors"], "settle-mismatch"
    put heFoldTranscript(heTKatLog("badact")) into tFoldA
    heTContains "fold: wrong-amount action rejected on replay", tFoldA["errors"], "engine-rejected"
+
+   -- a truncated transcript (river board line deleted before a contested
+   -- settle) is NAMED and skipped, never a mid-audit throw (the heIsCardList
+   -- guard; mirror of fold-kat's truncated-board case)
+   put heTKatLog(empty) into tShortLog
+   put heLogLine(1, "table", "board", "street=river,cards=Tc") into tRiverLine
+   replace tRiverLine & return with empty in tShortLog
+   put heFoldTranscript(tShortLog) into tFoldA
+   heTContains "fold: a truncated board is named, not a crash", tFoldA["errors"], "settle-bad-cards"
+
+   -- ante transcript (mirror of fold-kat ante_transcript): the settle is
+   -- re-derived from the bidAnte lines alone
+   put heFoldTranscript(heTKatAnteLog()) into tFoldA
+   heTAssert "fold: ante session settles to the pinned stacks", \
+         heTFoldTxt(tFoldA), "398/397/405 hand=1 errs=[]"
+   heTContains "fold: ante settle verified on replay", tFoldA["history"], "settle-verified"
 
    -- deep-dive (OXT-pass finding): the online lobby and the hotseat game share
    -- gGame["log"] in two incompatible formats -- a 4-field hotseat line vs a

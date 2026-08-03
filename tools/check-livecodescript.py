@@ -528,6 +528,27 @@ def check_command_as_function(text):
     return errors
 
 
+def check_dynamic_prop(text):
+    """Check 11 (H9): a parenthesised dynamic property name -- ``the (expr) of
+    obj`` / ``set the (expr) of obj to ...``. Property names in xTalk are
+    compile-time tokens; the computed-name form is not portable OXT. It shipped
+    once (v0.14.0 stored avatar paths in per-seat props built as
+    ``"uHeAvatarPath" & N``) and was caught in the pre-OXT-pass re-audit. The
+    portable shape is ONE property holding a line-/item-indexed list (the
+    uHeAvatarPaths pattern). Strings and comments are stripped first, so prose
+    that mentions the form does not flag."""
+    errors = []
+    for lineno, code in logical_lines(text):
+        scan = strip_strings(code)
+        if re.search(r"\bthe\s*\(", scan, re.IGNORECASE):
+            errors.append(
+                f"  L{lineno}: parenthesised dynamic property name ('the (expr) of ...')"
+                " -- not portable xTalk (H9); hold the data in ONE property indexed"
+                " by line/item instead"
+            )
+    return errors
+
+
 def check_dangling_else(text):
     """A single-line ``if … then <stmt>`` directly followed by a BARE ``else``
     line. LiveCode/OXT binds that else to the single-line if (the dangling-else
@@ -574,6 +595,7 @@ def main():
         problems += check_undeclared_kconsts(text)
         problems += check_undeclared_catch(text)
         problems += check_command_as_function(text)
+        problems += check_dynamic_prop(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")

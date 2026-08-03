@@ -311,7 +311,11 @@ pin (all classic, all fiddly, all testable without networking):
 - Button and blinds rotate by seat order; heads-up: button is small blind and acts
   first pre-flop, last post-flop.
 - Min-raise = size of the largest prior bet/raise of the street; an all-in below the
-  min-raise does **not** reopen betting for players who already acted.
+  min-raise does **not** reopen betting for players who already acted. This is
+  deliberately **per-wager**: several short all-ins that only *cumulatively* amount to
+  a full raise still do not reopen (TDA's cumulative reading is the stricter tournament
+  rule; the per-wager pin is simpler, KAT-pinned on both sides, and is the as-built
+  behavior — revisit only as a deliberate, spec-first change).
 - Side pots: layered by all-in amounts; each layer awarded independently at showdown
   (the settlement function iterates pot layers, not players). As-built pins: split-pot
   odd chips go to the first winning seat clockwise from the button; a short all-in big
@@ -350,16 +354,22 @@ receipts. **A future value layer must consume receipts and nothing but receipts*
   since your last `ckpt`, fold the log, resume. Hole cards at L2 need no re-delivery —
   the chain values are in the transcript; the player recomputes with their own scalar.
   (L0/L1: the dealer re-sends the sealed `holeDeliver` on request.)
-- **Mid-stream gap recovery** (as-built, M1): rp1 is a ~1 s, lossy, possibly-reordering
-  transport, so a client can miss a wire without disconnecting. Any wire whose `prev`
-  does not match the local chain head is dropped (verify-or-drop) — and a `chain-break`
-  drop (as distinct from a bad signature or unknown sender) triggers an unsigned `s?`
-  resync control message to the host, debounced so it re-asks at most ~once/2 s. The
-  host replays its signed wire log to the requester (also automatically on any
-  reconnect handshake); a full replay is safe for a mid-stream client because wires
-  at or below its head simply re-drop as `chain-break` and it resumes from its head
-  forward. `s?` is a transport control message, not a transcript type, and is honored
-  only from an already-admitted, connected peer.
+- **Mid-stream gap recovery** (as-built, M1): rp1 is a ~1 s, lossy, reordering,
+  REDELIVERING transport, so a client can miss a wire — or see one twice — without
+  disconnecting. A signature-verified, table-bound wire is classified by its
+  host-assigned `seq` against the last seq applied locally, never by a bare
+  `prev`-vs-head test: at or below the local seq it is an already-applied duplicate
+  and drops silently (no resync — treating duplicates as chain gaps is what made the
+  original design storm: every redelivery triggered a full replay whose own wires
+  re-triggered it); exactly next, it must chain onto the local head and is applied;
+  further ahead, it is held in a bounded per-seq reorder buffer (drained as the gap
+  fills) and an unsigned `s?` resync control message goes to the host, debounced so
+  it re-asks at most ~once/2 s. The host replays its signed wire log to the requester
+  (also automatically on any reconnect handshake); a full replay is safe and
+  idempotent for a mid-stream client because replayed wires at or below its seq shed
+  silently and it resumes from its head forward. `s?` is a transport control message,
+  not a transcript type, and is honored only from an already-admitted, connected
+  peer, rate-limited per peer.
 - **Timeout in betting**: auto check/fold, seat goes to sit-out after (config) misses.
 - **Timeout in dealing** (L2): void-and-audit (7.3). A player who habitually
   "disconnects" when the flop looks bad voids hands but never sees that flop — aborting

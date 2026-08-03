@@ -168,11 +168,21 @@ def apply_msg(state, mtype, seat, amount):
         if st["phase"] != "blinds":
             st["err"] = "bidAnte-out-of-phase"
             return st
+        # replay-as-audit hardening (mirrors heBetApply): a seat outside the
+        # hand, or a repeated ante, is engine-rejected -- otherwise an edited
+        # transcript replays an illegal posting sequence clean
+        if seat not in st["occ"]:
+            st["err"] = "bidAnte-wrong-seat"
+            return st
+        if st.get("antePostedBy", {}).get(seat) == "true":
+            st["err"] = "bidAnte-duplicate"
+            return st
         pay = min(st["ante"], st["stackBy"][seat])
         if amount != pay:
             st["err"] = "bidAnte-wrong-amount"
             return st
         _pay_dead(st, seat, pay)
+        st.setdefault("antePostedBy", {})[seat] = "true"
         return st
 
     if mtype == "bidSB":
@@ -182,11 +192,17 @@ def apply_msg(state, mtype, seat, amount):
         if seat != st["sbSeat"]:
             st["err"] = "bidSB-wrong-seat"
             return st
+        # phase stays "blinds" until the BB posts, so without this flag a
+        # transcript with two bidSB lines double-charges the small blind
+        if st.get("sbPosted") == "true":
+            st["err"] = "bidSB-duplicate"
+            return st
         pay = min(st["sb"], st["stackBy"][seat])
         if amount != pay:
             st["err"] = "bidSB-wrong-amount"
             return st
         _pay(st, seat, pay)
+        st["sbPosted"] = "true"
         return st
 
     if mtype == "bidBB":
@@ -220,7 +236,16 @@ def apply_msg(state, mtype, seat, amount):
         return st
 
     verb, amt = (amount.split(",") + ["0"])[:2]
-    amt = int(amt) if amt not in ("", None) else 0
+    # the amount is TEXT on the engine side (UI box / Phase 2 wire): keep it
+    # numeric-or-None here so the compares below mirror xTalk's behavior (a
+    # non-number simply mismatches; it must not crash the mirror)
+    if amt in ("", None):
+        amt = 0
+    else:
+        try:
+            amt = float(amt)
+        except ValueError:
+            amt = None
     if st["phase"] != "acting":
         st["err"] = "act-out-of-phase"
         return st
@@ -269,7 +294,13 @@ def apply_msg(state, mtype, seat, amount):
                 st["actedBy"][seat] = "true"
                 return _after_action(st, seat)
         else:
-            target = amt
+            # integer-only wagers (mirrors heBetApply's act-bad-amount guard):
+            # a fractional target would flow into settle()'s div/mod chip
+            # accounting and mint chips at settlement
+            if amt is None or amt != int(amt):
+                st["err"] = "act-bad-amount"
+                return st
+            target = int(amt)
             if verb == "bet" and st["betCur"] > 0:
                 st["err"] = "bet-facing-bet-use-raise"
                 return st
@@ -731,6 +762,68 @@ def case_quick_amounts():
     check("quick: half-pot never under the min raise", quick_amount(st4, 1, "half") >= 4, True)
 
 
+def case_bad_amounts():
+    # act-bad-amount (mirrors heBetApply): wagers are integer-only. A
+    # fractional target would mint chips in settle()'s div/mod accounting; a
+    # non-number would throw mid-arithmetic on the engine. Duplicated
+    # on-engine in heTestLegalRun.
+    st = run_blinds(new_hand(1, 2, {1: 100, 2: 100, 3: 100}, [1, 2, 3], 1))
+    bad = apply_msg(st, "act", 1, "raise,4.5")
+    check("bad-amount: fractional raise rejected", bad["err"], "act-bad-amount")
+    bad = apply_msg(st, "act", 1, "raise,abc")
+    check("bad-amount: non-numeric raise rejected", bad["err"], "act-bad-amount")
+    st2 = apply_msg(st, "act", 1, "call,2")
+    st2 = apply_msg(st2, "act", 2, "call,1")
+    st2 = apply_msg(st2, "act", 3, "check,0")
+    bad = apply_msg(st2, "act", st2["toAct"], "bet,2.5")
+    check("bad-amount: fractional bet rejected", bad["err"], "act-bad-amount")
+    # a whole-valued decimal is trunc-equal on the engine and stays legal
+    ok = apply_msg(st, "act", 1, "raise,4.0")
+    check("bad-amount: whole-valued decimal accepted", ok["err"], "")
+
+
+def case_duplicate_posts():
+    # replay-as-audit: an edited transcript repeating a blind/ante post, or
+    # anteing a seat outside the hand, must be engine-rejected -- phase stays
+    # "blinds" until the BB posts, so without the posted flags a double bidSB
+    # (or any number of repeated bidAnte lines) replayed clean AND audited
+    # clean. Duplicated on-engine in heTestAnteRun.
+    st = new_hand(1, 2, {1: 100, 2: 100, 3: 100}, [1, 2, 3], 1, ante=1)
+    st = post_antes(st)
+    bad = apply_msg(st, "bidAnte", 1, 1)
+    check("dup-post: repeated ante rejected", bad["err"], "bidAnte-duplicate")
+    bad = apply_msg(st, "bidAnte", 4, 1)
+    check("dup-post: ante from a seat outside the hand rejected",
+          bad["err"], "bidAnte-wrong-seat")
+    st = apply_msg(st, "bidSB", st["sbSeat"], 1)
+    check("dup-post: first SB accepted", st["err"], "")
+    bad = apply_msg(st, "bidSB", st["sbSeat"], 1)
+    check("dup-post: repeated SB rejected", bad["err"], "bidSB-duplicate")
+
+
+def case_short_sb_ante():
+    # mirror of the on-engine P0 regression pin (heTestAnteRun): a blind seat
+    # short AFTER its ante posts from the POST-ante stack. Seat 2 = SB, starts
+    # 55, ante 10 -> post-ante stack 45, so its all-in small blind is 45; the
+    # old pre-ante cap min(50, 55) is exactly what the engine rejects.
+    st = new_hand(50, 100, {1: 400, 2: 55, 3: 400}, [1, 2, 3], 1, ante=10)
+    st = post_antes(st)
+    check("short-sb-ante: SB is short after its ante", st["stackBy"][2], 45)
+    ok = apply_msg(st, "bidSB", 2, min(50, st["stackBy"][2]))
+    check("short-sb-ante: post-ante cap accepted", ok["err"], "")
+    check("short-sb-ante: all-in for ante + short blind", ok["handBy"][2], 55)
+    bad = apply_msg(st, "bidSB", 2, min(50, 55))
+    check("short-sb-ante: the pre-ante cap is rejected",
+          bad["err"], "bidSB-wrong-amount")
+
+
+def case_level_count():
+    # mirror of heLevelCount (pinned on-engine in heTestLevelRun): the default
+    # schedule is 8 ";"-separated levels
+    lv = "1/2/0;2/4/0;3/6/0;5/10/0;10/20/0;15/30/0;25/50/0;50/100/10"
+    check("level: the default schedule counts 8 levels", len(lv.split(";")), 8)
+
+
 def main():
     case_blind_schedule()
     case_quick_amounts()
@@ -747,6 +840,10 @@ def main():
     case_ante_short_allin()
     case_ante_conservation()
     case_levels()
+    case_bad_amounts()
+    case_duplicate_posts()
+    case_short_sb_ante()
+    case_level_count()
     print()
     if FAILS:
         print("FAILED -- %d betting case(s) wrong." % len(FAILS))
