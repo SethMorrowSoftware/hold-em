@@ -311,7 +311,11 @@ pin (all classic, all fiddly, all testable without networking):
 - Button and blinds rotate by seat order; heads-up: button is small blind and acts
   first pre-flop, last post-flop.
 - Min-raise = size of the largest prior bet/raise of the street; an all-in below the
-  min-raise does **not** reopen betting for players who already acted.
+  min-raise does **not** reopen betting for players who already acted. This is
+  deliberately **per-wager**: several short all-ins that only *cumulatively* amount to
+  a full raise still do not reopen (TDA's cumulative reading is the stricter tournament
+  rule; the per-wager pin is simpler, KAT-pinned on both sides, and is the as-built
+  behavior — revisit only as a deliberate, spec-first change).
 - Side pots: layered by all-in amounts; each layer awarded independently at showdown
   (the settlement function iterates pot layers, not players). As-built pins: split-pot
   odd chips go to the first winning seat clockwise from the button; a short all-in big

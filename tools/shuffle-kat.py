@@ -56,6 +56,12 @@ def draw_int(state, n):
 def shuffle_deck(seed):
     deck = list(range(1, 53))
     s = seed
+    # mirrors heShuffleDeck's defensive clamp: MINSTD has no 0 state (0 maps
+    # to 0 forever), and Python's % would wrap the -1 draw to n where the
+    # engine's sign-of-dividend mod yields 0 -- clamp so the two sides can
+    # never diverge on a bad seed
+    if not isinstance(s, (int, float)) or s < 1:
+        s = 1
     for i in range(52, 1, -1):
         j, s = draw_int(s, i)
         deck[i - 1], deck[j - 1] = deck[j - 1], deck[i - 1]

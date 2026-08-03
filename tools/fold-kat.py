@@ -157,6 +157,18 @@ def independent_fold(tx):
             inhand = [s for s in st["occ"] if st["foldedBy"][s] == "false"]
             ranks = {}
             if len(inhand) > 1:
+                # mirrors heFoldTranscript's settle guard: a contested showdown
+                # needs 5 in-range board cards and a valid hole pair per
+                # unfolded seat -- a truncated or hand-edited transcript is
+                # named and skipped, never a crash mid-audit
+                bad = len(board) != 5 or not all(1 <= c <= 52 for c in board)
+                for s in inhand:
+                    hp = holes.get(s, [])
+                    if len(hp) != 2 or not all(1 <= c <= 52 for c in hp):
+                        bad = True
+                if bad:
+                    errors.append("settle-bad-cards-hand-" + str(hand))
+                    continue
                 for s in inhand:
                     ranks[s] = ev.evaluate7(holes[s] + board)
             deltas = bk.settle(st, ranks)
@@ -319,6 +331,14 @@ def main():
     bad = independent_fold(transcript("badact"))
     contains("illegal action rejected on replay",
              " ".join(bad["errors"]), "engine-rejected")
+
+    # a truncated transcript (missing a board line before a contested settle)
+    # is named and skipped, never a crash mid-audit
+    tx = transcript()
+    ridx = max(i for i, e in enumerate(tx) if e[2] == "board")
+    shortres = independent_fold(tx[:ridx] + tx[ridx + 1:])
+    contains("truncated board caught (settle-bad-cards)",
+             " ".join(shortres["errors"]), "settle-bad-cards")
 
     # antes: the fold re-derives the pot from the bidAnte lines and verifies it
     anteres = independent_fold(ante_transcript())
