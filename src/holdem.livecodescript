@@ -6,6 +6,28 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.16.0 -- casino sounds (Kenney "Casino Audio", CC0). 11 sounds vendored as
+16-bit mono WAVs in assets/sounds (the upstream OGGs are not engine-playable;
+converted at vendor time, rate untouched). One playback gate (heSndPlay): config
+toggle -> lazy import-once (heSndTryInit imports each WAV as an audioClip; clips
+persist inside a saved stack, so the saved stack carries its own sounds) -> a
+rotation counter alternates kinds with two takes -> guarded play audioClip.
+Wired at message boundaries only: deal (cardSlide) in heUIHandStart, street
+(cardPlace) in heUIShowBoardStreet, accepted actions in heEngineDo's act case
+(fold=cardShove, check=chipLay, call/bet/raise=chipsHandle, allin=chipsCollide)
+-- the ACCEPTED path only, so a rejected action stays silent and remote peers'
+actions will sound identical when the transport lands -- and settle (chipsStack)
+in heHandSettle. cardShuffle is vendored + mapped but deliberately unwired (3 s;
+the deal-animation increment paces it before the first deal). New Settings toggle
+"Sounds: On/Off" (gCfg["sounds"], default on; turning it on plays a confirmation
+chip as a live test). heProbeSounds prints the resolved folder + per-file
+file/clip/ok state; heSndReload re-imports after moving files. Every engine call
+is guarded (H8 catch locals): a missing folder, file, or an audio-less engine
+degrades to silence, never a broken deal. tools/sounds-kat.py pins the vendored
+WAVs (RIFF/PCM16/mono/44100, sane durations) against the stack's kHeSoundFiles
+list and the heSndFilesFor mapping, in CI. kUIVersion 10 -> 11 (new Settings
+button). Playback itself: verified statically; NEEDS AN OXT PASS.
+
 v0.15.0 -- fold of the two outstanding review branches (PRs #25 + #33), rebased onto
 the v0.14.1 fixes so nothing already merged is lost. kUIVersion 9 -> 10 (the bet
 slider control changes style, so saved chrome rebuilds); kHeHarnessV 29 -> 30 (the
@@ -370,9 +392,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.15.0"
+constant kHeVersion = "0.16.0"
 constant kHeHarnessV = "30"
-constant kUIVersion = "10"
+constant kUIVersion = "11"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -471,6 +493,13 @@ constant kHeGlowColor = "248,224,120"  -- acting-seat ring colour
 -- six seat-portrait fallback fill colours (initials disc), one per seat, ";"-separated
 constant kHeAvatarFills = "196,58,58;58,120,196;72,168,96;198,150,44;150,96,196;54,170,180"
 
+-- v0.16.0 sound pack: Kenney "Casino Audio" (CC0), vendored as 16-bit mono WAVs
+-- in assets/sounds (the OGG originals are not engine-playable; see the NOTICE
+-- there). The list is the complete vendored set -- heSndTryInit imports each as
+-- an audioClip once (clips persist inside a saved stack), heSndFilesFor maps a
+-- game moment to its file(s), tools/sounds-kat.py pins list <-> disk <-> mapping.
+constant kHeSoundFiles = "cardShuffle.wav,cardSlide1.wav,cardSlide2.wav,cardPlace1.wav,cardPlace2.wav,cardShove1.wav,chipLay1.wav,chipsHandle1.wav,chipsHandle2.wav,chipsCollide1.wav,chipsStack1.wav"
+
 --------------------------------------------------------------------------
 -- script-local state (g prefix per the family convention)
 --------------------------------------------------------------------------
@@ -497,6 +526,11 @@ local gKitLastErr      -- why the last heKitTryInit dropped to flat (for heProbe
 -- v0.14.0 UI pack: gAvatarOn[seat] caches whether a seat shows a custom image ("true")
 -- or the initial fallback, so the 4Hz HUD toggles visibility without re-loading files.
 local gAvatarOn
+-- v0.16.0 sounds: gSndChk = init ran ("true"); gSndOk[file] = clip playable ("true");
+-- gSndTick = rotation counter so kinds with 2+ files alternate without random()
+local gSndChk
+local gSndOk
+local gSndTick
 
 --------------------------------------------------------------------------
 -- lifecycle (house law H1: sessions bracket the stack's life)
@@ -3356,6 +3390,7 @@ command heCfgDefaults
    put kHeDefaultLevelEvery into gCfg["levelEvery"]      -- hands per level (hands mode)
    put kHeDefaultLevelMinutes into gCfg["levelMinutes"]  -- minutes per level (time mode)
    put "normal" into gCfg["speed"]          -- "fast" | "normal" | "slow"
+   put "on" into gCfg["sounds"]             -- "on" | "off" (casino-audio SFX)
 end heCfgDefaults
 
 command heCfgEnsure
@@ -3747,6 +3782,9 @@ command heEngineDo pMsgType, pSeatNum, pAmount
          set the itemDelimiter to comma
          put item 1 of pAmount into tVerb
          heLogAppend "act", "seat" & pSeatNum, "verb=" & tVerb & ",amount=" & item 2 of pAmount
+         -- SFX here, on the ACCEPTED path only (a rejected action exited above),
+         -- so every action source -- buttons now, remote peers later -- sounds alike
+         heSndVerb tVerb
          break
    end switch
    heReactToNotes
@@ -3971,6 +4009,7 @@ command heHandSettle
    heLogAppend "settle", "table", "deltas=" & tDeltasTxt
 
    put "between" into gGame["phase"]
+   heSndPlay "win"
    heUISetStatus "Hand " & gGame["handNum"] & " settled: " & tDeltasTxt
    heHudMark
    send "heNextHandTick" to me in hePaceMs("paceNextHand", kHeNextHandDelayMs) milliseconds
@@ -4377,8 +4416,12 @@ command heBuildSettings
    set the rect of button "heBtnSetSpeed" to "560,424,792,456"
    set the label of button "heBtnSetSpeed" to "Normal"
 
-   heMakeLabel "heSetLevelInfo", "212,462,812,492", \
+   heMakeLabel "heSetLevelInfo", "212,462,540,492", \
          "a rising schedule turns the table into a tournament", kHeGoldColor, 11
+   -- sound effects toggle (v0.16.0, Kenney Casino Audio); label follows gCfg["sounds"]
+   create button "heBtnSetSounds"
+   set the rect of button "heBtnSetSounds" to "560,460,792,492"
+   set the label of button "heBtnSetSounds" to "Sounds: On"
 
    create button "heBtnSetApply"
    set the rect of button "heBtnSetApply" to "232,502,472,540"
@@ -4423,7 +4466,7 @@ command heSettingsSetVisible pOn
    put "heSetTitle,heSetHint,heSetLevelInfo,heSetStackLbl,heSetSBLbl,heSetBBLbl," \
          & "heSetAnteLbl,heSetSeatsLbl,heSetLevelLbl,heSetIntervalLbl,heSetSpeedLbl," \
          & "heSetStack,heSetSB,heSetBB,heSetAnte,heSetSeats,heSetInterval" into tFields
-   put "heBtnSetLevel,heBtnSetSpeed,heBtnSetApply,heBtnSetCancel,heBtnSetLogo" into tButtons
+   put "heBtnSetLevel,heBtnSetSpeed,heBtnSetApply,heBtnSetCancel,heBtnSetLogo,heBtnSetSounds" into tButtons
    repeat for each item tNm in tFields
       if there is a field tNm then
          set the visible of field tNm to pOn
@@ -4456,6 +4499,7 @@ command heSettingsRefresh
    set the text of field "heSetSeats" to gCfg["numSeats"]
    set the label of button "heBtnSetLevel" to heSettingsLevelLabel(gCfg["levelMode"])
    set the label of button "heBtnSetSpeed" to heSettingsSpeedLabel(gCfg["speed"])
+   set the label of button "heBtnSetSounds" to heSettingsSoundsLabel(gCfg["sounds"])
    heSettingsIntervalRefresh
 end heSettingsRefresh
 
@@ -4511,6 +4555,13 @@ function heSettingsIntervalLabel pMode
    return "Raise interval (n/a for cash)"
 end heSettingsIntervalLabel
 
+function heSettingsSoundsLabel pMode
+   if pMode is "off" then
+      return "Sounds: Off"
+   end if
+   return "Sounds: On"
+end heSettingsSoundsLabel
+
 function heSettingsSpeedLabel pSpeed
    switch pSpeed
       case "fast"
@@ -4555,6 +4606,18 @@ command heSettingsCycle pWhich
                put "normal" into gCfg["speed"]
          end switch
          set the label of button "heBtnSetSpeed" to heSettingsSpeedLabel(gCfg["speed"])
+         break
+      case "sounds"
+         if gCfg["sounds"] is "on" then
+            put "off" into gCfg["sounds"]
+         else
+            put "on" into gCfg["sounds"]
+         end if
+         set the label of button "heBtnSetSounds" to heSettingsSoundsLabel(gCfg["sounds"])
+         if gCfg["sounds"] is "on" then
+            -- audible confirmation, which doubles as a live test of the play path
+            heSndPlay "check"
+         end if
          break
    end switch
 end heSettingsCycle
@@ -5163,6 +5226,174 @@ command heBetSliderFromThumb
    end if
 end heBetSliderFromThumb
 
+--------------------------------------------------------------------------
+-- v0.16.0 sounds: Kenney "Casino Audio" (CC0), vendored WAVs in assets/sounds
+-- next to the saved stack (uHeSoundsPath overrides the folder). Import-once as
+-- audioClips (clips persist inside a saved stack; the guard makes re-init and
+-- re-open no-ops), play at message boundaries only (turn-rate -- never per
+-- frame), and every engine call is guarded so a missing file or an engine
+-- without audio support degrades to silence, never a broken deal.
+-- All of it: verified statically; NEEDS AN OXT PASS.
+--------------------------------------------------------------------------
+
+function heSndFilesFor pKind
+   -- game moment -> comma list of vendored files (2+ alternate via gSndTick).
+   -- "shuffle" is vendored + mapped but not yet wired into the flow: it is 3 s
+   -- long and would be cut off by the deal sound on the same beat; the deal-
+   -- animation increment paces it before the first deal.
+   switch pKind
+      case "shuffle"
+         return "cardShuffle.wav"
+      case "deal"
+         return "cardSlide1.wav,cardSlide2.wav"
+      case "board"
+         return "cardPlace1.wav,cardPlace2.wav"
+      case "fold"
+         return "cardShove1.wav"
+      case "check"
+         return "chipLay1.wav"
+      case "chips"
+         return "chipsHandle1.wav,chipsHandle2.wav"
+      case "allin"
+         return "chipsCollide1.wav"
+      case "win"
+         return "chipsStack1.wav"
+   end switch
+   return ""
+end heSndFilesFor
+
+command heSndVerb pVerb
+   -- accepted-action funnel (called from heEngineDo): verb -> sound kind
+   switch pVerb
+      case "fold"
+         heSndPlay "fold"
+         break
+      case "check"
+         heSndPlay "check"
+         break
+      case "allin"
+         heSndPlay "allin"
+         break
+      case "call"
+      case "bet"
+      case "raise"
+         heSndPlay "chips"
+         break
+   end switch
+end heSndVerb
+
+command heSndTryInit
+   -- import each vendored WAV as an audioClip, once. A clip already present
+   -- (saved stack, or a prior init) is just marked playable. Failures mark the
+   -- single file bad and move on -- one broken file never mutes the rest.
+   local tFile, tFolder, tFull, tImpErr
+   if gSndChk is "true" then
+      exit heSndTryInit
+   end if
+   put "true" into gSndChk
+   -- import lands in the defaultStack: pin it to THIS stack so a message-box
+   -- call can never import the clips into whatever stack happens to be front
+   set the defaultStack to the short name of this stack
+   set the itemDelimiter to comma
+   put the uHeSoundsPath of this stack into tFolder
+   if tFolder is empty then
+      put heStackFolder() into tFolder
+      if tFolder is empty then
+         exit heSndTryInit   -- unsaved stack, no override: stay silent
+      end if
+      put tFolder & "/assets/sounds" into tFolder
+   end if
+   repeat for each item tFile in kHeSoundFiles
+      if there is an audioClip tFile then
+         put "true" into gSndOk[tFile]
+         next repeat
+      end if
+      put tFolder & "/" & tFile into tFull
+      if there is not a file tFull then
+         next repeat
+      end if
+      try
+         import audioClip from file tFull
+         -- some engines name the imported clip after the full path: normalise
+         if there is not an audioClip tFile then
+            set the name of audioClip (the number of audioClips of this stack) \
+                  of this stack to tFile
+         end if
+         if there is an audioClip tFile then
+            put "true" into gSndOk[tFile]
+         end if
+      catch tImpErr
+         -- leave gSndOk[tFile] unset: this one stays silent, the rest still play
+      end try
+   end repeat
+end heSndTryInit
+
+command heSndPlay pKind
+   -- the ONE playback gate: config toggle -> lazy init -> rotate -> guarded play
+   local tList, tCount, tIdx, tFile, tPlayErr
+   heCfgEnsure
+   if gCfg["sounds"] is not "on" then
+      exit heSndPlay
+   end if
+   heSndTryInit
+   set the itemDelimiter to comma
+   put heSndFilesFor(pKind) into tList
+   if tList is empty then
+      exit heSndPlay
+   end if
+   put the number of items of tList into tCount
+   if gSndTick is not a number then
+      put 0 into gSndTick
+   end if
+   add 1 to gSndTick
+   put (gSndTick mod tCount) + 1 into tIdx
+   put item tIdx of tList into tFile
+   if gSndOk[tFile] is not "true" then
+      exit heSndPlay
+   end if
+   try
+      play audioClip tFile
+   catch tPlayErr
+      -- an engine without audio (or a hosed clip): mark it bad and stay silent
+      put "false" into gSndOk[tFile]
+   end try
+end heSndPlay
+
+command heProbeSounds
+   -- message-box diagnostic (mirror of heProbeKit): what resolved, what loaded
+   local tOut, tFile, tFolder, tFull
+   set the itemDelimiter to comma
+   put "holde-em sound probe  stack v" & kHeVersion & return into tOut
+   put "sounds enabled (gCfg): " & gCfg["sounds"] & return after tOut
+   put the uHeSoundsPath of this stack into tFolder
+   if tFolder is empty then
+      put heStackFolder() into tFolder
+      if tFolder is empty then
+         put "folder: stack UNSAVED and uHeSoundsPath unset -- save the stack" \
+               & " with assets/sounds next to it, or set uHeSoundsPath" & return after tOut
+      else
+         put tFolder & "/assets/sounds" into tFolder
+      end if
+   end if
+   put "folder: " & tFolder & return after tOut
+   put "init ran: " & (gSndChk is "true") & return after tOut
+   repeat for each item tFile in kHeSoundFiles
+      put tFolder & "/" & tFile into tFull
+      put tFile & "  file:" & (there is a file tFull) \
+            & "  clip:" & (there is an audioClip tFile) \
+            & "  ok:" & (gSndOk[tFile] is "true") & return after tOut
+   end repeat
+   put "run heSndReload after moving files or loading the pack" & return after tOut
+   put tOut
+end heProbeSounds
+
+command heSndReload
+   -- clear the cached init so the next play (or a probe after it) re-imports
+   put empty into gSndChk
+   put empty into gSndOk
+   heSndTryInit
+end heSndReload
+
 function heStackFolder
    -- the folder that holds the SAVED stack file, so an assets/ folder sitting next
    -- to the stack is found automatically. Empty when the stack was pasted into the
@@ -5473,6 +5704,9 @@ on mouseUp
          exit mouseUp
       case "heBtnSetLogo"
          heTableLogoPick
+         exit mouseUp
+      case "heBtnSetSounds"
+         heSettingsCycle "sounds"
          exit mouseUp
    end switch
    -- while an overlay is up, the table/action buttons are inert
@@ -5939,6 +6173,7 @@ command heUIHandStart
    repeat for each item tSeatNum in gGame["occ"]
       heUIShowHole tSeatNum, tDealA["holesBy"][tSeatNum]
    end repeat
+   heSndPlay "deal"
    heUISetStatus "Hand " & gGame["handNum"] & " dealt -- blinds " & gGame["sb"] & "/" & gGame["bb"] & " posted."
 end heUIHandStart
 
@@ -6000,6 +6235,7 @@ command heUIShowBoardStreet pStreetName, pIdxList
       heUIShowCardIn "heBoard" & tPos, tIdx
       add 1 to tPos
    end repeat
+   heSndPlay "board"
 end heUIShowBoardStreet
 
 command heUIShowdownReveal pInHandList, pRanksA

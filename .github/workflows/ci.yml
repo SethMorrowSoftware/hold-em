@@ -32,5 +32,7 @@ jobs:
         run: python3 tools/fold-kat.py
       - name: card-atlas KAT (kit-mode Kenney frame mapping)
         run: python3 tools/atlas-kat.py
+      - name: sounds KAT (vendored casino-audio WAVs + stack mapping)
+        run: python3 tools/sounds-kat.py
       - name: independent-reference fuzz (rules, not the port)
         run: python3 tools/logic-fuzz.py

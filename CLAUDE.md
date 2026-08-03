@@ -86,6 +86,7 @@ python3 tools/evaluator-kat.py          # spec 8.2 vectors (mirror of heEval7/he
 python3 tools/betting-kat.py            # spec 8.1/8.3 cases (mirror of heBetApply/heSettleOf)
 python3 tools/shuffle-kat.py            # playable integer deal (mirror of heShuffleDeck)
 python3 tools/protocol-kat.py           # spec 6/7.1 crypto deal (Phase 2 target)
+python3 tools/sounds-kat.py             # vendored casino-audio WAVs <-> stack mapping
 python3 tools/logic-fuzz.py             # INDEPENDENT-reference fuzz (rules, not the port)
 ```
 
