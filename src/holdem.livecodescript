@@ -6,6 +6,45 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.15.0 -- fold of the two outstanding review branches (PRs #25 + #33), rebased onto
+the v0.14.1 fixes so nothing already merged is lost. kUIVersion 9 -> 10 (the bet
+slider control changes style, so saved chrome rebuilds); kHeHarnessV 29 -> 30 (the
+netsim section gains reorder/duplicate vectors).
+  * ONLINE: THE CHAIN-BREAK RESYNC STORM IS FIXED (PR #25, seq-classified wires).
+    rp1 is lossy AND redelivers/reorders, but heNetIngestWire treated every
+    duplicate as a chain gap: each redelivered wire triggered another full-
+    transcript replay, whose own replayed wires re-triggered it, so the client
+    resync-looped forever and an online game never started. A verified wire is now
+    classified by its host-signed seq against gGame["lastSeq"]: seq <= lastSeq is
+    an already-applied duplicate -> dropped SILENTLY; seq = lastSeq+1 must chain
+    onto the head and is applied (heNetApplyWire), then any buffered successors
+    drain behind it (heNetDrainBuffer); seq > lastSeq+1 is a real gap -> the wire
+    is HELD in a bounded reorder buffer (heNetBufferWire, kHeWireBufMax) and one
+    debounced replay is requested. The table/version binding and the host-authority
+    fold of roster/cfg bodies (both v0.14.1 hardening) are enforced before / inside
+    apply exactly as before -- and dedup makes the full-log replay idempotent: a
+    caught-up client just sheds the replayed prefix instead of storming. The netsim
+    section now drives reorder, cascade-drain and duplicate vectors through the
+    real handlers.
+  * DYNAMIC PROPERTY NAMES REMOVED (PR #33, the big syntax find). v0.14.0 stored
+    avatar paths in per-seat props via the parenthesised computed-name form, which
+    is NOT portable xTalk: property names are compile-time tokens, and the dynamic
+    form is engine-shaky on OXT. Replaced with ONE uHeAvatarPaths property, line N
+    = seat N's path: plain line-chunk syntax, and paths cannot contain a newline.
+    New house rule H9 + static-gate check 11 flag the form so it can never ship
+    again. (A previously saved stack's per-seat paths are orphaned -- avatars
+    re-pick once; acceptable pre-OXT-pass.)
+  * BET SLIDER is now style "scale" (a real slider: no arrow chrome), the drag
+    handler uses its documented pNewPos parameter, track clicks step by one big
+    blind (page = 4 blinds) via lineInc/pageInc, and the scrollbarLineInc/LineDec/
+    PageInc/PageDec messages sync the amount box on a deferred send THEN pass --
+    never swallowing the engine's default thumb move.
+  * IMAGES ASPECT-FIT (PR #33). Setting an image's filename resets the control to
+    the picture's natural size; v0.14.0 re-rected after (correct) but into a
+    square, stretching non-square pictures. Both avatar and logo now aspect-fit
+    via formatWidth/Height (new pure heFitRect), letterboxing on the disc / felt
+    instead of distorting.
+
 v0.14.1 -- bug-fix pass. Six defects found by review; the first two are gameplay-
 visible, the rest are correctness/robustness. No new controls, so kUIVersion stays 9
 (a saved v9 stack keeps its chrome); kHeHarnessV 28 -> 29.
@@ -280,9 +319,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.14.1"
-constant kHeHarnessV = "29"
-constant kUIVersion = "9"
+constant kHeVersion = "0.15.0"
+constant kHeHarnessV = "30"
+constant kUIVersion = "10"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -323,6 +362,10 @@ constant kHeDefaultSB = 1
 constant kHeDefaultBB = 2
 constant kHeDefaultAnte = 0
 constant kHeDefaultStack = 400
+-- how many out-of-order future wires the online client will hold while it waits
+-- for the gap before them to fill (rp1 is lossy and reorders/duplicates). A wire
+-- further than this ahead of what we have applied is left to the full-log replay.
+constant kHeWireBufMax = 64
 -- blind-level schedule (tournament option). One level = "sb/bb/ante"; levels are
 -- ";"-separated. A literal single-line string (gotcha 6: constants must be
 -- literal, so no & lf building). The level advances every kHeDefaultLevelEvery
@@ -1437,6 +1480,9 @@ command heTableCreate
    put 0 into gGame["handNum"]
    put 0 into gGame["seqCounter"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
@@ -1480,6 +1526,9 @@ command heTableJoin pCodeTxt
    put empty into gGame["hostPubHex"]
    put 0 into gGame["handNum"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put empty into gGame["peerPubA"]
    put empty into gGame["peerByPub"]
    put empty into gGame["admittedA"]
@@ -1692,20 +1741,34 @@ command heHostRelay pPeer, pContentAndSig
 end heHostRelay
 
 command heNetIngestWire pWire
-   -- everyone's inbound path: verify-or-drop against the host key and local
-   -- chain head, then advance the chain and fold the message (spec 6/8).
-   local tVerdict, tA, tTypeTxt, tSeqTxt
-   put heEnvVerify(pWire, empty, gGame["hostPubHex"], gGame["chainHeadHex"]) into tVerdict
+   -- everyone's inbound path. rp1 is lossy AND redelivers/reorders wires, so a
+   -- verified wire is classified by its host-signed seq against the last we
+   -- applied (gGame["lastSeq"]), NOT by a bare prev==head test:
+   --   seq <= lastSeq     : already applied -> drop SILENTLY. This is the fix
+   --                        for the networked chain-break storm -- the host
+   --                        re-broadcasts and rp1 redelivers constantly, and
+   --                        treating every duplicate as a "chain gap" made the
+   --                        client resync-loop forever and the game never start.
+   --                        It also makes the full-log replay idempotent: a
+   --                        caught-up client just sheds the replayed prefix.
+   --   seq  = lastSeq + 1 : the expected next wire -> chain-check + apply, then
+   --                        drain any buffered successors now in order.
+   --   seq  > lastSeq + 1 : a real gap -> buffer it and ask the host to replay.
+   -- Signatures/shape are verified FIRST, and the table/version binding is
+   -- enforced BEFORE the seq is even read (a wire for another table must never
+   -- touch the buffer or lastSeq), so a duplicate/reordered wire is judged by
+   -- its seq, never mistaken for a signature failure. Never raises (H4).
+   local tVerdict, tA, tSeq
+   if gGame["lastSeq"] is not a number then
+      put 0 into gGame["lastSeq"]   -- unset on old saves / hand-rolled contexts
+   end if
+   if gGame["wireBufN"] is not a number then
+      put 0 into gGame["wireBufN"]
+   end if
+   put heEnvVerify(pWire, empty, gGame["hostPubHex"], empty) into tVerdict
    if tVerdict is not "ok" then
-      -- drop and log; a bad/replayed/reordered message is not an exception
+      -- drop and log; a bad/forged message is a real rejection, never a resync
       put tVerdict && char 1 to 24 of pWire & return after gGame["netLog"]
-      -- a chain break means we missed a wire (rp1 is lossy/reorders): ask the
-      -- host to replay the transcript so we catch up, instead of wedging here
-      -- forever (spec 9). Debounced in heNetRequestSync. Other drops are real
-      -- rejections and must NOT trigger a resync.
-      if tVerdict is "drop:chain-break" then
-         heNetRequestSync
-      end if
       heLobbyRefresh
       exit heNetIngestWire
    end if
@@ -1725,30 +1788,104 @@ command heNetIngestWire pWire
       heLobbyRefresh
       exit heNetIngestWire
    end if
+   put tA["seq"] into tSeq
+   if tSeq is not a number then
+      put "drop:bad-seq " & char 1 to 24 of pWire & return after gGame["netLog"]
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   if tSeq <= gGame["lastSeq"] then
+      exit heNetIngestWire   -- duplicate / already applied: drop, no resync loop
+   end if
+   if tSeq > gGame["lastSeq"] + 1 then
+      heNetBufferWire tSeq, pWire
+      put "gap    seq " & tSeq & " held (need " & (gGame["lastSeq"] + 1) & ")" \
+            & return after gGame["netLog"]
+      heNetRequestSync
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   -- tSeq is exactly lastSeq+1: it must chain onto our head, or the host's stream
+   -- is inconsistent (should not happen) -- ask for a replay rather than wedge.
+   if tA["prev"] is not gGame["chainHeadHex"] then
+      put "drop:chain-break" && char 1 to 24 of pWire & return after gGame["netLog"]
+      heNetRequestSync
+      heLobbyRefresh
+      exit heNetIngestWire
+   end if
+   heNetApplyWire pWire, tA
+   heNetDrainBuffer
+   heLobbyRefresh
+end heNetIngestWire
+
+command heNetApplyWire pWire, pA
+   -- apply one verified, in-order wire: advance the chain head, record the seq,
+   -- append to the transcript, and fold presence bodies into the display. pA is
+   -- a parsed wire (heEnvWireParse); its fields are copied into plain locals
+   -- first, so heEnvBodyText and the log lines chunk only plain text (H6-safe).
+   local tTypeTxt, tSeqTxt, tFromHex, tBodyHex
+   put pA["type"] into tTypeTxt
+   put pA["seq"] into tSeqTxt
+   put pA["from"] into tFromHex
+   put pA["bodyHex"] into tBodyHex
    put heChainNextHex(pWire) into gGame["chainHeadHex"]
+   put tSeqTxt into gGame["lastSeq"]
    put pWire & return after gGame["log"]
-   put tA["type"] into tTypeTxt
-   put tA["seq"] into tSeqTxt
    put "ok     " & tTypeTxt & " seq " & tSeqTxt & return after gGame["netLog"]
    -- lobby presence bodies drive the roster/cfg display; gameplay wires drive
-   -- the betting engine (the deal increment). tA fields are plain locals now,
-   -- so heEnvBodyText chunks only plain text (H6-safe). roster/cfg are HOST-
-   -- authored presence (spec 9): fold them only when the wire's own sender is the
-   -- host, so an admitted player cannot forge table config/roster by getting a
+   -- the betting engine (the deal increment). roster/cfg are HOST-authored
+   -- presence (spec 9): fold them only when the wire's own sender is the host,
+   -- so an admitted player cannot forge table config/roster by getting a
    -- content line relayed (the host relays any admitted sender's content).
    if tTypeTxt is "roster" or tTypeTxt is "cfg" then
-      if tA["from"] is gGame["hostPubHex"] then
+      if tFromHex is gGame["hostPubHex"] then
          if tTypeTxt is "roster" then
-            put heEnvBodyText(tA["bodyHex"]) into gGame["rosterBody"]
+            put heEnvBodyText(tBodyHex) into gGame["rosterBody"]
          else
-            put heEnvBodyText(tA["bodyHex"]) into gGame["cfgBody"]
+            put heEnvBodyText(tBodyHex) into gGame["cfgBody"]
          end if
       else
          put "drop   non-host " & tTypeTxt & " body ignored" & return after gGame["netLog"]
       end if
    end if
-   heLobbyRefresh
-end heNetIngestWire
+end heNetApplyWire
+
+command heNetBufferWire pSeq, pWire
+   -- hold an out-of-order future wire until the gap before it fills. Bounded: a
+   -- wire more than kHeWireBufMax ahead of what we have applied is left to the
+   -- full-log replay, so a flood of far-future seqs cannot grow the buffer.
+   if pSeq <= gGame["lastSeq"] + kHeWireBufMax and gGame["wireBuf"][pSeq] is empty then
+      put pWire into gGame["wireBuf"][pSeq]
+      add 1 to gGame["wireBufN"]
+   end if
+end heNetBufferWire
+
+command heNetDrainBuffer
+   -- after applying a wire, apply any buffered wires that are now consecutive.
+   -- Each is emptied as it is applied; when none remain (wireBufN back to 0) the
+   -- whole buffer is reset so emptied keys never accumulate across a long game.
+   -- Buffered wires were signature-verified and table/version-bound at ingest;
+   -- the prev link is re-checked here because the head has moved since.
+   local tNext, tWire, tA
+   repeat forever
+      put gGame["lastSeq"] + 1 into tNext
+      if gGame["wireBuf"][tNext] is empty then
+         exit repeat
+      end if
+      put gGame["wireBuf"][tNext] into tWire
+      put empty into gGame["wireBuf"][tNext]
+      subtract 1 from gGame["wireBufN"]
+      put heEnvWireParse(tWire) into tA
+      if tA["prev"] is not gGame["chainHeadHex"] then
+         exit repeat   -- a buffered wire that no longer chains: leave it for replay
+      end if
+      heNetApplyWire tWire, tA
+   end repeat
+   if gGame["wireBufN"] <= 0 then
+      put empty into gGame["wireBuf"]
+      put 0 into gGame["wireBufN"]
+   end if
+end heNetDrainBuffer
 
 command heNetSendAction pTypeTxt, pBodyTxt
    -- a player emits a signed content line to the host (or, if we are the host,
@@ -3833,6 +3970,8 @@ command heBuildTable
    -- all-in; feeds the heAmount box (the Bet/Raise buttons read that). Sits in the thin
    -- margin above the action row. Shown only on a bet/raise turn (heUIPromptToAct).
    create scrollbar "heBetSlider"
+   -- a scale, not a scrollbar: no arrow buttons, a draggable thumb on a track
+   set the style of scrollbar "heBetSlider" to "scale"
    set the rect of scrollbar "heBetSlider" to "528,575,1004,591"
    set the visible of scrollbar "heBetSlider" to false
    heMakeActionButton "heBtnMin", "Min", 608
@@ -4572,21 +4711,31 @@ end heMakeAvatar
 command heSeatAvatarRender pSeatNum
    -- choose picked-image vs coloured-initial for one seat; caches the choice in
    -- gAvatarOn so heSeatChromeVisible (the 4Hz hot path) never reloads the file
-   local tPath, tName, tInitial, tFill
+   local tPath, tName, tInitial, tFill, tPaths, tLocTxt, tCx, tCy, tNatW, tNatH
    set the itemDelimiter to ";"
    put item pSeatNum of kHeAvatarFills into tFill
    set the itemDelimiter to comma
    if there is a graphic ("heSeatAv" & pSeatNum) then
       set the backgroundColor of graphic ("heSeatAv" & pSeatNum) to tFill
    end if
-   put the ("uHeAvatarPath" & pSeatNum) of this stack into tPath
+   put the uHeAvatarPaths of this stack into tPaths
+   put line pSeatNum of tPaths into tPath
    if tPath is not empty and there is a file tPath then
       put "true" into gAvatarOn[pSeatNum]
       if there is an image ("heSeatAvImg" & pSeatNum) then
+         -- setting the filename resets the control to the picture's natural size,
+         -- so re-rect AFTER it -- aspect-fit inside the disc (formatWidth/Height are
+         -- the loaded picture's natural pixels) so a non-square photo letterboxes
+         -- on the coloured disc instead of stretching
          set the filename of image ("heSeatAvImg" & pSeatNum) to tPath
          if there is a graphic ("heSeatAv" & pSeatNum) then
+            put the loc of graphic ("heSeatAv" & pSeatNum) into tLocTxt
+            put item 1 of tLocTxt into tCx
+            put item 2 of tLocTxt into tCy
+            put the formatWidth of image ("heSeatAvImg" & pSeatNum) into tNatW
+            put the formatHeight of image ("heSeatAvImg" & pSeatNum) into tNatH
             set the rect of image ("heSeatAvImg" & pSeatNum) to \
-                  the rect of graphic ("heSeatAv" & pSeatNum)
+                  heFitRect(tNatW, tNatH, tCx, tCy, kHeAvatarSize)
          end if
          set the visible of image ("heSeatAvImg" & pSeatNum) to true
       end if
@@ -4608,7 +4757,7 @@ command heSeatAvatarRender pSeatNum
 end heSeatAvatarRender
 
 command heSeatAvatarPick pSeatNum
-   local tFile, tPropNm, tName, tPrompt
+   local tFile, tName, tPrompt, tPaths
    set the itemDelimiter to comma
    put item pSeatNum of kHeSeatNames into tName
    put "Choose an avatar image for " & tName into tPrompt
@@ -4617,8 +4766,12 @@ command heSeatAvatarPick pSeatNum
    if tFile is empty then
       exit heSeatAvatarPick   -- cancelled
    end if
-   put "uHeAvatarPath" & pSeatNum into tPropNm
-   set the (tPropNm) of this stack to tFile
+   -- ONE uHeAvatarPaths property, line N = seat N's path (paths cannot contain a
+   -- newline, so the line index is safe). A computed property NAME would need the
+   -- parenthesised dynamic-property form, which is not portable xTalk -- H9.
+   put the uHeAvatarPaths of this stack into tPaths
+   put tFile into line pSeatNum of tPaths
+   set the uHeAvatarPaths of this stack to tPaths
    heSeatAvatarRender pSeatNum
    heUISetStatus tName && "portrait updated."
 end heSeatAvatarPick
@@ -4636,22 +4789,43 @@ command heTableLogoPick
 end heTableLogoPick
 
 command heTableLogoRender
-   local tPath
+   local tPath, tNatW, tNatH
    if there is not an image "heTableLogo" then
       exit heTableLogoRender
    end if
    put the uHeTableLogoPath of this stack into tPath
    if tPath is not empty and there is a file tPath then
+      -- filename first (it resets the control to the picture's natural size),
+      -- then aspect-fit the rect into the logo box centred on the felt
       set the filename of image "heTableLogo" to tPath
-      set the rect of image "heTableLogo" to \
-            (512 - kHeLogoBox div 2) & comma & (300 - kHeLogoBox div 2) & comma \
-            & (512 + kHeLogoBox div 2) & comma & (300 + kHeLogoBox div 2)
+      put the formatWidth of image "heTableLogo" into tNatW
+      put the formatHeight of image "heTableLogo" into tNatH
+      set the rect of image "heTableLogo" to heFitRect(tNatW, tNatH, 512, 300, kHeLogoBox)
       set the blendLevel of image "heTableLogo" to kHeLogoDim
       set the visible of image "heTableLogo" to true
    else
       set the visible of image "heTableLogo" to false
    end if
 end heTableLogoRender
+
+function heFitRect pNatW, pNatH, pCx, pCy, pBox
+   -- the largest aspect-preserving rect that fits a pBox square centred on
+   -- (pCx,pCy). Pure values-in/values-out (H5); integer div keeps it exact.
+   -- Bad/missing natural sizes (image not loaded yet) fall back to the full box.
+   local tW, tH
+   if pNatW is not a number or pNatH is not a number or pNatW <= 0 or pNatH <= 0 then
+      put pBox into tW
+      put pBox into tH
+   else if pNatW >= pNatH then
+      put pBox into tW
+      put round(pBox * pNatH / pNatW) into tH
+   else
+      put pBox into tH
+      put round(pBox * pNatW / pNatH) into tW
+   end if
+   return (pCx - tW div 2) & comma & (pCy - tH div 2) & comma \
+         & (pCx + tW div 2) & comma & (pCy + tH div 2)
+end heFitRect
 
 command heBetSliderShow pMinTo, pMaxTo
    if there is not a scrollbar "heBetSlider" then
@@ -4665,6 +4839,12 @@ command heBetSliderShow pMinTo, pMaxTo
    set the startValue of scrollbar "heBetSlider" to pMinTo
    set the endValue of scrollbar "heBetSlider" to pMaxTo
    set the thumbPosition of scrollbar "heBetSlider" to pMinTo
+   -- track clicks step by a big blind (page = 4 blinds), so keyboard-free sizing
+   -- lands on natural amounts
+   if gGame["bb"] is a number and gGame["bb"] > 0 then
+      set the lineInc of scrollbar "heBetSlider" to gGame["bb"]
+      set the pageInc of scrollbar "heBetSlider" to gGame["bb"] * 4
+   end if
    set the visible of scrollbar "heBetSlider" to true
 end heBetSliderShow
 
@@ -4699,11 +4879,56 @@ end heBetSliderSync
 on scrollbarDrag pNewPos
    -- the bet slider feeds the amount box live; any other scrollbar passes through
    if the short name of the target is "heBetSlider" then
-      set the text of field "heAmount" to round(the thumbPosition of the target)
+      set the text of field "heAmount" to round(pNewPos)
       exit scrollbarDrag
    end if
    pass scrollbarDrag
 end scrollbarDrag
+
+-- track/step clicks on the scale: the engine moves the thumb as its DEFAULT
+-- action, so these always pass, and the field syncs on a short deferred send
+-- (after the default has landed) -- the house defer-out-of-dispatch pattern.
+on scrollbarLineInc
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarLineInc
+end scrollbarLineInc
+
+on scrollbarLineDec
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarLineDec
+end scrollbarLineDec
+
+on scrollbarPageInc
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarPageInc
+end scrollbarPageInc
+
+on scrollbarPageDec
+   if the short name of the target is "heBetSlider" then
+      send "heBetSliderFromThumb" to me in 30 milliseconds
+   end if
+   pass scrollbarPageDec
+end scrollbarPageDec
+
+command heBetSliderFromThumb
+   -- deferred: read wherever the engine left the thumb and mirror it into the
+   -- amount box. Guarded against the slider having been hidden since the send.
+   if there is not a scrollbar "heBetSlider" then
+      exit heBetSliderFromThumb
+   end if
+   if not the visible of scrollbar "heBetSlider" then
+      exit heBetSliderFromThumb
+   end if
+   if there is a field "heAmount" then
+      set the text of field "heAmount" to round(the thumbPosition of scrollbar "heBetSlider")
+   end if
+end heBetSliderFromThumb
 
 function heStackFolder
    -- the folder that holds the SAVED stack file, so an assets/ folder sitting next
@@ -5119,7 +5344,7 @@ end heUISetStatus
 
 command heUIPromptToAct
    local tSeatNum, tLegalTxt, tLine, tHasCheck, tHasCall, tHasBet, tHasRaise
-   local tHasAllin, tCallAmt, tName
+   local tHasAllin, tCallAmt, tName, tMinTo, tMaxTo
    set the itemDelimiter to comma
    if gGame["phase"] is not "hand" then
       exit heUIPromptToAct
@@ -5170,9 +5395,11 @@ command heUIPromptToAct
    -- seed the amount box with the minimum legal bet/raise-to, and arm the slider
    -- between that minimum and all-in (streetBy + stackBy). No bet/raise -> hide it.
    if (tHasBet or tHasRaise) and there is a field "heAmount" then
-      set the text of field "heAmount" to heQuickAmount(tSeatNum, "min")
-      heBetSliderShow heQuickAmount(tSeatNum, "min"), \
-            (gGame["state"]["streetBy"][tSeatNum] + gGame["state"]["stackBy"][tSeatNum])
+      put heQuickAmount(tSeatNum, "min") into tMinTo
+      put gGame["state"]["streetBy"][tSeatNum] + gGame["state"]["stackBy"][tSeatNum] \
+            into tMaxTo
+      set the text of field "heAmount" to tMinTo
+      heBetSliderShow tMinTo, tMaxTo
    else
       heBetSliderHide
    end if
@@ -5972,6 +6199,9 @@ command heTestNetSim
    put 0 into gGame["seqCounter"]
    put 0 into gGame["syncCooldown"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
    put "true" into gGame["admittedA"][tHostPubHex]
    put "true" into gGame["admittedA"][tPlayPubHex]     -- as if the player already handshook
    put "host" into gGame["roleByPub"][tHostPubHex]
@@ -6021,20 +6251,37 @@ command heTestNetSim
    put kKatTableHex into gGame["tableIdHex"]
    put 0 into gGame["syncCooldown"]
    put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
 
-   -- player ingests the host cfg wire -> chain advances, cfg body stashed
+   -- player ingests the host cfg wire (seq 1) -> chain advances, cfg body stashed
    heNetIngestWire tCfgWire
    heTAssert "netsim: player accepts host cfg + advances chain to head1", gGame["chainHeadHex"], tHead1
    heTAssert "netsim: player stashed the cfg body", gGame["cfgBody"], kKatLobbyCfgBody
+   heTAssert "netsim: player lastSeq is 1 after cfg", gGame["lastSeq"], 1
 
-   -- GAP: player misses wire 2, receives wire 3 -> chain break, head unchanged
+   -- REORDER: the player receives wire 3 (seq 3) BEFORE wire 2 -- rp1 reorders.
+   -- It must be HELD (buffered), not dropped, and the chain must stay put.
    heNetIngestWire tWire3
-   heTAssert "netsim: player drops the ahead-of-gap wire (chain unchanged)", gGame["chainHeadHex"], tHead1
+   heTAssert "netsim: out-of-order future wire is held, chain unchanged", gGame["chainHeadHex"], tHead1
+   heTAssert "netsim: the gap wire is buffered (not dropped)", gGame["wireBufN"], 1
 
-   -- RESYNC replay: host replays 2 then 3 -> player recovers to head3
+   -- the missing wire 2 arrives: it applies AND the buffered wire 3 drains behind
+   -- it in the same step, so the chain jumps straight to head3 from wire 2 alone.
+   heNetIngestWire tWire2
+   heTAssert "netsim: filling the gap cascades the buffered wire to head3", gGame["chainHeadHex"], tHead3
+   heTAssert "netsim: buffer emptied after the cascade", gGame["wireBufN"], 0
+
+   -- DUPLICATES: rp1 redelivers wires constantly. An already-applied wire must be
+   -- dropped SILENTLY -- no chain change, no resync -- or the client resync-loops
+   -- forever and the game never starts (the actual networked bug this fixes).
+   heNetIngestWire tCfgWire
+   heTAssert "netsim: a duplicate cfg (seq 1) is dropped, chain unchanged", gGame["chainHeadHex"], tHead3
    heNetIngestWire tWire2
    heNetIngestWire tWire3
-   heTAssert "netsim: player recovers to the host chain head after replay", gGame["chainHeadHex"], tHead3
+   heTAssert "netsim: duplicate wires 2 and 3 are dropped, chain stays head3", gGame["chainHeadHex"], tHead3
+   heTAssert "netsim: lastSeq stays 3 through the duplicates", gGame["lastSeq"], 3
 
    -- host-authority on ingest (deep-dive [1]/[6]): a wire whose cfg content is
    -- authored by a NON-host key -- even if it is otherwise valid and host-signed --
