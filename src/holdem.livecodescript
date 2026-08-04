@@ -6,6 +6,48 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.17.0 -- ONLINE PLAY (Phase 2d): full Level 0 hands over the signed wire
+chain. The game is now literally the spec-4 design: every client folds the
+same wires into the same gGame["state"] the hotseat UI already renders, and
+a react engine (heNetGameReact) emits only what OUR seat owes next, each
+emission behind a per-hand sent-flag so rp1 redelivery and catch-up replay
+never double-send. kHeHarnessV 30 -> 31; kUIVersion 11 -> 12 (Start Game).
+  * WIRE VOCABULARY (spec 6, as-built bodies): join binds each player's
+    per-table session box pub ON the chain (the signed contentLine IS the
+    spec-5 binding tuple); host sit wires assign seats (ascending-pubkey
+    order); handStart/dealLevel open a hand with dealer = the button seat.
+  * THE DEAL (spec 7.1, for real this time): seedCommit from every dealt
+    seat -> seedSeal (the seed sealed to the dealer's box, kept on-chain so
+    the transcript stays self-contained) -> the dealer opens, verifies every
+    commit, derives the committed deck, and delivers each seat's holes in a
+    sealed box -> blinds and betting as self-signed wires through the same
+    pure engine (the BB posts only after it SEES the SB fold, so forced bets
+    cannot race the relay) -> dealer board wires per street -> at hand end
+    every seat reveals its seed and every client re-derives deck/holes/ranks
+    from the reveals -- nobody can lie about a showdown.
+  * SETTLE/RECEIPTS/AUDIT: the host's settle wire is verified against every
+    client's own heSettleOf recomputation BEFORE folding (a mismatch is
+    refused and flagged, never followed); receipt wires carry the spec-8.3
+    co-signatures over a head that chains hand to hand; every client emits
+    its audit verdict (commits + wired board + its own delivered holes vs
+    the derived deal).
+  * THE LOBBY CFG now carries ante + stack (the full stakes fold from the
+    signed cfg on every client; protocol-kat pins regenerated); online
+    stacks seed from the cfg, never from a parked hotseat game.
+  * UI: action buttons emit wires online (only the seat to act may send);
+    the prompt is only ever ours; a host-only Start Game button seats the
+    joined players and deals hand 1; between-hands the host auto-kicks the
+    next hand on the usual pace beat.
+  * HARNESS: heTestNetPlay drives TWO complete hands host<->player on one
+    machine through the real handlers (real sxSeal roundtrips), via a
+    capture seam on the send path (gGame["netCap"]) -- a scripted fold-win
+    with deterministic deltas, then a checked-down showdown asserted on
+    invariants: five wired board cards, chip conservation, cross-wire stack
+    agreement, an advancing receipt chain, clean audits on both seats.
+  * Deferred to 2e with liveness: act timers, sit-out/reconnect mid-hand,
+    street ckpt wires, show/muck display choice, late-join seating, online
+    History folding (the live audit verdicts land in the net feed).
+
 v0.16.0 -- casino sounds (Kenney "Casino Audio", CC0). 11 sounds vendored as
 16-bit mono WAVs in assets/sounds (the upstream OGGs are not engine-playable;
 converted at vendor time, rate untouched). One playback gate (heSndPlay): config
@@ -392,9 +434,9 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.16.0"
-constant kHeHarnessV = "30"
-constant kUIVersion = "11"
+constant kHeVersion = "0.17.0"
+constant kHeHarnessV = "31"
+constant kUIVersion = "12"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
 -- index = (rank - 2) * 4 + suit, rank 2..14, suit 1..4 = c,d,h,s
@@ -1407,7 +1449,11 @@ function heLobbyCfgBody
    -- the table cfg the host signs into the transcript at create time; a clean,
    -- canonical string (pinned as kKatLobbyCfgBody) so joiners verify it byte
    -- for byte. Level 0 is the online deal ladder rung this build targets.
+   -- ante + stack joined the body in v0.17.0 (the online game needs the full
+   -- stakes to fold deterministically on every client); the pinned constants
+   -- in tools/protocol-kat.py were regenerated for the new bytes.
    return "v=1,level=0,sb=" & gGame["sb"] & ",bb=" & gGame["bb"] \
+         & ",ante=" & gGame["ante"] & ",stack=" & gGame["startStack"] \
          & ",seats=" & kHeDefaultSeats & ",button=1"
 end heLobbyCfgBody
 
@@ -1580,6 +1626,7 @@ command heTableCreate
    -- the host must admit ITSELF so heHostRelay accepts the host's own actions
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "host" into gGame["roleByPub"][gGame["idPubHex"]]
+   heNetGameInit
    heNetStart
    if gGame["online"] is not "true" then
       exit heTableCreate   -- transport unavailable; heNetStart set the status
@@ -1626,6 +1673,7 @@ command heTableJoin pCodeTxt
    -- admit ourselves as a player so the local roster shows our own seat
    put "true" into gGame["admittedA"][gGame["idPubHex"]]
    put "player" into gGame["roleByPub"][gGame["idPubHex"]]
+   heNetGameInit
    heNetStart
    if gGame["online"] is not "true" then
       exit heTableJoin   -- transport unavailable; heNetStart set the status
@@ -1944,10 +1992,29 @@ command heNetApplyWire pWire, pA
             put heEnvBodyText(tBodyHex) into gGame["rosterBody"]
          else
             put heEnvBodyText(tBodyHex) into gGame["cfgBody"]
+            -- adopt the signed stakes so every client folds the same game
+            -- (the host's own values are identical; this is a no-op there)
+            put heNetCfgVal("sb", gGame["sb"]) into gGame["sb"]
+            put heNetCfgVal("bb", gGame["bb"]) into gGame["bb"]
+            put heNetCfgVal("ante", 0) into gGame["ante"]
+            put heNetCfgVal("stack", kHeDefaultStack) into gGame["startStack"]
          end if
+         heNetGameReact
       else
          put "drop   non-host " & tTypeTxt & " body ignored" & return after gGame["netLog"]
       end if
+      exit heNetApplyWire
+   end if
+   -- the online game vocabulary folds through its own dispatcher (authority
+   -- checks per type live there); everything else is future/unknown -- the
+   -- chain carries it, nothing acts on it
+   if tTypeTxt is "join" or tTypeTxt is "sit" or tTypeTxt is "handStart" \
+         or tTypeTxt is "dealLevel" or tTypeTxt is "seedCommit" or tTypeTxt is "seedSeal" \
+         or tTypeTxt is "holeDeliver" or tTypeTxt is "board" or tTypeTxt is "bidAnte" \
+         or tTypeTxt is "bidSB" or tTypeTxt is "bidBB" or tTypeTxt is "act" \
+         or tTypeTxt is "seedReveal" or tTypeTxt is "settle" or tTypeTxt is "receipt" \
+         or tTypeTxt is "audit" then
+      heNetFoldGameWire tTypeTxt, tFromHex, heEnvBodyText(tBodyHex), pA["hand"]
    end if
 end heNetApplyWire
 
@@ -2026,6 +2093,13 @@ end heNetSendAction
 
 command heNetSendToHost pPayloadTxt
    local tHostPeer
+   -- netsim capture seam: the loopback harness has no rp1, so outbound
+   -- payloads are collected in gGame["netOutbox"] for the sim to shuttle by
+   -- hand. Off (empty) in production; the real send path below is untouched.
+   if gGame["netCap"] is "true" then
+      put pPayloadTxt & return after gGame["netOutbox"]
+      exit heNetSendToHost
+   end if
    put gGame["peerByPub"][gGame["hostPubHex"]] into tHostPeer
    if tHostPeer is empty then
       exit heNetSendToHost
@@ -2055,6 +2129,10 @@ end heNetRequestSync
 command heNetBroadcast pPayloadTxt
    -- host sends to every admitted peer (star topology, spec 4)
    local tPeer, tData
+   if gGame["netCap"] is "true" then
+      put pPayloadTxt & return after gGame["netOutbox"]
+      exit heNetBroadcast
+   end if
    put textEncode(pPayloadTxt, "utf-8") into tData
    repeat for each key tPeer in gGame["peerPubA"]
       get btRp1Send(gGame["session"], tPeer, tData)
@@ -2102,6 +2180,946 @@ command heHostEmitRoster
    end if
    heNetSendAction "roster", heRosterBody(tMembers)
 end heHostEmitRoster
+
+--------------------------------------------------------------------------
+-- the ONLINE game (Phase 2d): Level 0 play over the signed wire chain.
+-- Every client folds the same wires into the same gGame["state"] the hotseat
+-- UI already renders, and heNetGameReact then emits ONLY what OUR seat owes
+-- next (a commit, a seal, a blind, a board if we deal this hand...). Every
+-- emission is debounced by a per-hand sent-flag, so rp1 redelivery and the
+-- catch-up replay can never double-send. None of the hotseat pacing timers
+-- run online -- the network's turn-rate IS the pacing (spec 11).
+-- Deal (spec 7.1, Level 0): dealer = the button seat. seedCommit from every
+-- dealt seat -> seedSeal (the seed sealed to the dealer's session box pub,
+-- kept ON the chain so the transcript stays self-contained) -> the dealer
+-- derives the committed deck and emits sealed holeDeliver per seat -> blinds
+-- and betting as self-signed wires through the SAME pure engine -> dealer
+-- board wires -> at hand end every seat emits seedReveal, every client
+-- re-derives deck/holes/ranks from the REVEALED seeds (nobody can lie about
+-- a showdown), the host emits settle (verified by every client against its
+-- own heSettleOf before folding), then receipt co-signatures (spec 8.3,
+-- chained hand to hand) and per-client audit verdicts (spec 7.1 step 5).
+--------------------------------------------------------------------------
+
+command heNetGameInit
+   -- reset the online-game store (heTableCreate/heTableJoin + netsim contexts).
+   -- stacksBy is cleared deliberately: the parked hotseat table leaves its own
+   -- stack numbers behind, and the sit fold seeds a seat's stack only when the
+   -- slot is EMPTY -- online stacks must come from the signed cfg, never from
+   -- a leftover hotseat game (Leave rebuilds the hotseat table anyway).
+   put empty into gGame["boxByPub"]
+   put empty into gGame["seatByPub"]
+   put empty into gGame["pubBySeat"]
+   put empty into gGame["seatedList"]
+   put empty into gGame["stacksBy"]
+   put 0 into gGame["lastBB"]
+   put "false" into gGame["joinSent"]
+   put "false" into gGame["gameOn"]
+   put "true" into gGame["autoNext"]
+   put kHeGenesisPrev into gGame["rcptHeadHex"]
+   put empty into gGame["oDeal"]
+end heNetGameInit
+
+command heNetHandReset
+   -- per-hand deal store; runs when a handStart wire folds. Sent-flags are the
+   -- redelivery/replay debounce for every emission this hand.
+   put empty into gGame["oDeal"]
+   put "false" into gGame["oDeal"]["commitSent"]
+   put "false" into gGame["oDeal"]["sealSent"]
+   put "false" into gGame["oDeal"]["holesSent"]
+   put "false" into gGame["oDeal"]["anteSent"]
+   put "false" into gGame["oDeal"]["sbSent"]
+   put "false" into gGame["oDeal"]["bbSent"]
+   put "false" into gGame["oDeal"]["revealSent"]
+   put "false" into gGame["oDeal"]["settleSent"]
+   put "false" into gGame["oDeal"]["receiptSent"]
+   put "false" into gGame["oDeal"]["auditSent"]
+   put "false" into gGame["oDeal"]["settleDone"]
+   put "false" into gGame["oDeal"]["nextArmed"]
+   put 0 into gGame["oDeal"]["commitN"]
+   put 0 into gGame["oDeal"]["sealN"]
+   put 0 into gGame["oDeal"]["holeN"]
+   put 0 into gGame["oDeal"]["revealN"]
+   put 0 into gGame["oDeal"]["receiptN"]
+   put 0 into gGame["oDeal"]["dealerSeat"]
+   put 0 into gGame["oDeal"]["dealCount"]
+   put empty into gGame["oDeal"]["boardList"]
+   put empty into gGame["oDeal"]["myHoles"]
+   put empty into gGame["oDeal"]["mySeedHex"]
+end heNetHandReset
+
+function heNetMySeat
+   local tSeat
+   put gGame["seatByPub"][gGame["idPubHex"]] into tSeat
+   if tSeat is not a number then
+      return 0
+   end if
+   return tSeat
+end heNetMySeat
+
+function heNetSeatPos pSeatNum
+   -- a seat's CONTRIBUTOR position = its 1-based index in the hand's ascending
+   -- occupied-seat list (sparse seats pack down to 1..count; the seed XOR and
+   -- commit arrays are position-indexed, spec 7.1)
+   local tOccList, tPos, tSeatNum
+   set the itemDelimiter to comma
+   put gGame["state"]["occ"] into tOccList
+   put 0 into tPos
+   repeat for each item tSeatNum in tOccList
+      add 1 to tPos
+      if tSeatNum is pSeatNum then
+         return tPos
+      end if
+   end repeat
+   return 0
+end heNetSeatPos
+
+function heNetSeatAtPos pPos
+   local tOccList
+   set the itemDelimiter to comma
+   put gGame["state"]["occ"] into tOccList
+   return item pPos of tOccList
+end heNetSeatAtPos
+
+command heNetStartGame
+   -- HOST only: seat everyone who has joined (published a session box pub) and
+   -- kick off hand 1. Seats are assigned in ascending-pubkey order, so the
+   -- assignment is deterministic and every client could re-derive it; the sit
+   -- wires make it explicit and signed. Late joiners sit out until the sit-in
+   -- flow arrives with liveness (2e).
+   local tPubHex, tPubsTxt, tSeatNum, tJoinedN
+   if gGame["online"] is not "true" or gGame["isHost"] is not "true" then
+      exit heNetStartGame
+   end if
+   if gGame["gameOn"] is "true" then
+      exit heNetStartGame
+   end if
+   put empty into tPubsTxt
+   put 0 into tJoinedN
+   repeat for each key tPubHex in gGame["boxByPub"]
+      if gGame["admittedA"][tPubHex] is "true" then
+         put tPubHex & return after tPubsTxt
+         add 1 to tJoinedN
+      end if
+   end repeat
+   if tJoinedN < 2 then
+      heUISetStatus "Need at least 2 joined players to start (have " & tJoinedN & ")."
+      exit heNetStartGame
+   end if
+   if tJoinedN > kHeMaxSeats then
+      heUISetStatus "Too many joined players for the table (" & tJoinedN & ")."
+      exit heNetStartGame
+   end if
+   sort lines of tPubsTxt
+   put 0 into tSeatNum
+   repeat for each line tPubHex in tPubsTxt
+      add 1 to tSeatNum
+      heNetSendAction "sit", "seat=" & tSeatNum & ",pub=" & tPubHex
+   end repeat
+   heNetHandKick
+end heNetStartGame
+
+command heNetHandKick
+   -- HOST only: open the next hand -- emit handStart (+ dealLevel naming the
+   -- dealer = the button seat) for the seats that still have chips.
+   local tOccList, tSeatNum, tButtonSeat, tCount, tStacksTxt, tSeatedList
+   if gGame["online"] is not "true" or gGame["isHost"] is not "true" then
+      exit heNetHandKick
+   end if
+   set the itemDelimiter to comma
+   put gGame["seatedList"] into tSeatedList
+   put empty into tOccList
+   put 0 into tCount
+   repeat for each item tSeatNum in tSeatedList
+      if gGame["stacksBy"][tSeatNum] > 0 then
+         put tSeatNum & comma after tOccList
+         add 1 to tCount
+      end if
+   end repeat
+   if tOccList is not empty then
+      delete char -1 of tOccList
+   end if
+   if tCount < 2 then
+      heUISetStatus "Game over -- one stack left."
+      exit heNetHandKick
+   end if
+   put heScheduleButton(tOccList, gGame["lastBB"]) into tButtonSeat
+   add 1 to gGame["handNum"]
+   put tOccList into tStacksTxt
+   replace comma with "|" in tStacksTxt
+   heNetSendAction "handStart", "seats=" & tStacksTxt & ",button=" & tButtonSeat
+   heNetSendAction "dealLevel", "level=0,dealer=" & tButtonSeat & ",count=" & tCount
+end heNetHandKick
+
+on heNetNextHandTick
+   -- host's between-hands beat; guarded so a stale send can never double-kick
+   if gGame["online"] is not "true" or gGame["isHost"] is not "true" then
+      exit heNetNextHandTick
+   end if
+   if gGame["phase"] is not "between" then
+      exit heNetNextHandTick
+   end if
+   heNetHandKick
+end heNetNextHandTick
+
+command heNetEngineFold pMsgType, pSeatNum, pAmount
+   -- fold one gameplay message into the SAME pure engine the hotseat uses.
+   -- No heLogAppend (online, gGame["log"] is the signed wire chain itself) and
+   -- no paced hotseat scheduling -- consequences are wire-driven via react.
+   local tStateA, tVerb
+   put heBetApply(gGame["state"], pMsgType, pSeatNum, pAmount) into tStateA
+   if tStateA["err"] is not empty then
+      put "drop   engine-rejected " & pMsgType && tStateA["err"] & return after gGame["netLog"]
+      exit heNetEngineFold
+   end if
+   put tStateA into gGame["state"]
+   if pMsgType is "act" then
+      set the itemDelimiter to comma
+      put item 1 of pAmount into tVerb
+      heSndVerb tVerb
+   end if
+   -- mirror the engine phase into the table phase the HUD renders (the paced
+   -- hotseat equivalents live in heReactToNotes; online is turn-rate)
+   if tStateA["phase"] is "runout" then
+      put "runout" into gGame["phase"]
+   else if tStateA["phase"] is "showdown" or tStateA["phase"] is "handdone" then
+      put "showdown" into gGame["phase"]
+   end if
+   heHudMark
+end heNetEngineFold
+
+command heNetFoldGameWire pTypeTxt, pFromHex, pBodyTxt, pHandTxt
+   -- fold one verified, in-order, ROSTERED game wire into the client game
+   -- store + engine. From-authority per type: sit/handStart/dealLevel/settle
+   -- must be host-authored; holeDeliver/board must come from this hand's
+   -- dealer; everything seat-scoped must come from the key that OWNS the seat
+   -- (a seat claim in a body is never trusted over seatByPub). Anything
+   -- malformed is a logged drop, never a throw (H4).
+   local tBodyA, tSeat, tPos, tHex, tAmt, tVerb, tCardsTxt, tOneCard, tIdxList
+   local tFromSeat, tDealerPub, tOccList, tCount, tStackAmt, tOpenErr, tOpenTxt
+   local tDeltasTxt, tMineTxt, tHeadHex, tSigHex, tResultTxt, tPrevBad
+   set the itemDelimiter to comma
+   put pBodyTxt into tBodyA
+   split tBodyA by comma and "="
+   put gGame["seatByPub"][pFromHex] into tFromSeat
+   switch pTypeTxt
+
+      case "join"
+         -- spec 5 session binding: the signed contentLine covers table + from
+         -- + box pub, which IS the binding tuple. Store the box lane.
+         put tBodyA["box"] into tHex
+         if heIsHex(tHex, 64) then
+            put tHex into gGame["boxByPub"][pFromHex]
+            put "join   " & char 1 to 8 of pFromHex & " bound a session box key" & return after gGame["netLog"]
+         else
+            put "drop   join with a malformed box key" & return after gGame["netLog"]
+         end if
+         break
+
+      case "sit"
+         if pFromHex is not gGame["hostPubHex"] then
+            put "drop   non-host sit ignored" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["seat"] into tSeat
+         put tBodyA["pub"] into tHex
+         if tSeat is not a number or tSeat < 1 or tSeat > kHeMaxSeats or not heIsHex(tHex, 64) then
+            put "drop   malformed sit" & return after gGame["netLog"]
+            break
+         end if
+         put tSeat into gGame["seatByPub"][tHex]
+         put tHex into gGame["pubBySeat"][tSeat]
+         put gGame["seatedList"] into tOccList
+         if tSeat is not among the items of tOccList then
+            if tOccList is empty then
+               put tSeat into tOccList
+            else
+               put comma & tSeat after tOccList
+            end if
+            sort items of tOccList ascending numeric
+            put tOccList into gGame["seatedList"]
+         end if
+         -- opening stack from the signed table cfg
+         put heNetCfgVal("stack", kHeDefaultStack) into tStackAmt
+         if gGame["stacksBy"][tSeat] is not a number then
+            put tStackAmt into gGame["stacksBy"][tSeat]
+         end if
+         put "true" into gGame["gameOn"]
+         if tHex is gGame["idPubHex"] then
+            heUISetStatus "You are seated at seat " & tSeat & ". The game is starting."
+         end if
+         break
+
+      case "handStart"
+         if pFromHex is not gGame["hostPubHex"] then
+            put "drop   non-host handStart ignored" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["seats"] into tOccList
+         replace "|" with comma in tOccList
+         put tBodyA["button"] into tSeat
+         if tOccList is empty or tSeat is not a number then
+            put "drop   malformed handStart" & return after gGame["netLog"]
+            break
+         end if
+         heNetHandReset
+         put pHandTxt into gGame["handNum"]
+         put tSeat into gGame["buttonSeat"]
+         put heBetNewHand(gGame["sb"], gGame["bb"], gGame["ante"], gGame["stacksBy"], \
+               tOccList, tSeat) into gGame["state"]
+         put gGame["state"]["bbSeat"] into gGame["lastBB"]
+         put "hand" into gGame["phase"]
+         heUIClearCards
+         heHudMark
+         put "hand   #" & pHandTxt & " begins (button seat " & tSeat & ")" & return after gGame["netLog"]
+         break
+
+      case "dealLevel"
+         if pFromHex is not gGame["hostPubHex"] then
+            put "drop   non-host dealLevel ignored" & return after gGame["netLog"]
+            break
+         end if
+         if tBodyA["level"] is not "0" then
+            put "drop   unsupported deal level " & tBodyA["level"] & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["dealer"] into tSeat
+         put tBodyA["count"] into tCount
+         if tSeat is not a number or tCount is not a number then
+            put "drop   malformed dealLevel" & return after gGame["netLog"]
+            break
+         end if
+         put tSeat into gGame["oDeal"]["dealerSeat"]
+         put tCount into gGame["oDeal"]["dealCount"]
+         break
+
+      case "seedCommit"
+         put tBodyA["pos"] into tPos
+         put tBodyA["commit"] into tHex
+         if tPos is not a number or not heIsHex(tHex, 64) \
+               or heNetSeatAtPos(tPos) is not tFromSeat or tFromSeat is 0 then
+            put "drop   bad seedCommit" & return after gGame["netLog"]
+            break
+         end if
+         if gGame["oDeal"]["commitsBy"][tPos] is empty then
+            put tHex into gGame["oDeal"]["commitsBy"][tPos]
+            add 1 to gGame["oDeal"]["commitN"]
+         end if
+         break
+
+      case "seedSeal"
+         put tBodyA["pos"] into tPos
+         put tBodyA["sealed"] into tHex
+         if tPos is not a number or tHex is empty or not heIsHex(tHex, 0) \
+               or heNetSeatAtPos(tPos) is not tFromSeat or tFromSeat is 0 then
+            put "drop   bad seedSeal" & return after gGame["netLog"]
+            break
+         end if
+         if gGame["oDeal"]["sealsBy"][tPos] is empty then
+            put tHex into gGame["oDeal"]["sealsBy"][tPos]
+            add 1 to gGame["oDeal"]["sealN"]
+         end if
+         break
+
+      case "holeDeliver"
+         put gGame["pubBySeat"][gGame["oDeal"]["dealerSeat"]] into tDealerPub
+         if pFromHex is not tDealerPub then
+            put "drop   holeDeliver not from the dealer" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["seat"] into tSeat
+         put tBodyA["sealed"] into tHex
+         if tSeat is not a number or tHex is empty or not heIsHex(tHex, 0) then
+            put "drop   malformed holeDeliver" & return after gGame["netLog"]
+            break
+         end if
+         if gGame["oDeal"]["holeSealedBy"][tSeat] is empty then
+            put tHex into gGame["oDeal"]["holeSealedBy"][tSeat]
+            add 1 to gGame["oDeal"]["holeN"]
+         end if
+         if tSeat is heNetMySeat() and gGame["oDeal"]["myHoles"] is empty then
+            -- our private lane: open the sealed box with the session key (H4:
+            -- a bad blob is a logged drop; the audit names the dealer later)
+            try
+               put textDecode(sxSealOpen(heHex2BinD(tHex), gGame["boxPubData"], \
+                     gGame["boxSecData"]), "utf-8") into tOpenTxt
+               if heIsCardList(tOpenTxt, 2) then
+                  put tOpenTxt into gGame["oDeal"]["myHoles"]
+                  heUISetStatus "Your cards: " & heCardName(item 1 of tOpenTxt) \
+                        && heCardName(item 2 of tOpenTxt)
+               else
+                  put "drop   holeDeliver opened to garbage" & return after gGame["netLog"]
+               end if
+            catch tOpenErr
+               put "drop   holeDeliver would not open" & return after gGame["netLog"]
+            end try
+         end if
+         break
+
+      case "bidAnte"
+      case "bidSB"
+      case "bidBB"
+         if tFromSeat is 0 then
+            put "drop   bid from an unseated key" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["amount"] into tAmt
+         heNetEngineFold pTypeTxt, tFromSeat, tAmt
+         break
+
+      case "act"
+         if tFromSeat is 0 then
+            put "drop   act from an unseated key" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["verb"] into tVerb
+         put tBodyA["amount"] into tAmt
+         heNetEngineFold "act", tFromSeat, tVerb & comma & tAmt
+         break
+
+      case "board"
+         put gGame["pubBySeat"][gGame["oDeal"]["dealerSeat"]] into tDealerPub
+         if pFromHex is not tDealerPub then
+            put "drop   board not from the dealer" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["cards"] into tCardsTxt
+         replace "|" with comma in tCardsTxt
+         put empty into tIdxList
+         repeat for each item tOneCard in tCardsTxt
+            put heCardIndex(tOneCard) & comma after tIdxList
+         end repeat
+         if tIdxList is not empty then
+            delete char -1 of tIdxList
+         end if
+         if not heIsCardList(tIdxList, the number of items of tIdxList) \
+               or the number of items of tIdxList < 1 then
+            put "drop   malformed board" & return after gGame["netLog"]
+            break
+         end if
+         if gGame["oDeal"]["boardList"] is empty then
+            put tIdxList into gGame["oDeal"]["boardList"]
+         else
+            put comma & tIdxList after gGame["oDeal"]["boardList"]
+         end if
+         heNetEngineFold "board", 0, 0
+         heNetShowBoard
+         break
+
+      case "seedReveal"
+         put tBodyA["pos"] into tPos
+         put tBodyA["seed"] into tHex
+         if tPos is not a number or not heIsHex(tHex, 64) \
+               or heNetSeatAtPos(tPos) is not tFromSeat or tFromSeat is 0 then
+            put "drop   bad seedReveal" & return after gGame["netLog"]
+            break
+         end if
+         -- the reveal must open the commitment made before the deal (spec 7.1)
+         if heSeedCommitHex(tHex) is not gGame["oDeal"]["commitsBy"][tPos] then
+            put "AUDIT  seedReveal pos " & tPos & " does not match its commit" & return after gGame["netLog"]
+            break
+         end if
+         if gGame["oDeal"]["revealsBy"][tPos] is empty then
+            put tHex into gGame["oDeal"]["revealsBy"][tPos]
+            add 1 to gGame["oDeal"]["revealN"]
+         end if
+         break
+
+      case "settle"
+         if pFromHex is not gGame["hostPubHex"] then
+            put "drop   non-host settle ignored" & return after gGame["netLog"]
+            break
+         end if
+         if gGame["oDeal"]["settleDone"] is "true" then
+            break
+         end if
+         put tBodyA["deltas"] into tDeltasTxt
+         put heNetComputeSettleTxt() into tMineTxt
+         if tMineTxt is empty then
+            put "drop   settle before the reveals completed" & return after gGame["netLog"]
+            break
+         end if
+         if tDeltasTxt is not tMineTxt then
+            -- a host settle that disagrees with our own deterministic
+            -- recomputation is refused outright -- deliberate: following it
+            -- would mean following a provably wrong (or hostile) host
+            put "SETTLE-MISMATCH host=" & tDeltasTxt & " ours=" & tMineTxt & return after gGame["netLog"]
+            heUISetStatus "Settlement mismatch -- this hand is disputed. See the net feed."
+            break
+         end if
+         heNetApplySettle tDeltasTxt
+         break
+
+      case "receipt"
+         if tFromSeat is 0 then
+            put "drop   receipt from an unseated key" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["head"] into tHeadHex
+         put tBodyA["sig"] into tSigHex
+         if not heIsHex(tHeadHex, 64) or not heIsHex(tSigHex, 128) \
+               or tHeadHex is not gGame["rcptHeadHex"] \
+               or not heReceiptSigVerify(tSigHex, tHeadHex, pFromHex) then
+            put "drop   bad receipt from seat " & tFromSeat & return after gGame["netLog"]
+            break
+         end if
+         if gGame["oDeal"]["receiptsBy"][tFromSeat] is empty then
+            put tSigHex into gGame["oDeal"]["receiptsBy"][tFromSeat]
+            add 1 to gGame["oDeal"]["receiptN"]
+         end if
+         if gGame["oDeal"]["receiptN"] >= gGame["oDeal"]["dealCount"] then
+            put "rcpt   hand " & gGame["handNum"] & " receipt co-signed by all " \
+                  & gGame["oDeal"]["receiptN"] & " seats" & return after gGame["netLog"]
+         end if
+         break
+
+      case "audit"
+         if tFromSeat is 0 then
+            put "drop   audit from an unseated key" & return after gGame["netLog"]
+            break
+         end if
+         put tBodyA["result"] into tResultTxt
+         put "audit  seat " & tFromSeat & ": " & tResultTxt & return after gGame["netLog"]
+         break
+
+   end switch
+   heNetGameReact
+end heNetFoldGameWire
+
+function heNetCfgVal pKey, pDefault
+   -- one numeric value out of the signed table cfg body ("k=v,k=v" text);
+   -- copy-then-split keeps every chunk on a plain local (H6)
+   local tBodyA, tVal
+   set the itemDelimiter to comma
+   put gGame["cfgBody"] into tBodyA
+   split tBodyA by comma and "="
+   put tBodyA[pKey] into tVal
+   if tVal is not a number then
+      return pDefault
+   end if
+   return tVal
+end heNetCfgVal
+
+command heNetGameReact
+   -- the per-client reaction to the folded transcript: emit ONLY what our
+   -- seat owes next, each emission behind a per-hand sent-flag so redelivery
+   -- and replay never double-send. Runs after every applied wire.
+   local tMySeat, tOccList, tStateA, tCount, tPos, tSeedHex, tSealedHex, tRndErr
+   local tDealerSeat, tDealerPubHex, tDealerBoxHex, tBoardTxt, tBoardN, tStreetTxt
+   local tDeltasTxt, tHeadHex, tSigHex, tResultTxt, tSealErr, tAllPosted, tSeatNum
+   if gGame["online"] is not "true" then
+      exit heNetGameReact
+   end if
+   -- 1. bind our session box key once the roster lists us (spec 5): the signed
+   -- contentLine over table + from + box IS the binding tuple
+   if gGame["joinSent"] is not "true" and gGame["boxPubData"] is not empty \
+         and gGame["rosterBody"] contains gGame["idPubHex"] then
+      put "true" into gGame["joinSent"]
+      heNetSendAction "join", "box=" & heBin2HexS(gGame["boxPubData"])
+   end if
+   if gGame["gameOn"] is not "true" then
+      exit heNetGameReact
+   end if
+   put heNetMySeat() into tMySeat
+   put gGame["oDeal"]["dealerSeat"] into tDealerSeat
+   put gGame["oDeal"]["dealCount"] into tCount
+   set the itemDelimiter to comma
+   put gGame["state"]["occ"] into tOccList
+   if tOccList is empty or tCount is not a number or tCount is 0 then
+      exit heNetGameReact   -- no hand open, or dealLevel not folded yet
+   end if
+   put heNetSeatPos(tMySeat) into tPos
+   -- 2. commit fresh deal entropy (spec 7.1 step 1; freshness law, spec 5)
+   if tPos > 0 and gGame["oDeal"]["commitSent"] is not "true" then
+      put "true" into gGame["oDeal"]["commitSent"]
+      try
+         put heBin2HexS(sxRandomBytes(32)) into tSeedHex
+         put tSeedHex into gGame["oDeal"]["mySeedHex"]
+         heNetSendAction "seedCommit", "pos=" & tPos & ",commit=" & heSeedCommitHex(tSeedHex)
+      catch tRndErr
+         put "ERROR  could not draw deal entropy" & return after gGame["netLog"]
+      end try
+   end if
+   -- 3. seal our seed to the dealer (spec 7.1 step 2) once every commit is in
+   -- (committing BEFORE any seed travels is what stops the dealer stacking)
+   if tPos > 0 and gGame["oDeal"]["commitN"] >= tCount \
+         and gGame["oDeal"]["sealSent"] is not "true" then
+      put gGame["pubBySeat"][tDealerSeat] into tDealerPubHex
+      put gGame["boxByPub"][tDealerPubHex] into tDealerBoxHex
+      if heIsHex(tDealerBoxHex, 64) then
+         put "true" into gGame["oDeal"]["sealSent"]
+         try
+            put heBin2HexS(sxSeal(textEncode(gGame["oDeal"]["mySeedHex"], "utf-8"), \
+                  heHex2BinD(tDealerBoxHex))) into tSealedHex
+            heNetSendAction "seedSeal", "pos=" & tPos & ",sealed=" & tSealedHex
+         catch tSealErr
+            put "ERROR  could not seal the seed to the dealer" & return after gGame["netLog"]
+         end try
+      end if
+   end if
+   -- 4. we deal this hand: open the seals, verify, derive, deliver
+   if tMySeat is tDealerSeat and tMySeat > 0 and gGame["oDeal"]["sealN"] >= tCount \
+         and gGame["oDeal"]["holesSent"] is not "true" then
+      put "true" into gGame["oDeal"]["holesSent"]
+      heNetDealerDeal
+   end if
+   -- 5. blinds once every seat has its (sealed) holes. Antes first (dead
+   -- money), then the SB, and the BB only after it SEES the SB fold -- so the
+   -- two forced posts can never race in the relay's ordering.
+   if gGame["oDeal"]["holeN"] >= tCount and tPos > 0 then
+      put gGame["state"] into tStateA
+      if tStateA["phase"] is "blinds" then
+         if gGame["ante"] > 0 and gGame["oDeal"]["anteSent"] is not "true" \
+               and tStateA["antePostedBy"][tMySeat] is not "true" then
+            put "true" into gGame["oDeal"]["anteSent"]
+            heNetSendAction "bidAnte", "amount=" & min(gGame["ante"], tStateA["stackBy"][tMySeat])
+         end if
+         put "true" into tAllPosted
+         if gGame["ante"] > 0 then
+            repeat for each item tSeatNum in tOccList
+               if tStateA["antePostedBy"][tSeatNum] is not "true" then
+                  put "false" into tAllPosted
+               end if
+            end repeat
+         end if
+         if tAllPosted is "true" and tMySeat is tStateA["sbSeat"] \
+               and tStateA["sbPosted"] is not "true" and gGame["oDeal"]["sbSent"] is not "true" then
+            put "true" into gGame["oDeal"]["sbSent"]
+            heNetSendAction "bidSB", "amount=" & min(tStateA["sb"], tStateA["stackBy"][tMySeat])
+         end if
+         if tStateA["sbPosted"] is "true" and tMySeat is tStateA["bbSeat"] \
+               and gGame["oDeal"]["bbSent"] is not "true" then
+            put "true" into gGame["oDeal"]["bbSent"]
+            heNetSendAction "bidBB", "amount=" & min(tStateA["bb"], tStateA["stackBy"][tMySeat])
+         end if
+      end if
+   end if
+   -- 6. we deal this hand and a street is due (live close or runout)
+   if tMySeat is tDealerSeat and tMySeat > 0 then
+      put gGame["state"] into tStateA
+      put gGame["oDeal"]["boardList"] into tBoardTxt
+      put the number of items of tBoardTxt into tBoardN
+      put empty into tStreetTxt
+      if tStateA["phase"] is "acting" or tStateA["phase"] is "runout" then
+         if tBoardN is 0 and (tStateA["street"] is not "preflop" or tStateA["phase"] is "runout") then
+            put "flop" into tStreetTxt
+         else if tBoardN is 3 and (tStateA["street"] is "turn" or tStateA["street"] is "river" \
+               or tStateA["phase"] is "runout") then
+            put "turn" into tStreetTxt
+         else if tBoardN is 4 and (tStateA["street"] is "river" or tStateA["phase"] is "runout") then
+            put "river" into tStreetTxt
+         end if
+      end if
+      if tStreetTxt is not empty then
+         heNetDealerBoard tStreetTxt
+      end if
+   end if
+   -- 7. the action display (wires do the state; this is only the prompt)
+   put gGame["state"] into tStateA
+   if tStateA["phase"] is "acting" then
+      if tStateA["toAct"] is tMySeat then
+         heUIPromptToAct
+      else
+         heDisableActions
+         heUISetStatus "Waiting for seat " & tStateA["toAct"] & " to act..."
+      end if
+   end if
+   -- 8. hand over: reveal our seed so everyone can audit (spec 7.1 step 5)
+   if (tStateA["phase"] is "showdown" or tStateA["phase"] is "handdone") \
+         and tPos > 0 and gGame["oDeal"]["revealSent"] is not "true" then
+      put "true" into gGame["oDeal"]["revealSent"]
+      heNetSendAction "seedReveal", "pos=" & tPos & ",seed=" & gGame["oDeal"]["mySeedHex"]
+   end if
+   -- 9. host: emit the settle once every seed is revealed; every client will
+   -- verify it against its own recomputation before folding it
+   if gGame["isHost"] is "true" and gGame["oDeal"]["revealN"] >= tCount \
+         and gGame["oDeal"]["settleSent"] is not "true" \
+         and (tStateA["phase"] is "showdown" or tStateA["phase"] is "handdone") then
+      put heNetComputeSettleTxt() into tDeltasTxt
+      if tDeltasTxt is not empty then
+         put "true" into gGame["oDeal"]["settleSent"]
+         heNetSendAction "settle", "deltas=" & tDeltasTxt
+      end if
+   end if
+   -- 10. co-sign the settlement receipt (spec 8.3, chained hand to hand)
+   if gGame["oDeal"]["settleDone"] is "true" and tPos > 0 \
+         and gGame["oDeal"]["receiptSent"] is not "true" then
+      put "true" into gGame["oDeal"]["receiptSent"]
+      put gGame["rcptHeadHex"] into tHeadHex
+      put heReceiptSigHex(tHeadHex, gGame["idSecData"]) into tSigHex
+      heNetSendAction "receipt", "head=" & tHeadHex & ",sig=" & tSigHex
+   end if
+   -- 11. our audit verdict (spec 7.1 step 5)
+   if gGame["oDeal"]["settleDone"] is "true" and tPos > 0 \
+         and gGame["oDeal"]["auditSent"] is not "true" then
+      put "true" into gGame["oDeal"]["auditSent"]
+      put heNetAuditHand() into tResultTxt
+      heNetSendAction "audit", "result=" & tResultTxt
+   end if
+   -- 12. host: the between-hands beat, then the next hand deals itself
+   if gGame["isHost"] is "true" and gGame["autoNext"] is "true" \
+         and gGame["oDeal"]["settleDone"] is "true" \
+         and gGame["oDeal"]["nextArmed"] is not "true" then
+      put "true" into gGame["oDeal"]["nextArmed"]
+      send "heNetNextHandTick" to me in hePaceMs("paceNext", kHeNextHandDelayMs) milliseconds
+   end if
+end heNetGameReact
+
+command heNetDealerDeal
+   -- we are this hand's dealer: open every sealed seed with our session key,
+   -- verify each against its commitment (a mismatch aborts the deal, named),
+   -- derive the committed deck, and send each seat its two hole cards sealed
+   -- to ITS session key (spec 7.1 steps 3-4)
+   local tPos, tCount, tSeedsA, tSealedHex, tSeedHex, tOpenErr, tBad
+   local tDealA, tOccList, tSeatNum, tHolePair, tPeerPubHex, tPeerBoxHex
+   local tSealErr, tSealedOut
+   set the itemDelimiter to comma
+   put gGame["oDeal"]["dealCount"] into tCount
+   put "false" into tBad
+   repeat with tPos = 1 to tCount
+      put gGame["oDeal"]["sealsBy"][tPos] into tSealedHex
+      put empty into tSeedHex
+      try
+         put textDecode(sxSealOpen(heHex2BinD(tSealedHex), gGame["boxPubData"], \
+               gGame["boxSecData"]), "utf-8") into tSeedHex
+      catch tOpenErr
+         put empty into tSeedHex
+      end try
+      if not heIsHex(tSeedHex, 64) \
+            or heSeedCommitHex(tSeedHex) is not gGame["oDeal"]["commitsBy"][tPos] then
+         put "AUDIT  seal at pos " & tPos & " bad or commit-mismatched -- deal aborted" & return after gGame["netLog"]
+         put "true" into tBad
+      end if
+      put tSeedHex into tSeedsA[tPos]
+   end repeat
+   if tBad is "true" then
+      heUISetStatus "Deal aborted: a sealed seed failed its commitment. See the net feed."
+      exit heNetDealerDeal
+   end if
+   put heNetDealFromSeeds(tSeedsA, tCount) into tDealA
+   put tDealA into gGame["oDeal"]["dealerDealA"]
+   put gGame["state"]["occ"] into tOccList
+   repeat for each item tSeatNum in tOccList
+      put tDealA["holesBy"][tSeatNum] into tHolePair
+      put gGame["pubBySeat"][tSeatNum] into tPeerPubHex
+      put gGame["boxByPub"][tPeerPubHex] into tPeerBoxHex
+      try
+         put heBin2HexS(sxSeal(textEncode(tHolePair, "utf-8"), heHex2BinD(tPeerBoxHex))) into tSealedOut
+         heNetSendAction "holeDeliver", "seat=" & tSeatNum & ",sealed=" & tSealedOut
+      catch tSealErr
+         put "ERROR  could not seal holes for seat " & tSeatNum & return after gGame["netLog"]
+      end try
+   end repeat
+end heNetDealerDeal
+
+function heNetDealFromSeeds pSeedsA, pCount
+   -- the committed keyed-stream deal (spec 7.1 step 3) from position-indexed
+   -- seed hex: XOR -> stream key -> deck -> assignment. Same code whether the
+   -- seeds came out of sealed boxes (dealer, at deal time) or public reveals
+   -- (every client, at audit/settle time) -- which is the point: one pinned
+   -- derivation, two moments.
+   local tXorHex, tKeyData, tDeckList
+   put heXorSeedsHex(pSeedsA, pCount) into tXorHex
+   put heStreamKeyData(heHex2BinD(gGame["tableIdHex"]), gGame["handNum"], tXorHex) into tKeyData
+   put heDeckFromStreamKey(tKeyData) into tDeckList
+   return heDealAssign(tDeckList, gGame["state"]["occ"], gGame["buttonSeat"])
+end heNetDealFromSeeds
+
+command heNetDealerBoard pStreetTxt
+   -- dealer: broadcast one street from the deck derived at deal time
+   local tDealA, tIdxList, tNamesTxt, tOneCard
+   set the itemDelimiter to comma
+   put gGame["oDeal"]["dealerDealA"] into tDealA
+   if tDealA is not an array then
+      exit heNetDealerBoard
+   end if
+   switch pStreetTxt
+      case "flop"
+         put tDealA["flopList"] into tIdxList
+         break
+      case "turn"
+         put tDealA["turnIx"] into tIdxList
+         break
+      case "river"
+         put tDealA["riverIx"] into tIdxList
+         break
+      default
+         exit heNetDealerBoard
+   end switch
+   put empty into tNamesTxt
+   repeat for each item tOneCard in tIdxList
+      put heCardName(tOneCard) & "|" after tNamesTxt
+   end repeat
+   if tNamesTxt is not empty then
+      delete char -1 of tNamesTxt
+   end if
+   heNetSendAction "board", "street=" & pStreetTxt & ",cards=" & tNamesTxt
+end heNetDealerBoard
+
+function heNetRevealedDealA
+   -- after every seed is revealed: re-derive the whole committed deal.
+   -- Empty until the reveals are complete.
+   local tCount, tPos, tSeedsA, tSeedHex
+   put gGame["oDeal"]["dealCount"] into tCount
+   if tCount is not a number or tCount is 0 then
+      return empty
+   end if
+   if gGame["oDeal"]["revealN"] < tCount then
+      return empty
+   end if
+   repeat with tPos = 1 to tCount
+      put gGame["oDeal"]["revealsBy"][tPos] into tSeedHex
+      put tSeedHex into tSeedsA[tPos]
+   end repeat
+   return heNetDealFromSeeds(tSeedsA, tCount)
+end heNetRevealedDealA
+
+function heNetComputeSettleTxt
+   -- the deterministic settlement every client computes for itself: showdown
+   -- ranks come from the REVEALED deck (a player cannot lie about its holes),
+   -- deltas from the same pure heSettleOf the hotseat uses. Standard
+   -- "seat:delta|..." format over the hand's occupied seats.
+   local tDealA, tStateA, tRanksA, tDeltasA, tInList, tSeatNum, tHolePair
+   local tSevenList, tOutTxt, tOccList
+   set the itemDelimiter to comma
+   put heNetRevealedDealA() into tDealA
+   if tDealA is not an array then
+      return empty
+   end if
+   put gGame["state"] into tStateA
+   put heBetInHandList(tStateA) into tInList
+   put empty into tRanksA
+   if heCountItems(tInList) > 1 then
+      repeat for each item tSeatNum in tInList
+         put tDealA["holesBy"][tSeatNum] into tHolePair
+         put tHolePair & comma & tDealA["flopList"] & comma & tDealA["turnIx"] \
+               & comma & tDealA["riverIx"] into tSevenList
+         put heEval7(tSevenList) into tRanksA[tSeatNum]
+      end repeat
+   end if
+   put heSettleOf(tStateA, tRanksA) into tDeltasA
+   put empty into tOutTxt
+   put tStateA["occ"] into tOccList
+   repeat for each item tSeatNum in tOccList
+      put tSeatNum & ":" & tDeltasA[tSeatNum] & "|" after tOutTxt
+   end repeat
+   if tOutTxt is not empty then
+      delete char -1 of tOutTxt
+   end if
+   return tOutTxt
+end heNetComputeSettleTxt
+
+command heNetApplySettle pDeltasTxt
+   -- fold the verified settle: move the stacks, advance the receipt chain
+   -- (spec 8.3: settleHash binds the deltas to the settle wire's own chain
+   -- head; the receipt head chains hand to hand), show the showdown, and
+   -- drop to the between-hands phase
+   local tPairTxt, tSeatNum, tDeltaAmt, tDeltasCSV, tSettleHash, tColonPos
+   set the itemDelimiter to "|"
+   put empty into tDeltasCSV
+   repeat for each item tPairTxt in pDeltasTxt
+      put offset(":", tPairTxt) into tColonPos
+      if tColonPos > 0 then
+         put char 1 to (tColonPos - 1) of tPairTxt into tSeatNum
+         put char (tColonPos + 1) to -1 of tPairTxt into tDeltaAmt
+         if tSeatNum is a number and tDeltaAmt is a number then
+            add tDeltaAmt to gGame["stacksBy"][tSeatNum]
+         end if
+         put tSeatNum & ":" & tDeltaAmt & comma after tDeltasCSV
+      end if
+   end repeat
+   set the itemDelimiter to comma
+   if tDeltasCSV is not empty then
+      delete char -1 of tDeltasCSV
+   end if
+   put heSettleHashHex(tDeltasCSV, heHex2BinD(gGame["chainHeadHex"])) into tSettleHash
+   put heReceiptHeadHex(tSettleHash, gGame["rcptHeadHex"]) into gGame["rcptHeadHex"]
+   put "true" into gGame["oDeal"]["settleDone"]
+   put "between" into gGame["phase"]
+   heNetShowdownShow
+   heUISetStatus "Hand " & gGame["handNum"] & " settled: " & pDeltasTxt
+   heHudMark
+end heNetApplySettle
+
+function heNetAuditHand
+   -- our per-client audit verdict (spec 7.1 step 5): re-derive the committed
+   -- deal from the reveals and check it against what we WITNESSED -- the
+   -- commitments, the wired board, and OUR OWN delivered holes. (Another
+   -- seat's sealed delivery can only be checked by that seat; its own audit
+   -- covers it.)
+   local tDealA, tMySeat, tMyHoles, tBoardTxt, tCommitsA, tSeedsA, tPos, tCount
+   local tBoardN
+   set the itemDelimiter to comma
+   put heNetRevealedDealA() into tDealA
+   if tDealA is not an array then
+      return "fail:reveals-incomplete"
+   end if
+   put heNetMySeat() into tMySeat
+   put gGame["oDeal"]["myHoles"] into tMyHoles
+   if tMySeat > 0 and tMyHoles is not empty then
+      put tMyHoles into tDealA["holesBy"][tMySeat]
+   end if
+   put gGame["oDeal"]["boardList"] into tBoardTxt
+   put the number of items of tBoardTxt into tBoardN
+   if tBoardN >= 3 then
+      put item 1 to 3 of tBoardTxt into tDealA["flopList"]
+   end if
+   if tBoardN >= 4 then
+      put item 4 of tBoardTxt into tDealA["turnIx"]
+   end if
+   if tBoardN >= 5 then
+      put item 5 of tBoardTxt into tDealA["riverIx"]
+   end if
+   put gGame["oDeal"]["dealCount"] into tCount
+   repeat with tPos = 1 to tCount
+      put gGame["oDeal"]["commitsBy"][tPos] into tCommitsA[tPos]
+      put gGame["oDeal"]["revealsBy"][tPos] into tSeedsA[tPos]
+   end repeat
+   return heAuditDeal(heHex2BinD(gGame["tableIdHex"]), gGame["handNum"], tSeedsA, \
+         tCommitsA, tCount, tDealA, gGame["state"]["occ"], gGame["buttonSeat"])
+end heNetAuditHand
+
+command heNetShowBoard
+   -- render the wired board through the hotseat board display path
+   local tBoardTxt, tBoardN
+   set the itemDelimiter to comma
+   put gGame["oDeal"]["boardList"] into tBoardTxt
+   put the number of items of tBoardTxt into tBoardN
+   if tBoardN >= 3 then
+      heUIShowBoardStreet "flop", (item 1 to 3 of tBoardTxt)
+   end if
+   if tBoardN >= 4 then
+      heUIShowBoardStreet "turn", (item 4 of tBoardTxt)
+   end if
+   if tBoardN >= 5 then
+      heUIShowBoardStreet "river", (item 5 of tBoardTxt)
+   end if
+end heNetShowBoard
+
+command heNetShowdownShow
+   -- at settle time every hole is derivable from the reveals: show the
+   -- contested seats' cards and our own, through the hotseat display path
+   local tDealA, tStateA, tInList, tSeatNum, tHolePair, tMySeat, tMyHoles
+   set the itemDelimiter to comma
+   put heNetRevealedDealA() into tDealA
+   if tDealA is not an array then
+      exit heNetShowdownShow
+   end if
+   put gGame["state"] into tStateA
+   put heBetInHandList(tStateA) into tInList
+   if heCountItems(tInList) > 1 then
+      repeat for each item tSeatNum in tInList
+         put tDealA["holesBy"][tSeatNum] into tHolePair
+         heUIShowHole tSeatNum, tHolePair
+      end repeat
+   else
+      put heNetMySeat() into tMySeat
+      put gGame["oDeal"]["myHoles"] into tMyHoles
+      if tMySeat > 0 and tMyHoles is not empty then
+         heUIShowHole tMySeat, tMyHoles
+      end if
+   end if
+end heNetShowdownShow
 
 --------------------------------------------------------------------------
 -- small pure utilities
@@ -3438,6 +4456,7 @@ command heTableNew
    put gCfg["sb"] into gGame["sb"]
    put gCfg["bb"] into gGame["bb"]
    put gCfg["ante"] into gGame["ante"]
+   put gCfg["startStack"] into gGame["startStack"]
    put gCfg["numSeats"] into gGame["numSeats"]
    put gCfg["levelMode"] into gGame["levelMode"]
    put gCfg["levels"] into gGame["levels"]
@@ -4324,6 +5343,11 @@ command heBuildLobby
    create button "heBtnLeave"
    set the rect of button "heBtnLeave" to "232,516,472,548"
    set the label of button "heBtnLeave" to "Leave (play hotseat)"
+   -- host-only: seats everyone who has joined and deals hand 1 (Phase 2d);
+   -- heLobbyRefresh keeps it enabled only for a host with 2+ joined players
+   create button "heBtnStartGame"
+   set the rect of button "heBtnStartGame" to "492,516,732,548"
+   set the label of button "heBtnStartGame" to "Start Game"
 
    heLobbyHide
 end heBuildLobby
@@ -4348,7 +5372,7 @@ command heLobbySetVisible pOn
    end if
    put "heLobbyTitle,heJoinLabel,heJoinCode,heLobbyId,heLobbyTable," \
          & "heRosterHdr,heNetHdr,heLobbyRoster,heLobbyNet" into tFields
-   put "heBtnCreate,heBtnJoin,heBtnCopyCode,heBtnLeave" into tButtons
+   put "heBtnCreate,heBtnJoin,heBtnCopyCode,heBtnLeave,heBtnStartGame" into tButtons
    set the itemDelimiter to comma
    repeat for each item tNm in tFields
       if there is a field tNm then
@@ -4738,6 +5762,10 @@ command heLobbyRefresh
       put tNetAll into tNet
    end if
    set the text of field "heLobbyNet" to tNet
+   -- Start Game is the host's verb, once the table is live and the game is
+   -- not already running (joined-player count is checked on the click)
+   heEnableBtn "heBtnStartGame", (gGame["online"] is "true" \
+         and gGame["isHost"] is "true" and gGame["gameOn"] is not "true")
 end heLobbyRefresh
 
 command heBuildHistory
@@ -5659,6 +6687,9 @@ on mouseUp
             heUISetStatus "Invite code copied to the clipboard."
          end if
          exit mouseUp
+      case "heBtnStartGame"
+         heNetStartGame
+         exit mouseUp
       case "heBtnLeave"
          heNetStop
          -- returning to hotseat: if the transcript was clobbered by an online
@@ -5758,6 +6789,37 @@ on mouseUp
    -- non-integers (act-bad-amount) as the Phase 2 wire backstop; this trunc
    -- keeps the local UX forgiving instead of surfacing a rejection.
    put trunc(tAmt) into tAmt
+   -- ONLINE: an action is a signed wire, not a local engine call -- our own
+   -- relayed wire folding back is what moves the state (spec 4: the game is a
+   -- fold over the transcript). Only the seat to act may emit; the engine
+   -- would reject anyone else's wire anyway.
+   if gGame["online"] is "true" then
+      if tSeatNum is not heNetMySeat() then
+         exit mouseUp
+      end if
+      switch tWho
+         case "heBtnFold"
+            heNetSendAction "act", "verb=fold,amount=0"
+            break
+         case "heBtnCheck"
+            heNetSendAction "act", "verb=check,amount=0"
+            break
+         case "heBtnCall"
+            heNetSendAction "act", "verb=call,amount=" & heCallAmountFor(tSeatNum)
+            break
+         case "heBtnBet"
+            heNetSendAction "act", "verb=bet,amount=" & tAmt
+            break
+         case "heBtnRaise"
+            heNetSendAction "act", "verb=raise,amount=" & tAmt
+            break
+         case "heBtnAllin"
+            heNetSendAction "act", "verb=allin,amount=" & \
+                  (gGame["state"]["streetBy"][tSeatNum] + gGame["state"]["stackBy"][tSeatNum])
+            break
+      end switch
+      exit mouseUp
+   end if
    switch tWho
       case "heBtnFold"
          heActionDo tSeatNum, "fold", 0
@@ -5853,6 +6915,12 @@ command heUIPromptToAct
    end if
    put gGame["state"]["toAct"] into tSeatNum
    if tSeatNum is 0 then
+      exit heUIPromptToAct
+   end if
+   -- online, the prompt is only ever OURS: another seat's turn shows as
+   -- waiting (heNetGameReact disables the buttons and says who is up)
+   if gGame["online"] is "true" and tSeatNum is not heNetMySeat() then
+      heDisableActions
       exit heUIPromptToAct
    end if
    put heBetLegal(gGame["state"], tSeatNum) into tLegalTxt
@@ -6343,6 +7411,9 @@ end b2kSpriteOnFinish
 --------------------------------------------------------------------------
 
 local gRpt, gPassN, gFailN, gSkipN
+-- the netplay loopback's two live gGame contexts (host / player), shuttled by
+-- heTNetPump; emptied when the section ends so nothing big lingers
+local gTNetHostG, gTNetPlayG
 
 constant kKatSeed1Deck = "8h,4d,6s,Qd,2c,2d,6d,7d,Ad,Jd,8d,5c,5d,Ts,Tc,7c,8c,Ac,3c,Js,6c,Ah,9d,Jh,2h,As,9s,Kc,8s,4c,Qc,5h,Th,7s,2s,Kh,5s,Qh,9c,4s,Jc,3d,Kd,9h,3s,Qs,3h,Td,Ks,7h,6h,4h"
 
@@ -6382,9 +7453,9 @@ constant kKatChainHead6 = "62fcd52b3757f590c33bede7330620853074c1e5c153549244a8d
 constant kKatSettleHash = "68095dcf5a74fac1e1340a1073a466dcf117024257f5c265de21698257b34b6f"
 constant kKatAdmitSig = "17cf45eeecf27a3e9b63e1e0ff47ae1ea337430cb135fb499944a60681fcd1e949a7a88f532b2f888c0ea32364e93e9aa2f569419f27e8034b695a4ee94d5e0b"
 constant kKatIdPub2 = "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10"
-constant kKatLobbyCfgBody = "v=1,level=0,sb=1,bb=2,seats=6,button=1"
+constant kKatLobbyCfgBody = "v=1,level=0,sb=1,bb=2,ante=0,stack=400,seats=6,button=1"
 constant kKatRosterBody = "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10:player,b6ef1a19d789c27bea3f6c127db635929541f34907750ee12d0b715c010c7566:host"
-constant kKatLobbyHead2 = "54c4df80d160eaaef52536a8ff6f2a7e09caccc629e1c467fe382eedc8a23509"
+constant kKatLobbyHead2 = "974bbb46cf5c62eabc9d3930446b7748f38139d10b0ed1c0cb37f155b4d1a3e9"
 constant kKatCkptSig = "08c7f29409998d642657b9a084802b7ca3a136d696e881b545ed4e5a750fdb6d14e4967f401977aca416f03c0d4f03f98b3acc53e61266f3d8cee9912639e20f"
 constant kKatSettleHash2 = "5e716ce9022f4c47d99e081b52be3a8bb5f9f1f56d3def18577c2f7ac9de8df5"
 constant kKatRcptHead1 = "53ed9ccc64863dc05c1b76cd7953e19bba73895b8dd22ea00e6c9ff40f423cef"
@@ -6417,6 +7488,7 @@ command heRunSelftest
    heRunSection "heTestDealOrderRun"
    heRunSection "heTestLobbyRun"
    heRunSection "heTestNetSim"
+   heRunSection "heTestNetPlay"
    heRunSection "heProbeSodium"
    put return & "==== " & gPassN & " pass, " & gFailN & " fail, " & gSkipN & " skip ====" \
          & return after gRpt
@@ -6847,6 +7919,240 @@ command heTestNetSim
 
    put tSaved into gGame
 end heTestNetSim
+
+command heTNetDeliver pPayloadTxt
+   -- netplay loopback: deliver one captured rp1 payload into the CURRENT
+   -- gGame context, exactly as heNetOnMessage routes it ("c" -> host relay,
+   -- "w" -> ingest; "s?" cannot occur in this ordered exchange)
+   local tKind, tRest, tSaved
+   put the itemDelimiter into tSaved
+   set the itemDelimiter to tab
+   put item 1 of pPayloadTxt into tKind
+   put item 2 to -1 of pPayloadTxt into tRest
+   set the itemDelimiter to tSaved
+   if tKind is "c" then
+      if gGame["isHost"] is "true" then
+         heHostRelay 0, tRest
+      end if
+   else if tKind is "w" then
+      heNetIngestWire tRest
+   end if
+end heTNetDeliver
+
+command heTNetPump
+   -- shuttle captured payloads between the two contexts until both go quiet.
+   -- Player outbox carries "c" frames to the host; host outbox carries "w"
+   -- broadcasts to the player (the host self-ingested its own already).
+   local tRound, tQuiet, tCarry, tLine
+   repeat with tRound = 1 to 400
+      put "true" into tQuiet
+      put gTNetPlayG["netOutbox"] into tCarry
+      put empty into gTNetPlayG["netOutbox"]
+      if tCarry is not empty then
+         put "false" into tQuiet
+         put gTNetHostG into gGame
+         repeat for each line tLine in tCarry
+            if tLine is not empty then
+               heTNetDeliver tLine
+            end if
+         end repeat
+         put gGame into gTNetHostG
+      end if
+      put gTNetHostG["netOutbox"] into tCarry
+      put empty into gTNetHostG["netOutbox"]
+      if tCarry is not empty then
+         put "false" into tQuiet
+         put gTNetPlayG into gGame
+         repeat for each line tLine in tCarry
+            if tLine is not empty then
+               heTNetDeliver tLine
+            end if
+         end repeat
+         put gGame into gTNetPlayG
+      end if
+      if tQuiet is "true" then
+         exit repeat
+      end if
+   end repeat
+end heTNetPump
+
+command heTNetAct pSeatNum, pBodyTxt
+   -- emit an act from whichever context owns the seat, then pump to quiet
+   local tMySeat
+   put gTNetPlayG into gGame
+   put heNetMySeat() into tMySeat
+   if tMySeat is pSeatNum then
+      heNetSendAction "act", pBodyTxt
+      put gGame into gTNetPlayG
+   else
+      put gGame into gTNetPlayG
+      put gTNetHostG into gGame
+      heNetSendAction "act", pBodyTxt
+      put gGame into gTNetHostG
+   end if
+   heTNetPump
+end heTNetAct
+
+command heTNetPlayCtx pIsHost, pPubHex, pSecData, pBoxPub, pBoxSec, pHostPubHex
+   -- one netplay context: the online keys + game store a create/join builds,
+   -- with the capture seam on and the host's between-hands timer off
+   put empty into gGame
+   put "true" into gGame["online"]
+   put pIsHost into gGame["isHost"]
+   put pPubHex into gGame["idPubHex"]
+   put pSecData into gGame["idSecData"]
+   put pBoxPub into gGame["boxPubData"]
+   put pBoxSec into gGame["boxSecData"]
+   put pHostPubHex into gGame["hostPubHex"]
+   put kKatTableHex into gGame["tableIdHex"]
+   put 1 into gGame["sb"]
+   put 2 into gGame["bb"]
+   put 0 into gGame["ante"]
+   put 400 into gGame["startStack"]
+   put 0 into gGame["handNum"]
+   put 0 into gGame["seqCounter"]
+   put 0 into gGame["syncCooldown"]
+   put kHeGenesisPrev into gGame["chainHeadHex"]
+   put 0 into gGame["lastSeq"]
+   put empty into gGame["wireBuf"]
+   put 0 into gGame["wireBufN"]
+   heNetGameInit
+   put "false" into gGame["autoNext"]
+   put "true" into gGame["netCap"]
+   put empty into gGame["netOutbox"]
+   put "idle" into gGame["phase"]
+end heTNetPlayCtx
+
+command heTestNetPlay
+   -- a FULL online Level 0 hand, twice, on one machine: host + player contexts
+   -- driving the REAL handlers end to end -- cfg/roster, join (session box
+   -- binding), sit, handStart/dealLevel, seedCommit -> seedSeal -> sealed
+   -- holeDeliver (real sxSeal roundtrips), blinds, betting, dealer board
+   -- wires, seed reveals, the verified settle, receipt co-signatures, and
+   -- per-client audits. Hand 1 is a scripted fold-win (deterministic deltas
+   -- whatever the deck); hand 2 checks down to a showdown (the deck is real
+   -- entropy, so the asserts there are invariants: conservation, agreement,
+   -- clean audits). SKIPs without SodiumXT or without its box surface.
+   local tSaved, tHostPub, tHostSec, tPlayPub, tPlaySec, tHostPubHex, tPlayPubHex
+   local tHostBoxPub, tHostBoxSec, tPlayBoxPub, tPlayBoxSec, tBoxErr
+   local tStateA, tSbSeat, tBbSeat, tStep, tSeat, tOwe, tBoardTxt, tRcptHand1
+   put return & "-- 15. Online Level 0 hand, end to end (single-machine loopback)" & return after gRpt
+   if not heHasSodium() then
+      heTSkip "netplay: online hand", "SodiumXT not installed"
+      exit heTestNetPlay
+   end if
+   set the itemDelimiter to comma
+   put gGame into tSaved
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed1), tHostPub, tHostSec
+   sxSignKeypairFromSeed heHex2BinD(kKatIdSeed2), tPlayPub, tPlaySec
+   put heBin2HexS(tHostPub) into tHostPubHex
+   put heBin2HexS(tPlayPub) into tPlayPubHex
+   try
+      sxBoxKeypairFromSeed heHash32(textEncode(kHeDomainSess & kKatIdSeed1, "utf-8")), \
+            tHostBoxPub, tHostBoxSec
+      sxBoxKeypairFromSeed heHash32(textEncode(kHeDomainSess & kKatIdSeed2, "utf-8")), \
+            tPlayBoxPub, tPlayBoxSec
+      get sxSeal(textEncode("probe", "utf-8"), tHostBoxPub)
+   catch tBoxErr
+      put tSaved into gGame
+      heTSkip "netplay: online hand", "SodiumXT box surface not available"
+      exit heTestNetPlay
+   end try
+
+   -- host context opens the table: signed cfg + roster, then its own join
+   heTNetPlayCtx "true", tHostPubHex, tHostSec, tHostBoxPub, tHostBoxSec, tHostPubHex
+   put "true" into gGame["admittedA"][tHostPubHex]
+   put "true" into gGame["admittedA"][tPlayPubHex]
+   put "host" into gGame["roleByPub"][tHostPubHex]
+   put "player" into gGame["roleByPub"][tPlayPubHex]
+   heNetSendAction "cfg", heLobbyCfgBody()
+   heHostEmitRoster
+   put gGame into gTNetHostG
+   heTNetPlayCtx "false", tPlayPubHex, tPlaySec, tPlayBoxPub, tPlayBoxSec, tHostPubHex
+   put gGame into gTNetPlayG
+   heTNetPump
+   heTAssert "netplay: both session box keys bound on-chain (host view)", \
+         the number of lines of the keys of gTNetHostG["boxByPub"], 2
+   heTAssert "netplay: both session box keys bound on-chain (player view)", \
+         the number of lines of the keys of gTNetPlayG["boxByPub"], 2
+
+   -- the host starts the game: sit wires + hand 1; the deal and the blinds
+   -- then run themselves through the react engine on both sides
+   put gTNetHostG into gGame
+   heNetStartGame
+   put gGame into gTNetHostG
+   heTNetPump
+   put gTNetPlayG["state"] into tStateA
+   heTAssert "netplay: hand 1 dealt itself to the action (phase acting)", tStateA["phase"], "acting"
+   heTAssert "netplay: both sides at the same chain head", \
+         gTNetPlayG["chainHeadHex"], gTNetHostG["chainHeadHex"]
+   heTAssert "netplay: the player's sealed holes opened", \
+         (gTNetPlayG["oDeal"]["myHoles"] is not empty), "true"
+   heTAssert "netplay: the host's sealed holes opened", \
+         (gTNetHostG["oDeal"]["myHoles"] is not empty), "true"
+   put tStateA["sbSeat"] into tSbSeat
+   put tStateA["bbSeat"] into tBbSeat
+   heTAssert "netplay: heads-up preflop action is on the button/SB", tStateA["toAct"], tSbSeat
+
+   -- hand 1: the SB folds -> deterministic deltas (SB -1, BB +1) no matter
+   -- what the committed deck was; then reveals/settle/receipts/audits flow
+   heTNetAct tSbSeat, "verb=fold,amount=0"
+   heTAssert "netplay: hand 1 settled on both sides", \
+         gTNetPlayG["oDeal"]["settleDone"] & "/" & gTNetHostG["oDeal"]["settleDone"], "true/true"
+   heTAssert "netplay: the folder paid its blind", gTNetPlayG["stacksBy"][tSbSeat], 399
+   heTAssert "netplay: the winner collected it", gTNetPlayG["stacksBy"][tBbSeat], 401
+   heTAssert "netplay: stacks agree across the wire", \
+         gTNetPlayG["stacksBy"][tSbSeat] & "/" & gTNetPlayG["stacksBy"][tBbSeat], \
+         gTNetHostG["stacksBy"][tSbSeat] & "/" & gTNetHostG["stacksBy"][tBbSeat]
+   heTAssert "netplay: receipt heads agree and left genesis", \
+         (gTNetPlayG["rcptHeadHex"] is gTNetHostG["rcptHeadHex"] \
+         and gTNetPlayG["rcptHeadHex"] is not kHeGenesisPrev), "true"
+   heTContains "netplay: the receipt is co-signed by both seats", \
+         gTNetPlayG["netLog"], "receipt co-signed by all 2"
+   heTContains "netplay: seat 1 audits the deal clean", gTNetPlayG["netLog"], "audit  seat 1: pass"
+   heTContains "netplay: seat 2 audits the deal clean", gTNetPlayG["netLog"], "audit  seat 2: pass"
+   put gTNetPlayG["rcptHeadHex"] into tRcptHand1
+
+   -- hand 2: kicked by the host (the sim keeps autoNext off), checked down to
+   -- a showdown -- real entropy decides the winner, so the asserts are the
+   -- invariants: five board cards on the wire, chip conservation, agreement,
+   -- a fresh receipt link, clean audits
+   put gTNetHostG into gGame
+   heNetHandKick
+   put gGame into gTNetHostG
+   heTNetPump
+   repeat with tStep = 1 to 20
+      put gTNetPlayG["state"] into tStateA
+      if tStateA["phase"] is not "acting" then
+         exit repeat
+      end if
+      put tStateA["toAct"] into tSeat
+      put tStateA["betCur"] - tStateA["streetBy"][tSeat] into tOwe
+      if tOwe > 0 then
+         heTNetAct tSeat, "verb=call,amount=" & min(tOwe, tStateA["stackBy"][tSeat])
+      else
+         heTNetAct tSeat, "verb=check,amount=0"
+      end if
+   end repeat
+   heTAssert "netplay: hand 2 settled on both sides", \
+         gTNetPlayG["oDeal"]["settleDone"] & "/" & gTNetHostG["oDeal"]["settleDone"], "true/true"
+   put gTNetPlayG["oDeal"]["boardList"] into tBoardTxt
+   heTAssert "netplay: the dealer wired all five board cards", the number of items of tBoardTxt, 5
+   heTAssert "netplay: chips conserved through the showdown", \
+         gTNetPlayG["stacksBy"][1] + gTNetPlayG["stacksBy"][2], 800
+   heTAssert "netplay: hand 2 stacks agree across the wire", \
+         gTNetPlayG["stacksBy"][1] & "/" & gTNetPlayG["stacksBy"][2], \
+         gTNetHostG["stacksBy"][1] & "/" & gTNetHostG["stacksBy"][2]
+   heTAssert "netplay: the receipt chain advanced hand to hand", \
+         (gTNetPlayG["rcptHeadHex"] is not tRcptHand1 \
+         and gTNetPlayG["rcptHeadHex"] is gTNetHostG["rcptHeadHex"]), "true"
+   heTAssert "netplay: both sides end at the same chain head", \
+         gTNetPlayG["chainHeadHex"], gTNetHostG["chainHeadHex"]
+
+   put empty into gTNetHostG
+   put empty into gTNetPlayG
+   put tSaved into gGame
+end heTestNetPlay
 
 command heTestCryptoRun
    -- on-engine mirror of tools/protocol-kat.py (spec 6 + 7.1 crypto). SKIPs

@@ -162,10 +162,31 @@ Rules, each closing a specific hole:
   later dispute the rules they signed.
 
 Message vocabulary (body schemas fixed at implementation time, names fixed here):
-`cfg join leave sit stand shuffleStep unmaskStep seedCommit seedReveal holeDeliver
-board bid[SB/BB] act(fold|check|call|bet|raise|allin) ckpt show muck settle audit
-chat`. (`board` was added as-built: the L0/L1 street broadcast needed its own type,
-and at every level the board record is what makes transcript replay self-contained.)
+`cfg join leave sit stand shuffleStep unmaskStep seedCommit seedSeal seedReveal
+holeDeliver board bid[SB/BB/Ante] act(fold|check|call|bet|raise|allin) ckpt show muck
+settle receipt audit chat`. (`board` was added as-built: the L0/L1 street broadcast
+needed its own type, and at every level the board record is what makes transcript
+replay self-contained. `seedSeal` was added as-built: spec 7.1 step 2 sends each seed
+to the dealer in a sealed box, and carrying that ciphertext ON the chain -- body
+`pos=<seat>,sealed=<hex>` -- keeps the transcript self-contained and replayable
+instead of routing the seed through an out-of-band lane. `receipt` was added as-built:
+the 8.3 settlement co-signature needed its own type -- body `head=<hex>,sig=<hex>` --
+rather than overloading `ckpt`.)
+
+As-built body schemas for the online (M1) game wires: `join` carries the sender's
+per-table session box pub (`box=<64hex>`) -- the contentLine signature IS the spec 5
+session-key binding (long-term key over table + box pub). `sit` is host-authored seat
+assignment, one wire per seated player (`seat=N,pub=<64hex>`), emitted at game start.
+`handStart` (host) carries `seats=1|2|..,button=B`; stacks are whatever the folded
+stream says they are. `dealLevel` (host) carries `level=0,dealer=<seat>,count=N` --
+the dealer is the button seat's player (the L0 rotation). `seedCommit`/`seedSeal`/
+`seedReveal` carry `pos=<seat>` plus their payload and must come from the seat's own
+key. `holeDeliver` (dealer) carries `seat=N,sealed=<hex>` -- the two card names sealed
+to seat N's session box pub. `board` (dealer) carries `street=..,cards=a|b|c`.
+`settle` (host) carries the standard deltas body; every client verifies it against its
+own `heSettleOf` recomputation before folding it. Showdown ranks online are derived
+from the REVEALED seeds (re-derive deck -> holes -> ranks), never from player claims,
+so `show`/`muck` remain display-only niceties (deferred with liveness, 2e).
 
 ## 7. The deal protocol ladder
 

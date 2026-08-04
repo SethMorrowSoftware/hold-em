@@ -117,7 +117,16 @@ The netcode spike. Everything here is turn-rate — rp1's ~1 s tick is the budge
   from fixed seeds — headless, in CI.
 - **2d. Online Level 0 deal + receipts** (spec 7.1, 8.3): sealed-box hole delivery,
   end-of-hand seed reveal audit, countersigned settlement receipts chained hand to
-  hand.
+  hand. **Status: written (v0.17.0), netsim-pinned on one machine; needs the
+  multi-machine OXT pass.** As-built shape: `join` wires bind each player's session
+  box pub on-chain; host `sit` wires assign seats; the dealer is the button seat;
+  seeds travel as on-chain `seedSeal` ciphertexts; showdown ranks are re-derived
+  from the revealed seeds (players cannot lie about holes); the host's `settle` is
+  verified by every client before folding; `receipt` wires carry the 8.3
+  co-signatures. Street `ckpt` wires and `show`/`muck` are deferred to 2e alongside
+  liveness (they exist for reconnect windows and display choice, not correctness).
+  Online History folding (translating the wire log for the History panel) is also
+  deferred -- the live audit verdicts land in the net feed.
 - **2e. Liveness** (spec 9): act timers + time-bank, sit-out, reconnect via
   transcript replay from last checkpoint, host election.
 - **2f. Onion tables** (spec 10): the same envelopes over OnionXT streams — expected

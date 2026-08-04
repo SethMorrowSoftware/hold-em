@@ -434,7 +434,9 @@ def compute_all():
     # advance -- so heTestLobbyRun can machine-check it with no network.
     lobby_members = [(out["id_pubs"][0], "host"), (out["id_pubs"][1], "player")]
     out["roster_body"] = roster_body(lobby_members)
-    out["lobby_cfg_body"] = "v=1,level=0,sb=1,bb=2,seats=6,button=1"
+    # ante + stack joined the body in v0.17.0 (the online game folds its full
+    # stakes from the signed cfg); heLobbyCfgBody mirrors this string exactly
+    out["lobby_cfg_body"] = "v=1,level=0,sb=1,bb=2,ante=0,stack=400,seats=6,button=1"
     lw1 = make_wire(1, TABLE, 0, ID_SEEDS[0], "cfg", out["lobby_cfg_body"],
                     1, GENESIS, HOST_SEED)
     lh1 = chain_next(lw1)
@@ -494,8 +496,8 @@ PINNED = {
   "833fed8ee30a882bd877555a9df260d4322224fa095513d84972a660e7ad6b10",
   "ad1d6dbbd062cdacf356daf0834471b6246105b17e3b988dd5e7f0db45fb66a6"
  ],
- "lobby_cfg_body": "v=1,level=0,sb=1,bb=2,seats=6,button=1",
- "lobby_head2": "54c4df80d160eaaef52536a8ff6f2a7e09caccc629e1c467fe382eedc8a23509",
+ "lobby_cfg_body": "v=1,level=0,sb=1,bb=2,ante=0,stack=400,seats=6,button=1",
+ "lobby_head2": "974bbb46cf5c62eabc9d3930446b7748f38139d10b0ed1c0cb37f155b4d1a3e9",
  "receipt_head1": "53ed9ccc64863dc05c1b76cd7953e19bba73895b8dd22ea00e6c9ff40f423cef",
  "receipt_head2": "0284af24c750eaaaa5a521b87d8f1ab6ce00b0b2be074ce03d24884e004fc910",
  "receipt_sigs": [
