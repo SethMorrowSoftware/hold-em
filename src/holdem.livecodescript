@@ -22,6 +22,18 @@ kHeHarnessV 32 -> 33.
     transcript already holds (per-seat presence), and board wires dedupe by
     street-vs-count on fold -- a redelivered or reconnect-burst flop can no
     longer append twice and shift every later board slot.
+  * CATCH-UP SUPPRESSION (the Codex review find on PR #39): react used to
+    fire after EVERY replayed wire, against chain states that predate the
+    client's own historical messages -- the presence guards saw an
+    incomplete transcript and re-emitted join/commit/seal/reveal for every
+    hand replayed, and the host sequenced all of it onto the live chain.
+    heNetReplayLogTo now PREFIXES the replay with an unsigned "r!" control
+    frame carrying the head seq (same transport class as "s?", honored only
+    from the host's live handle so a stranger cannot suppress a victim);
+    the client stays silent until its applied seq reaches the mark, then
+    reacts ONCE against the complete transcript. A lost marker degrades to
+    the old noisy behavior -- it can never wedge. The sim asserts the
+    replay adds ZERO wires to the chain.
   * THE NETPLAY SIM NOW CRASHES AND RECONNECTS THE PLAYER MID-HAND: its
     context is rebuilt from nothing but its keys + identity seed, the host
     replays the whole signed transcript (heNetReplayLogTo, now behind the
@@ -1871,6 +1883,19 @@ command heNetOnMessage pPeer, pPayloadData
       case "w"
          heNetIngestWire tRest
          break
+      case "r!"
+         -- the host announces a catch-up replay up to head seq (the frame's
+         -- payload, already split off as tRest): suspend react emissions
+         -- until our applied seq reaches it (see heNetReplayLogTo). Honored
+         -- only from the HOST's live handle -- an unsigned control frame from
+         -- anyone else could otherwise suppress a victim's emissions
+         -- indefinitely (transport DoS).
+         put gGame["hostPubHex"] into tPeerPub
+         if pPeer is gGame["peerByPub"][tPeerPub] and tRest is a number then
+            put tRest into gGame["catchUpTo"]
+            put "catch  replay to seq " & tRest & " announced" & return after gGame["netLog"]
+         end if
+         break
       case "s?"
          -- a peer asks us (the host) to replay the transcript so it can catch
          -- up from a chain gap (spec 9). Only honor it from an admitted,
@@ -2213,7 +2238,20 @@ command heNetReplayLogTo pPeer
    -- spec 9 reconnect seam: replay the whole signed wire log to a freshly
    -- handshaked peer, in order, so it advances its chain from genesis and
    -- catches up. Turn-rate, not frame-rate; a lobby log is a few lines.
+   -- The replay is PREFIXED with an "r!" catch-up marker carrying our head
+   -- seq: the client suspends its react emissions until its applied seq
+   -- reaches the mark, THEN reacts once against the complete transcript --
+   -- without this, react fired after every replayed wire against a chain
+   -- state that predates the client's own historical messages, re-emitting
+   -- join/commit/seal/reveal for every hand replayed and polluting the live
+   -- chain with host-sequenced duplicates (Codex review on PR #39). A lost
+   -- marker degrades to the old noisy behavior; it can never wedge.
    local tWireLine, tLog
+   if gGame["netCap"] is "true" then
+      put "r!" & tab & gGame["lastSeq"] & return after gGame["netOutbox"]
+   else
+      get btRp1Send(gGame["session"], pPeer, textEncode("r!" & tab & gGame["lastSeq"], "utf-8"))
+   end if
    put gGame["log"] into tLog
    repeat for each line tWireLine in tLog
       if tWireLine is not empty then
@@ -2279,6 +2317,7 @@ command heNetGameInit
    put "false" into gGame["joinSent"]
    put "false" into gGame["gameOn"]
    put "true" into gGame["autoNext"]
+   put empty into gGame["catchUpTo"]
    put kHeGenesisPrev into gGame["rcptHeadHex"]
    put empty into gGame["oDeal"]
 end heNetGameInit
@@ -2796,6 +2835,18 @@ command heNetGameReact
    local tMyPubHex
    if gGame["online"] is not "true" then
       exit heNetGameReact
+   end if
+   -- CATCH-UP SUPPRESSION: while a host replay is streaming (announced by the
+   -- "r!" marker), every mid-replay state is HISTORICAL -- reacting to it
+   -- would re-emit join/commit/seal/reveal for every hand replayed and
+   -- pollute the live chain with sequenced duplicates. Stay silent until our
+   -- applied seq reaches the announced head, then react once against the
+   -- complete transcript, where the presence guards see the whole truth.
+   if gGame["catchUpTo"] is a number then
+      if gGame["lastSeq"] < gGame["catchUpTo"] then
+         exit heNetGameReact
+      end if
+      put empty into gGame["catchUpTo"]
    end if
    -- 1. bind our session box key once the roster lists us (spec 5): the signed
    -- contentLine over table + from + box IS the binding tuple. Presence-guarded
@@ -8103,21 +8154,10 @@ end heTestNetSim
 
 command heTNetDeliver pPayloadTxt
    -- netplay loopback: deliver one captured rp1 payload into the CURRENT
-   -- gGame context, exactly as heNetOnMessage routes it ("c" -> host relay,
-   -- "w" -> ingest; "s?" cannot occur in this ordered exchange)
-   local tKind, tRest, tSaved
-   put the itemDelimiter into tSaved
-   set the itemDelimiter to tab
-   put item 1 of pPayloadTxt into tKind
-   put item 2 to -1 of pPayloadTxt into tRest
-   set the itemDelimiter to tSaved
-   if tKind is "c" then
-      if gGame["isHost"] is "true" then
-         heHostRelay 0, tRest
-      end if
-   else if tKind is "w" then
-      heNetIngestWire tRest
-   end if
+   -- gGame context through the REAL message router, so control frames (the
+   -- "r!" catch-up marker above all) take exactly the production path. Peer
+   -- handle 0 is the loopback's stand-in for the counterparty's live handle.
+   heNetOnMessage 0, textEncode(pPayloadTxt, "utf-8")
 end heTNetDeliver
 
 command heTNetPump
@@ -8202,6 +8242,9 @@ command heTNetPlayCtx pIsHost, pPubHex, pSecData, pBoxPub, pBoxSec, pHostPubHex,
    put "false" into gGame["autoNext"]
    put "true" into gGame["netCap"]
    put empty into gGame["netOutbox"]
+   -- the loopback's peer handle for the host is 0 (heTNetDeliver's stand-in),
+   -- so the "r!" catch-up marker's from-the-host transport check passes
+   put 0 into gGame["peerByPub"][pHostPubHex]
    put "idle" into gGame["phase"]
 end heTNetPlayCtx
 
@@ -8219,6 +8262,7 @@ command heTestNetPlay
    local tHostBoxPub, tHostBoxSec, tPlayBoxPub, tPlayBoxSec, tBoxErr
    local tStateA, tSbSeat, tBbSeat, tStep, tSeat, tOwe, tBoardTxt, tRcptHand1
    local tSnapG, tEvil, tEvilC, tOffPub, tOffSec, tDlrSeat, tDlrPub, tDlrSec, tStackSnap
+   local tSeqSnap
    put return & "-- 15. Online Level 0 hand, end to end (single-machine loopback)" & return after gRpt
    if not heHasSodium() then
       heTSkip "netplay: online hand", "SodiumXT not installed"
@@ -8363,13 +8407,19 @@ command heTestNetPlay
    put tSnapG into gTNetPlayG
 
    -- RECONNECT: rebuild the player from nothing but its keys and identity
-   -- seed, then the host replays the whole signed transcript into it
+   -- seed, then the host replays the whole signed transcript into it. The
+   -- replay must add ZERO new wires to the live chain -- the "r!" catch-up
+   -- marker suppresses the rebuilt client's reactions until it is caught up,
+   -- so mid-replay states never leak duplicate emissions (Codex, PR #39).
+   put gTNetHostG["lastSeq"] into tSeqSnap
    heTNetPlayCtx "false", tPlayPubHex, tPlaySec, tPlayBoxPub, tPlayBoxSec, tHostPubHex, kKatIdSeed2
    put gGame into gTNetPlayG
    put gTNetHostG into gGame
    heNetReplayLogTo 0
    put gGame into gTNetHostG
    heTNetPump
+   heTAssert "reconnect: the catch-up replay added ZERO wires to the chain", \
+         gTNetHostG["lastSeq"], tSeqSnap
    heTAssert "reconnect: the rebuilt client reaches the host's chain head", \
          gTNetPlayG["chainHeadHex"], gTNetHostG["chainHeadHex"]
    heTAssert "reconnect: seat map and stacks recovered", \

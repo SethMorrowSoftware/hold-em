@@ -380,7 +380,14 @@ receipts. **A future value layer must consume receipts and nothing but receipts*
 - **Reconnect**: rejoin with the table code, present identity, receive the transcript
   since your last `ckpt`, fold the log, resume. Hole cards at L2 need no re-delivery —
   the chain values are in the transcript; the player recomputes with their own scalar.
-  (L0/L1: the dealer re-sends the sealed `holeDeliver` on request.)
+  (L0/L1 as-built: the sealed `holeDeliver` is already ON the chain, so the replay
+  itself re-delivers it, and the per-hand seed re-derives — see 7.1 step 1.) As-built,
+  the host prefixes a replay with an unsigned `r!` control frame carrying its head
+  seq (the same transport class as `s?`, honored only from the host's live handle):
+  the catching-up client suspends its protocol emissions until its applied seq
+  reaches the mark, then reacts once against the complete transcript — without this,
+  every mid-replay state re-emitted the client's own historical messages as fresh
+  duplicates onto the live chain. A lost marker degrades to noise, never a wedge.
 - **Mid-stream gap recovery** (as-built, M1): rp1 is a ~1 s, lossy, reordering,
   REDELIVERING transport, so a client can miss a wire — or see one twice — without
   disconnecting. A signature-verified, table-bound wire is classified by its
