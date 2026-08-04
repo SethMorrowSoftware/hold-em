@@ -199,8 +199,14 @@ levels share the transcript, betting engine, and settlement.
 The spades-grade protocol, inherited unchanged:
 
 1. Every player broadcasts `seedCommit` = `sxHash("HOLDEM-SEEDC-v1|" || seed_i)`
-   (32-byte `sxRandomBytes` seed; the commitment is domain-separated per section 16,
-   an as-built correction to the original bare `sxHash(seed_i)`).
+   (the commitment is domain-separated per section 16, an as-built correction to the
+   original bare `sxHash(seed_i)`). As-built (v0.18.0), `seed_i` is DERIVED, not
+   drawn: `sxHash("HOLDEM-SEEDP-v1|" || idSeed || "|" || table || "|" || hand)` —
+   secret-keyed by the player's identity seed (unguessable to others), fresh per
+   hand (the hand number is in the input, honoring the section 5 freshness law), and
+   deterministic, so a client that crashes and rejoins mid-hand re-derives the exact
+   seed it committed and can still seal and reveal — without this, a reconnect
+   wedged the hand's audit forever because the drawn seed lived only in RAM.
 2. Every player sends `seed_i` to the current dealer in a sealed box.
 3. The shuffle is a Fisher-Yates draw from a keyed stream, pinned byte-exactly in
    `tools/protocol-kat.py`:
