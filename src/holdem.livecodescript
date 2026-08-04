@@ -6,6 +6,27 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.17.3 -- the report gets its OWN scrolling panel (heReportShow: full-size
+field + Close, built on first use so it layers above every overlay, no
+kUIVersion bump needed). Even the CORRECT msg-container put displays
+nothing on OXT when the message-box palette is closed -- the report
+"vanished" while the lobby's net field (the live wire feed, which updates
+on every wire during the netplay section) looked like the output. The
+panel always shows the whole report; the clipboard copy stays.
+
+v0.17.2 -- fix v0.17.1's report delivery: "put gRpt into the message box"
+THROWS on OXT -- the message box CONTAINER is the single token "msg" (the
+dictionary's prose name is not the compilable token, gotcha 13's family).
+Now "put gRpt into msg". New static-gate check 12 flags the prose form so
+it can never ship again; CLAUDE.md gotcha 13 carries the lesson.
+
+v0.17.1 -- harness QoL: the self-test report now lands EXPLICITLY in the
+message box AND a full copy goes to the clipboard, with a closing line
+saying so -- a run floods the status/lobby fields with live lines and the
+bare put was too easy to lose behind the stack window, which made the
+whole-report read (the point of the harness) a scavenger hunt.
+kHeHarnessV 31 -> 32.
+
 v0.17.0 -- ONLINE PLAY (Phase 2d): full Level 0 hands over the signed wire
 chain. The game is now literally the spec-4 design: every client folds the
 same wires into the same gGame["state"] the hotseat UI already renders, and
@@ -434,8 +455,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.17.0"
-constant kHeHarnessV = "31"
+constant kHeVersion = "0.17.3"
+constant kHeHarnessV = "32"
 constant kUIVersion = "12"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -6718,6 +6739,9 @@ on mouseUp
       case "heBtnHistClose"
          heHistHide
          exit mouseUp
+      case "heBtnReportClose"
+         heReportHide
+         exit mouseUp
       case "heBtnSettings"
          heSettingsShow
          exit mouseUp
@@ -7497,9 +7521,62 @@ command heRunSelftest
    else
       put "RESULT: green" & return after gRpt
    end if
-   put gRpt
+   -- deliver the report where it can be READ WHOLE: the stack's own scrolling
+   -- report panel (heReportShow) -- on OXT a put into the msg container lands
+   -- silently in a CLOSED message-box palette, so the report seemed to vanish
+   -- while the lobby's net field (the live wire feed) kept updating -- plus a
+   -- full copy on the clipboard, made to be pasted back for review. (The msg
+   -- CONTAINER token is "msg", not the prose "the message box" -- v0.17.2,
+   -- gotcha 13's family -- but even the correct form displays nothing when
+   -- the palette is closed, hence the panel.)
+   put "(full report is also on the clipboard -- just paste it)" & return after gRpt
+   set the clipboardData["text"] to gRpt
+   put gRpt into msg
+   heReportShow gRpt
    return gRpt
 end heRunSelftest
+
+command heReportShow pTxt
+   -- the harness report panel: a scrollable field the WHOLE report reads in,
+   -- with a Close button. Built on first use (so it layers above every other
+   -- overlay) and reused after; deliberately NOT part of heBuildTable, so it
+   -- needs no kUIVersion bump and never exists until a report does.
+   if there is not a field "heReportFld" then
+      create graphic "heReportBg"
+      set the style of graphic "heReportBg" to "roundrect"
+      set the roundRadius of graphic "heReportBg" to 16
+      set the rect of graphic "heReportBg" to "112,60,912,620"
+      set the backgroundColor of graphic "heReportBg" to "20,26,24"
+      set the borderColor of graphic "heReportBg" to kHeGoldColor
+      set the borderWidth of graphic "heReportBg" to 2
+      set the opaque of graphic "heReportBg" to true
+      create field "heReportFld"
+      set the rect of field "heReportFld" to "124,72,900,572"
+      set the lockText of field "heReportFld" to true
+      set the vScrollbar of field "heReportFld" to true
+      set the textSize of field "heReportFld" to 11
+      set the opaque of field "heReportFld" to true
+      set the backgroundColor of field "heReportFld" to "14,18,16"
+      set the textColor of field "heReportFld" to kHeWhite
+      set the borderWidth of field "heReportFld" to 0
+      create button "heBtnReportClose"
+      set the rect of button "heBtnReportClose" to "812,580,900,612"
+      set the label of button "heBtnReportClose" to "Close"
+   end if
+   set the text of field "heReportFld" to pTxt
+   set the scroll of field "heReportFld" to 0
+   show graphic "heReportBg"
+   show field "heReportFld"
+   show button "heBtnReportClose"
+end heReportShow
+
+command heReportHide
+   if there is a field "heReportFld" then
+      hide graphic "heReportBg"
+      hide field "heReportFld"
+      hide button "heBtnReportClose"
+   end if
+end heReportHide
 
 command heRunSection pName
    -- run one test section under a guard: a runtime fault is caught, counted as a

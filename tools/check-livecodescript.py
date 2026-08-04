@@ -549,6 +549,24 @@ def check_dynamic_prop(text):
     return errors
 
 
+def check_msgbox_prose(text):
+    """Check 12: ``the message box`` used in CODE as a container reference.
+    ``put x into the message box`` does not compile on OXT -- the message box
+    CONTAINER is the single token ``msg`` (gotcha 13's family: the
+    dictionary's prose name is not the compilable token). Shipped once
+    (v0.17.1's report delivery) and threw at first run. Strings and comments
+    are stripped first, so prose that mentions the form does not flag."""
+    errors = []
+    for lineno, code in logical_lines(text):
+        scan = strip_strings(code)
+        if re.search(r"\bthe\s+message\s+box\b", scan, re.IGNORECASE):
+            errors.append(
+                f"  L{lineno}: 'the message box' is dictionary prose, not a container"
+                " -- the message box container token is 'msg' (put x into msg)"
+            )
+    return errors
+
+
 def check_dangling_else(text):
     """A single-line ``if … then <stmt>`` directly followed by a BARE ``else``
     line. LiveCode/OXT binds that else to the single-line if (the dangling-else
@@ -596,6 +614,7 @@ def main():
         problems += check_undeclared_catch(text)
         problems += check_command_as_function(text)
         problems += check_dynamic_prop(text)
+        problems += check_msgbox_prose(text)
         if problems:
             failures += 1
             print(f"FAIL  {rel}")

@@ -265,7 +265,10 @@ bug in the family.
     `if`/`repeat` block has broken compilation of an entire script.
 13. **Object-type tokens are single words.** `import audioClip from file …` compiles;
     `import audio clip …` does not. Dictionary prose spells them as two words; the
-    tokens are not.
+    tokens are not. Same family (found v0.17.1): the message box CONTAINER is the
+    single token `msg` — `put x into msg`; the prose form `put x into the message
+    box` throws at runtime. The static gate flags `the message box` in code
+    (check 12).
 14. **Sensor/contact messages go to `b2kContactTarget`, not the frame target.**
     Forgetting it = silent sensors with zero errors. Set both targets if the table ever
     uses Kit sensors.
