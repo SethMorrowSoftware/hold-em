@@ -6,6 +6,13 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.17.1 -- harness QoL: the self-test report now lands EXPLICITLY in the
+message box ("put gRpt into the message box") AND a full copy goes to the
+clipboard, with a closing line saying so -- a run floods the status/lobby
+fields with live lines and the bare put was too easy to lose behind the
+stack window, which made the whole-report read (the point of the harness)
+a scavenger hunt. kHeHarnessV 31 -> 32.
+
 v0.17.0 -- ONLINE PLAY (Phase 2d): full Level 0 hands over the signed wire
 chain. The game is now literally the spec-4 design: every client folds the
 same wires into the same gGame["state"] the hotseat UI already renders, and
@@ -434,8 +441,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.17.0"
-constant kHeHarnessV = "31"
+constant kHeVersion = "0.17.1"
+constant kHeHarnessV = "32"
 constant kUIVersion = "12"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -7497,7 +7504,14 @@ command heRunSelftest
    else
       put "RESULT: green" & return after gRpt
    end if
-   put gRpt
+   -- deliver the report where it can be READ WHOLE: explicitly into the
+   -- message box (a run floods the status/lobby fields with live lines, and a
+   -- bare put was too easy to lose behind the stack window), plus a full copy
+   -- on the clipboard -- the report is made to be pasted back for review, and
+   -- the clipboard survives any message-box display quirk.
+   put "(full report is also on the clipboard -- just paste it)" & return after gRpt
+   set the clipboardData["text"] to gRpt
+   put gRpt into the message box
    return gRpt
 end heRunSelftest
 
