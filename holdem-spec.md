@@ -8,6 +8,14 @@ to build against; its companions are `CLAUDE.md` (the operational guide + every 
 OXT/LiveCodeScript lesson) and `IMPLEMENTATION-PLAN.md` (the phased build order). Where
 the eventual code differs from this spec, the code wins and this file gets updated.
 
+**Implementing a client in another language? Read `HOLDEM-PROTOCOL.md` instead.** It is
+the as-built wire protocol distilled out of this spec and the reference implementation,
+stated without any xTalk: primitives, envelope bytes, ingest and ordering, the message
+vocabulary and authority matrix, the Level 0 deal, betting, settlement, and a
+conformance checklist against `tools/protocol-kat.py`. This file remains the place to
+understand *why* the protocol is shaped the way it is -- the threat model (2), the deal
+ladder above Level 0 (7.2, 7.3), and the value-readiness limits (13).
+
 The one-sentence design goal: **make the deal and the settlement cryptographically
 verifiable now, so that if chips ever carry real value, the game logic is not the weak
 link.** The spec is explicit about what that does and does not buy (section 2, section 13).
