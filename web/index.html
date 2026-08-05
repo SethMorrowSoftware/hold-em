@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>holde-em</title>
+<style>
+  :root {
+    --felt: #146845; --felt-dk: #0d4a31; --rim: #744926;
+    --ink: #12160f; --pale: #f2efe6; --gold: #f4ce60; --chip: #c43a3a;
+    --panel: #0e4029; --dim: rgba(242,239,230,.62);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; font: 15px/1.5 system-ui, -apple-system, sans-serif;
+    background: radial-gradient(ellipse at 50% 0%, #1d2a22, #0b110d 70%);
+    color: var(--pale); display: flex; flex-direction: column; align-items: center;
+  }
+  header {
+    width: 100%; max-width: 980px; padding: 18px 20px 6px;
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  }
+  h1 { font-size: 19px; margin: 0; letter-spacing: .02em; font-weight: 650; }
+  .who { font: 12px/1 var(--mono); color: var(--dim); }
+  main { width: 100%; max-width: 980px; padding: 8px 20px 40px; }
+
+  .card-panel {
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.09);
+    border-radius: 12px; padding: 18px; margin-bottom: 16px;
+  }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 5px; }
+  input, button, select {
+    font: inherit; border-radius: 8px; border: 1px solid rgba(255,255,255,.16);
+    background: rgba(255,255,255,.06); color: var(--pale); padding: 9px 12px;
+  }
+  input { width: 100%; font-family: var(--mono); font-size: 13px; }
+  button { cursor: pointer; font-weight: 560; transition: filter .12s, transform .06s; }
+  button:hover:not(:disabled) { filter: brightness(1.22); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: .38; cursor: not-allowed; }
+  button.primary { background: var(--gold); color: #241d05; border-color: transparent; }
+  button.danger  { background: var(--chip); border-color: transparent; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > * { flex: 0 0 auto; }
+  .grow { flex: 1 1 220px; }
+
+  /* ---- table ---- */
+  .felt {
+    position: relative; background: radial-gradient(ellipse at 50% 42%, var(--felt), var(--felt-dk));
+    border: 9px solid var(--rim); border-radius: 130px/86px;
+    padding: 26px 20px; min-height: 340px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    box-shadow: inset 0 0 70px rgba(0,0,0,.42);
+  }
+  .pot { font: 600 13px var(--mono); color: var(--gold); letter-spacing: .04em; margin-bottom: 12px; }
+  .board { display: flex; gap: 7px; min-height: 78px; align-items: center; }
+  .pc {
+    width: 54px; height: 76px; border-radius: 7px; background: var(--pale); color: var(--ink);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font: 700 21px/1 system-ui; box-shadow: 0 2px 7px rgba(0,0,0,.4);
+  }
+  .pc.red { color: #c1272d; }
+  .pc .s { font-size: 17px; font-weight: 600; }
+  .pc.back {
+    background: repeating-linear-gradient(45deg, #7d2230 0 6px, #5e1a25 6px 12px);
+    border: 2px solid var(--pale);
+  }
+  .pc.small { width: 40px; height: 56px; font-size: 16px; }
+  .pc.small .s { font-size: 13px; }
+
+  .seats { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 16px; }
+  .seat {
+    background: var(--panel); border: 1px solid rgba(255,255,255,.12); border-radius: 9px;
+    padding: 8px 11px; min-width: 138px; font-size: 13px;
+  }
+  .seat.acting { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold); }
+  .seat.folded { opacity: .42; }
+  .seat.me { background: #12563a; }
+  .seat .n { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .seat .name { font-weight: 600; }
+  .seat .stack { font: 600 12px var(--mono); color: var(--gold); }
+  .seat .meta { font: 11px/1.4 var(--mono); color: var(--dim); }
+  .badge {
+    display: inline-block; font: 600 10px/1 system-ui; padding: 2px 5px; border-radius: 4px;
+    background: rgba(255,255,255,.15); margin-left: 4px; vertical-align: 1px;
+  }
+  .badge.btn { background: var(--pale); color: var(--ink); }
+
+  .mine { display: flex; gap: 8px; align-items: center; justify-content: center; margin-top: 14px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; justify-content: center; }
+  .status { text-align: center; font-size: 13px; color: var(--dim); min-height: 20px; margin-top: 10px; }
+
+  .feed {
+    font: 11px/1.65 var(--mono); color: var(--dim); background: rgba(0,0,0,.3);
+    border-radius: 9px; padding: 11px 13px; max-height: 190px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .code {
+    font: 12px/1.5 var(--mono); background: rgba(0,0,0,.32); padding: 9px 11px;
+    border-radius: 7px; word-break: break-all; user-select: all; cursor: copy;
+  }
+  .hint { font-size: 12px; color: var(--dim); margin: 8px 0 0; }
+  .warn { color: #f0b429; }
+  .hide { display: none !important; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .07em;
+       color: var(--dim); margin: 0 0 11px; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>holde-em</h1>
+  <span class="who" id="who">starting...</span>
+</header>
+
+<main>
+  <!-- lobby -->
+  <section id="setup" class="card-panel">
+    <h2>Table</h2>
+    <div class="row">
+      <button class="primary" id="bHost">Host a table</button>
+      <div class="grow">
+        <label for="code">or join with an invite code</label>
+        <input id="code" placeholder="64 hex characters" spellcheck="false" autocomplete="off">
+      </div>
+      <button id="bJoin">Join</button>
+    </div>
+    <p class="hint" id="relayHint"></p>
+  </section>
+
+  <section id="lobby" class="card-panel hide">
+    <h2>Lobby</h2>
+    <div id="inviteWrap">
+      <label>Invite code -- click to select, then share it</label>
+      <div class="code" id="invite"></div>
+    </div>
+    <div id="roster" class="hint"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="bStart">Start game</button>
+      <span class="hint" id="startHint"></span>
+    </div>
+  </section>
+
+  <!-- table -->
+  <section id="game" class="card-panel hide">
+    <div class="felt">
+      <div class="pot" id="pot">POT 0</div>
+      <div class="board" id="board"></div>
+      <div class="seats" id="seats"></div>
+      <div class="mine" id="mine"></div>
+      <div class="status" id="status"></div>
+      <div class="actions" id="actions"></div>
+    </div>
+  </section>
+
+  <section class="card-panel">
+    <h2>Transcript feed</h2>
+    <div class="feed" id="feed"></div>
+    <p class="hint">Every line above is a signed, hash-chained envelope this client
+      verified for itself. Nothing here is taken on trust -- not even from the host.</p>
+  </section>
+</main>
+
+<script type="importmap">
+{
+  "imports": {
+    "libsodium-wrappers": "./node_modules/libsodium-wrappers/dist/modules-esm/libsodium-wrappers.mjs",
+    "libsodium": "./node_modules/libsodium/dist/modules-esm/libsodium.mjs"
+  }
+}
+</script>
+<script type="module">
+import * as P from './holdem-protocol.mjs';
+import * as E from './engine.mjs';
+import { Table } from './client.mjs';
+import { WebSocketTransport } from './transport.mjs';
+
+const $ = (id) => document.getElementById(id);
+const RELAY = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+
+let table = null;
+const feedLines = [];
+const feed = (m) => {
+  feedLines.push(m);
+  if (feedLines.length > 300) feedLines.shift();
+  $('feed').textContent = feedLines.join('\n');
+  $('feed').scrollTop = 1e9;
+};
+
+await P.ready();
+
+// --- identity: generated once, persisted. Browser storage is NOT secure
+// storage -- see web/README.md section 4.5 before this ever carries value.
+let seedHex = localStorage.getItem('holdem.idSeed');
+if (!seedHex || !P.isHex(seedHex, 64)) {
+  seedHex = P.hex(P.sodium.randombytes_buf(32));
+  localStorage.setItem('holdem.idSeed', seedHex);
+}
+const idSeed = P.unhex(seedHex);
+const me = P.identityFromSeed(idSeed);
+$('who').textContent = `you: ${P.fingerprint(me.publicKey)}`;
+$('relayHint').textContent =
+  'Both players connect through the relay this page is served from. It verifies ' +
+  'nothing and cannot cheat -- every envelope is signed end to end.';
+
+// ---------------------------------------------------------------- rendering
+const RED = new Set(['d', 'h']);
+function cardEl(idx, small) {
+  const d = document.createElement('div');
+  d.className = 'pc' + (small ? ' small' : '');
+  if (idx == null) { d.className += ' back'; return d; }
+  const n = E.cardName(idx), suit = n[1];
+  const glyph = { c: '♣', d: '♦', h: '♥', s: '♠' }[suit];
+  if (RED.has(suit)) d.className += ' red';
+  d.innerHTML = `<span>${n[0]}</span><span class="s">${glyph}</span>`;
+  return d;
+}
+
+function render() {
+  if (!table) return;
+  const st = table.state;
+
+  if (table.tableIdHex) {
+    $('lobby').classList.remove('hide');
+    $('invite').textContent = table.tableIdHex;
+    $('inviteWrap').classList.toggle('hide', !table.isHost);
+  }
+  const members = table.rosterBody ? table.rosterBody.split(',') : [];
+  $('roster').textContent = members.length
+    ? `${members.length} at the table: ` +
+      members.map((m) => {
+        const [p, r] = m.split(':');
+        return p.slice(0, 8) + (r === 'host' ? ' (host)' : '') +
+               (p === table.idPubHex ? ' <- you' : '');
+      }).join(', ')
+    : 'waiting for peers...';
+
+  $('bStart').classList.toggle('hide', !table.isHost || table.gameOn);
+  $('startHint').textContent = table.isHost && !table.gameOn
+    ? `${table.boxByPub.size} joined (need 2+)` : '';
+
+  if (!st) return;
+  $('game').classList.remove('hide');
+
+  const pot = st.occ.reduce((a, s) => a + st.handBy[s], 0);
+  $('pot').textContent = `POT ${pot}`;
+
+  const board = $('board');
+  board.innerHTML = '';
+  for (const c of table.deal.board) board.appendChild(cardEl(c));
+  for (let i = table.deal.board.length; i < 5; i++) {
+    const ph = document.createElement('div');
+    ph.className = 'pc';
+    ph.style.cssText = 'background:rgba(255,255,255,.05);box-shadow:none';
+    board.appendChild(ph);
+  }
+
+  const seats = $('seats');
+  seats.innerHTML = '';
+  for (const s of st.occ) {
+    const el = document.createElement('div');
+    const acting = st.phase === 'acting' && st.toAct === s;
+    el.className = 'seat' + (acting ? ' acting' : '')
+      + (st.foldedBy[s] === 'true' ? ' folded' : '')
+      + (s === table.mySeat ? ' me' : '');
+    const pub = table.pubBySeat.get(s) || '';
+    const badges =
+      (s === st.buttonSeat ? '<span class="badge btn">D</span>' : '') +
+      (s === st.sbSeat ? '<span class="badge">SB</span>' : '') +
+      (s === st.bbSeat ? '<span class="badge">BB</span>' : '') +
+      (st.allinBy[s] === 'true' ? '<span class="badge">ALL IN</span>' : '');
+    el.innerHTML =
+      `<div class="n"><span class="name">${s === table.mySeat ? 'You' : 'Seat ' + s}${badges}</span>` +
+      `<span class="stack">${st.stackBy[s]}</span></div>` +
+      `<div class="meta">${pub.slice(0, 8)}${st.streetBy[s] > 0 ? '  bet ' + st.streetBy[s] : ''}` +
+      `${st.foldedBy[s] === 'true' ? '  folded' : ''}</div>`;
+    seats.appendChild(el);
+  }
+
+  const mine = $('mine');
+  mine.innerHTML = '';
+  if (table.deal.myHoles) for (const c of table.deal.myHoles) mine.appendChild(cardEl(c));
+  else if (table.mySeat > 0 && st.phase !== 'blinds') {
+    mine.appendChild(cardEl(null)); mine.appendChild(cardEl(null));
+  }
+
+  // status
+  let msg = '';
+  if (table.disputed) msg = 'SETTLEMENT DISPUTED -- this client refused the host figure.';
+  else if (st.phase === 'blinds') msg = 'Dealing...';
+  else if (st.phase === 'acting')
+    msg = st.toAct === table.mySeat ? 'Your action.' : `Waiting for seat ${st.toAct}...`;
+  else if (st.phase === 'showdown' || st.phase === 'handdone')
+    msg = table.deal.settleDone ? 'Hand settled.' : 'Showdown -- revealing seeds...';
+  else if (st.phase === 'runout') msg = 'All in -- running it out.';
+  $('status').textContent = msg;
+  $('status').className = 'status' + (table.disputed ? ' warn' : '');
+
+  // actions
+  const acts = $('actions');
+  acts.innerHTML = '';
+  const legal = table.legalActions();
+  if (!legal.length) return;
+  for (const entry of legal) {
+    const [verb, ...rest] = entry.split(' ');
+    if (verb === 'bet' || verb === 'raise') {
+      const lo = Number(rest[0]), hi = Number(rest[1]);
+      const box = document.createElement('input');
+      box.type = 'number'; box.min = lo; box.max = hi; box.value = lo;
+      box.style.cssText = 'width:96px;flex:0 0 auto';
+      const b = document.createElement('button');
+      b.className = 'primary';
+      b.textContent = `${verb} to`;
+      b.onclick = () => {
+        const v = Math.max(lo, Math.min(hi, Math.round(Number(box.value))));
+        table.act(verb, v);
+        render();
+      };
+      acts.appendChild(b); acts.appendChild(box);
+    } else {
+      const b = document.createElement('button');
+      const amt = rest.length ? Number(rest[0]) : 0;
+      b.textContent = verb === 'fold' ? 'Fold'
+        : verb === 'check' ? 'Check'
+        : verb === 'call' ? `Call ${amt}` : `All in ${amt}`;
+      if (verb === 'fold') b.className = 'danger';
+      b.onclick = () => { table.act(verb, amt); render(); };
+      acts.appendChild(b);
+    }
+  }
+}
+
+// ------------------------------------------------------------------ wiring
+async function begin(isHost, code) {
+  const tableCode = isHost ? P.hex(P.sodium.randombytes_buf(32)) : code;
+  const tx = new WebSocketTransport(RELAY, { tableCode });
+  table = new Table({
+    idSeed, transport: tx, isHost, tableIdHex: tableCode,
+    cfg: { sb: 1, bb: 2, ante: 0, stack: 200 },
+    log: feed,
+  });
+  table.onChange = render;
+  await tx.connect();
+
+  // a player's frames go to whichever peer turns out to be the host
+  const origHs = tx._onHs;
+  tx.onHandshake((peer, token) => {
+    const ok = P.admitTokenVerify(token, tableCode);
+    if (ok && ok.role === 'host') tx.hostPeer = peer;
+    origHs(peer, token);
+    render();
+  });
+
+  table.start();
+  $('setup').classList.add('hide');
+  feed(isHost ? 'hosting -- share the invite code' : 'joining...');
+
+  // The retry pass is how a live client recovers a dropped player->host frame
+  // and how a lagging client re-asks for a replay (see Table.retryPass).
+  setInterval(() => { if (table) { table.retryPass(); render(); } }, 3000);
+  render();
+}
+
+$('bHost').onclick = () => begin(true, null);
+$('bJoin').onclick = () => {
+  const c = $('code').value.trim();
+  if (!P.isHex(c, 64)) { alert('An invite code is 64 hex characters.'); return; }
+  begin(false, c);
+};
+$('bStart').onclick = () => {
+  const r = table.startGame();
+  if (!r.ok) alert(r.why);
+  render();
+};
+$('invite').onclick = () => {
+  navigator.clipboard?.writeText(table.tableIdHex);
+  feed('invite code copied to clipboard');
+};
+
+feed('ready -- host a table or paste an invite code');
+</script>
+</body>
+</html>

@@ -56,3 +56,12 @@ jobs:
       - name: JS protocol conformance (vs tools/protocol-kat.py)
         working-directory: web
         run: node conformance.mjs
+      - name: JS engine conformance (differential vs tools/betting-kat.py)
+        working-directory: web
+        run: node engine-conformance.mjs
+      - name: end-to-end table simulation
+        working-directory: web
+        run: npm run sim
+      - name: end-to-end table simulation (lossy transport)
+        working-directory: web
+        run: npm run sim:lossy

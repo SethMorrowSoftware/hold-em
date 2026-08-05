@@ -8,14 +8,24 @@
     ".": "./holdem-protocol.mjs"
   },
   "files": [
-    "holdem-protocol.mjs"
+    "holdem-protocol.mjs",
+    "engine.mjs",
+    "client.mjs",
+    "transport.mjs"
   ],
   "scripts": {
-    "test": "node conformance.mjs"
+    "test": "node conformance.mjs",
+    "test:engine": "node engine-conformance.mjs",
+    "sim": "node table-sim.mjs --players 3 --hands 3 --quiet",
+    "sim:lossy": "node table-sim.mjs --players 4 --hands 5 --lossy --quiet",
+    "relay": "node relay.mjs"
   },
   "dependencies": {
     "libsodium-wrappers": "^0.8.4"
   },
   "license": "MIT",
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "ws": "^8.21.2"
+  }
 }
