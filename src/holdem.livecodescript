@@ -6,6 +6,48 @@ ONE self-contained, paste-and-run stack: the hotseat game plus its own
 self-test harness (call heRunSelftest in the message box). No second stack,
 no required extensions to be playable.
 
+v0.18.0 -- reconnect + adversarial hardening (the single-machine half of 2e,
+chosen because it is exactly what real-network play will stress first).
+kHeHarnessV 32 -> 33.
+  * DETERMINISTIC PER-HAND SEEDS (spec 7.1 as-built): a seat's deal seed is
+    now H("HOLDEM-SEEDP-v1|" || idSeed || table || hand) -- secret-keyed by
+    the identity seed, fresh per hand (the hand number is in the input), and
+    RECONSTRUCTIBLE: a client that crashes and rejoins re-derives the exact
+    seed it committed, so it can still seal and reveal instead of wedging
+    the hand's audit forever (the old sxRandomBytes seed lived only in RAM).
+  * REPLAY-PROOF EMISSIONS: every react emission now carries a PRESENCE
+    guard against the folded transcript (commit/seal/reveal/receipt/audit/
+    join skip themselves when the chain already carries them), the dealer
+    re-derives its deck after a reconnect without re-sending deliveries the
+    transcript already holds (per-seat presence), and board wires dedupe by
+    street-vs-count on fold -- a redelivered or reconnect-burst flop can no
+    longer append twice and shift every later board slot.
+  * CATCH-UP SUPPRESSION (the Codex review find on PR #39): react used to
+    fire after EVERY replayed wire, against chain states that predate the
+    client's own historical messages -- the presence guards saw an
+    incomplete transcript and re-emitted join/commit/seal/reveal for every
+    hand replayed, and the host sequenced all of it onto the live chain.
+    heNetReplayLogTo now PREFIXES the replay with an unsigned "r!" control
+    frame carrying the head seq (same transport class as "s?", honored only
+    from the host's live handle so a stranger cannot suppress a victim);
+    the client stays silent until its applied seq reaches the mark, then
+    reacts ONCE against the complete transcript. A lost marker degrades to
+    the old noisy behavior -- it can never wedge. The sim asserts the
+    replay adds ZERO wires to the chain.
+  * THE NETPLAY SIM NOW CRASHES AND RECONNECTS THE PLAYER MID-HAND: its
+    context is rebuilt from nothing but its keys + identity seed, the host
+    replays the whole signed transcript (heNetReplayLogTo, now behind the
+    capture seam too), and the rebuilt client must converge byte-for-byte
+    (chain head, seat map, stacks, mid-hand street, re-opened sealed holes)
+    AND finish the hand to a clean showdown.
+  * ADVERSARIAL PROBES, through the real ingest path on throwaway context
+    copies: an out-of-turn act (host-signed, correctly sequenced -- engine-
+    rejected on fold), a junk sealed holeDeliver (logged drop, holes stay
+    unset, never a throw), a seedReveal that breaks its commitment (named,
+    never stored), and a HOST SETTLE THAT LIES (refused outright: no chips
+    move, the hand does not complete). The security branches are now pinned
+    behavior, not desk-checked claims.
+
 v0.17.3 -- the report gets its OWN scrolling panel (heReportShow: full-size
 field + Close, built on first use so it layers above every overlay, no
 kUIVersion bump needed). Even the CORRECT msg-container put displays
@@ -455,8 +497,8 @@ needs an OXT pass.
 -- declaration silently evaluates to nothing at runtime)
 --------------------------------------------------------------------------
 
-constant kHeVersion = "0.17.3"
-constant kHeHarnessV = "32"
+constant kHeVersion = "0.18.0"
+constant kHeHarnessV = "33"
 constant kUIVersion = "12"
 
 -- card contract (mirrored in tools/evaluator-kat.py): index 1..52,
@@ -482,6 +524,13 @@ constant kHeDomainShuf = "HOLDEM-SHUF-v1|"
 constant kHeDomainChain = "HOLDEM-CHAIN-v1|"
 constant kHeDomainSettle = "HOLDEM-SETL-v1|"
 constant kHeDomainSess = "HOLDEM-SESS-v1|"
+-- per-hand deal-seed derivation (v0.18.0): seed = H(domain || idSeed || "|" ||
+-- table || "|" || hand). Secret-keyed (the identity seed never leaves the
+-- machine), fresh per hand (spec 5 freshness law -- the hand number is in the
+-- input), and DETERMINISTIC -- a reconnecting client re-derives the exact seed
+-- it committed, so it can still reveal at hand end instead of wedging the
+-- audit (spec 9 reconnect).
+constant kHeDomainSeedP = "HOLDEM-SEEDP-v1|"
 -- host-trust hardening (spec 6 checkpoints, 8.3 settlement receipts)
 constant kHeDomainCkpt = "HOLDEM-CKPT-v1|"
 constant kHeDomainRcpt = "HOLDEM-RCPT-v1|"
@@ -1375,6 +1424,7 @@ command heIdentitySetup
    sxSignKeypairFromSeed tSeedData, tPub, tSec
    put heBin2HexS(tPub) into gGame["idPubHex"]
    put tSec into gGame["idSecData"]
+   put tSeedHex into gGame["idSeedHex"]   -- the per-hand deal-seed PRF key
    put heFingerprintOf(tPub) into gGame["idFingerprint"]
    -- The per-table X25519 box key is for the FUTURE sealed hole-card lanes; the
    -- current lobby (ed25519 identity + admission tokens) never reads it. It is
@@ -1833,6 +1883,19 @@ command heNetOnMessage pPeer, pPayloadData
       case "w"
          heNetIngestWire tRest
          break
+      case "r!"
+         -- the host announces a catch-up replay up to head seq (the frame's
+         -- payload, already split off as tRest): suspend react emissions
+         -- until our applied seq reaches it (see heNetReplayLogTo). Honored
+         -- only from the HOST's live handle -- an unsigned control frame from
+         -- anyone else could otherwise suppress a victim's emissions
+         -- indefinitely (transport DoS).
+         put gGame["hostPubHex"] into tPeerPub
+         if pPeer is gGame["peerByPub"][tPeerPub] and tRest is a number then
+            put tRest into gGame["catchUpTo"]
+            put "catch  replay to seq " & tRest & " announced" & return after gGame["netLog"]
+         end if
+         break
       case "s?"
          -- a peer asks us (the host) to replay the transcript so it can catch
          -- up from a chain gap (spec 9). Only honor it from an admitted,
@@ -2164,6 +2227,10 @@ command heNetSendWireTo pPeer, pWire
    -- targeted replay of one sequenced wire to a single peer (star topology).
    -- Same "w" framing as a broadcast so the receiver's heNetOnMessage path is
    -- identical whether the wire arrived live or as catch-up.
+   if gGame["netCap"] is "true" then
+      put "w" & tab & pWire & return after gGame["netOutbox"]
+      exit heNetSendWireTo
+   end if
    get btRp1Send(gGame["session"], pPeer, textEncode("w" & tab & pWire, "utf-8"))
 end heNetSendWireTo
 
@@ -2171,7 +2238,20 @@ command heNetReplayLogTo pPeer
    -- spec 9 reconnect seam: replay the whole signed wire log to a freshly
    -- handshaked peer, in order, so it advances its chain from genesis and
    -- catches up. Turn-rate, not frame-rate; a lobby log is a few lines.
+   -- The replay is PREFIXED with an "r!" catch-up marker carrying our head
+   -- seq: the client suspends its react emissions until its applied seq
+   -- reaches the mark, THEN reacts once against the complete transcript --
+   -- without this, react fired after every replayed wire against a chain
+   -- state that predates the client's own historical messages, re-emitting
+   -- join/commit/seal/reveal for every hand replayed and polluting the live
+   -- chain with host-sequenced duplicates (Codex review on PR #39). A lost
+   -- marker degrades to the old noisy behavior; it can never wedge.
    local tWireLine, tLog
+   if gGame["netCap"] is "true" then
+      put "r!" & tab & gGame["lastSeq"] & return after gGame["netOutbox"]
+   else
+      get btRp1Send(gGame["session"], pPeer, textEncode("r!" & tab & gGame["lastSeq"], "utf-8"))
+   end if
    put gGame["log"] into tLog
    repeat for each line tWireLine in tLog
       if tWireLine is not empty then
@@ -2237,6 +2317,7 @@ command heNetGameInit
    put "false" into gGame["joinSent"]
    put "false" into gGame["gameOn"]
    put "true" into gGame["autoNext"]
+   put empty into gGame["catchUpTo"]
    put kHeGenesisPrev into gGame["rcptHeadHex"]
    put empty into gGame["oDeal"]
 end heNetGameInit
@@ -2419,6 +2500,7 @@ command heNetFoldGameWire pTypeTxt, pFromHex, pBodyTxt, pHandTxt
    local tBodyA, tSeat, tPos, tHex, tAmt, tVerb, tCardsTxt, tOneCard, tIdxList
    local tFromSeat, tDealerPub, tOccList, tCount, tStackAmt, tOpenErr, tOpenTxt
    local tDeltasTxt, tMineTxt, tHeadHex, tSigHex, tResultTxt, tPrevBad
+   local tStreetName, tBoardHeld, tBoardN
    set the itemDelimiter to comma
    put pBodyTxt into tBodyA
    split tBodyA by comma and "="
@@ -2604,6 +2686,19 @@ command heNetFoldGameWire pTypeTxt, pFromHex, pBodyTxt, pHandTxt
             put "drop   board not from the dealer" & return after gGame["netLog"]
             break
          end if
+         -- street-vs-count dedupe: a redelivered or reconnect-burst board wire
+         -- must not append twice (a doubled flop would shift every later slot
+         -- and corrupt the audit's board compare). Each street lands exactly
+         -- once, in order.
+         put tBodyA["street"] into tStreetName
+         put gGame["oDeal"]["boardList"] into tBoardHeld
+         put the number of items of tBoardHeld into tBoardN
+         if not ((tStreetName is "flop" and tBoardN is 0) \
+               or (tStreetName is "turn" and tBoardN is 3) \
+               or (tStreetName is "river" and tBoardN is 4)) then
+            put "drop   out-of-order/duplicate board (" & tStreetName & ")" & return after gGame["netLog"]
+            break
+         end if
          put tBodyA["cards"] into tCardsTxt
          replace "|" with comma in tCardsTxt
          put empty into tIdxList
@@ -2613,10 +2708,16 @@ command heNetFoldGameWire pTypeTxt, pFromHex, pBodyTxt, pHandTxt
          if tIdxList is not empty then
             delete char -1 of tIdxList
          end if
-         if not heIsCardList(tIdxList, the number of items of tIdxList) \
-               or the number of items of tIdxList < 1 then
-            put "drop   malformed board" & return after gGame["netLog"]
-            break
+         if tStreetName is "flop" then
+            if not heIsCardList(tIdxList, 3) then
+               put "drop   malformed board" & return after gGame["netLog"]
+               break
+            end if
+         else
+            if not heIsCardList(tIdxList, 1) then
+               put "drop   malformed board" & return after gGame["netLog"]
+               break
+            end if
          end if
          if gGame["oDeal"]["boardList"] is empty then
             put tIdxList into gGame["oDeal"]["boardList"]
@@ -2700,6 +2801,9 @@ command heNetFoldGameWire pTypeTxt, pFromHex, pBodyTxt, pHandTxt
             break
          end if
          put tBodyA["result"] into tResultTxt
+         if gGame["oDeal"]["auditsBy"][tFromSeat] is empty then
+            put tResultTxt into gGame["oDeal"]["auditsBy"][tFromSeat]
+         end if
          put "audit  seat " & tFromSeat & ": " & tResultTxt & return after gGame["netLog"]
          break
 
@@ -2728,13 +2832,30 @@ command heNetGameReact
    local tMySeat, tOccList, tStateA, tCount, tPos, tSeedHex, tSealedHex, tRndErr
    local tDealerSeat, tDealerPubHex, tDealerBoxHex, tBoardTxt, tBoardN, tStreetTxt
    local tDeltasTxt, tHeadHex, tSigHex, tResultTxt, tSealErr, tAllPosted, tSeatNum
+   local tMyPubHex
    if gGame["online"] is not "true" then
       exit heNetGameReact
    end if
+   -- CATCH-UP SUPPRESSION: while a host replay is streaming (announced by the
+   -- "r!" marker), every mid-replay state is HISTORICAL -- reacting to it
+   -- would re-emit join/commit/seal/reveal for every hand replayed and
+   -- pollute the live chain with sequenced duplicates. Stay silent until our
+   -- applied seq reaches the announced head, then react once against the
+   -- complete transcript, where the presence guards see the whole truth.
+   if gGame["catchUpTo"] is a number then
+      if gGame["lastSeq"] < gGame["catchUpTo"] then
+         exit heNetGameReact
+      end if
+      put empty into gGame["catchUpTo"]
+   end if
    -- 1. bind our session box key once the roster lists us (spec 5): the signed
-   -- contentLine over table + from + box IS the binding tuple
+   -- contentLine over table + from + box IS the binding tuple. Presence-guarded
+   -- (the transcript already carrying our box means a reconnect replay, not a
+   -- first join).
+   put gGame["idPubHex"] into tMyPubHex
    if gGame["joinSent"] is not "true" and gGame["boxPubData"] is not empty \
-         and gGame["rosterBody"] contains gGame["idPubHex"] then
+         and gGame["boxByPub"][tMyPubHex] is empty \
+         and gGame["rosterBody"] contains tMyPubHex then
       put "true" into gGame["joinSent"]
       heNetSendAction "join", "box=" & heBin2HexS(gGame["boxPubData"])
    end if
@@ -2750,21 +2871,33 @@ command heNetGameReact
       exit heNetGameReact   -- no hand open, or dealLevel not folded yet
    end if
    put heNetSeatPos(tMySeat) into tPos
-   -- 2. commit fresh deal entropy (spec 7.1 step 1; freshness law, spec 5)
-   if tPos > 0 and gGame["oDeal"]["commitSent"] is not "true" then
-      put "true" into gGame["oDeal"]["commitSent"]
+   -- 2. our deal entropy (spec 7.1 step 1; freshness law, spec 5). The seed is
+   -- DERIVED, not drawn: H(domain || idSeed || table || hand) -- secret-keyed
+   -- and fresh per hand, but reconstructible, so a client that crashed and
+   -- reconnected mid-hand re-derives the exact seed it committed and can
+   -- still reveal at hand end (spec 9). The commit is only EMITTED when the
+   -- transcript does not already carry it (presence guard: replay-proof) and
+   -- this run has not just sent it (flag: redelivery debounce).
+   if tPos > 0 and gGame["oDeal"]["mySeedHex"] is empty then
       try
-         put heBin2HexS(sxRandomBytes(32)) into tSeedHex
+         put heNetHandSeedHex() into tSeedHex
          put tSeedHex into gGame["oDeal"]["mySeedHex"]
-         heNetSendAction "seedCommit", "pos=" & tPos & ",commit=" & heSeedCommitHex(tSeedHex)
       catch tRndErr
-         put "ERROR  could not draw deal entropy" & return after gGame["netLog"]
+         put "ERROR  could not derive deal entropy" & return after gGame["netLog"]
       end try
+   end if
+   if tPos > 0 and gGame["oDeal"]["mySeedHex"] is not empty \
+         and gGame["oDeal"]["commitSent"] is not "true" \
+         and gGame["oDeal"]["commitsBy"][tPos] is empty then
+      put "true" into gGame["oDeal"]["commitSent"]
+      heNetSendAction "seedCommit", "pos=" & tPos & ",commit=" \
+            & heSeedCommitHex(gGame["oDeal"]["mySeedHex"])
    end if
    -- 3. seal our seed to the dealer (spec 7.1 step 2) once every commit is in
    -- (committing BEFORE any seed travels is what stops the dealer stacking)
    if tPos > 0 and gGame["oDeal"]["commitN"] >= tCount \
-         and gGame["oDeal"]["sealSent"] is not "true" then
+         and gGame["oDeal"]["sealSent"] is not "true" \
+         and gGame["oDeal"]["sealsBy"][tPos] is empty then
       put gGame["pubBySeat"][tDealerSeat] into tDealerPubHex
       put gGame["boxByPub"][tDealerPubHex] into tDealerBoxHex
       if heIsHex(tDealerBoxHex, 64) then
@@ -2778,10 +2911,13 @@ command heNetGameReact
          end try
       end if
    end if
-   -- 4. we deal this hand: open the seals, verify, derive, deliver
+   -- 4. we deal this hand: open the seals, verify, derive, deliver. Runs
+   -- whenever the derived deck is missing -- covers the fresh deal AND a
+   -- dealer that reconnected mid-hand (it re-opens the replayed seals and
+   -- re-derives; per-seat delivery inside is presence-guarded, so seats the
+   -- transcript already served are never re-sent).
    if tMySeat is tDealerSeat and tMySeat > 0 and gGame["oDeal"]["sealN"] >= tCount \
-         and gGame["oDeal"]["holesSent"] is not "true" then
-      put "true" into gGame["oDeal"]["holesSent"]
+         and gGame["oDeal"]["dealerDealA"] is not an array then
       heNetDealerDeal
    end if
    -- 5. blinds once every seat has its (sealed) holes. Antes first (dead
@@ -2847,7 +2983,9 @@ command heNetGameReact
    end if
    -- 8. hand over: reveal our seed so everyone can audit (spec 7.1 step 5)
    if (tStateA["phase"] is "showdown" or tStateA["phase"] is "handdone") \
-         and tPos > 0 and gGame["oDeal"]["revealSent"] is not "true" then
+         and tPos > 0 and gGame["oDeal"]["revealSent"] is not "true" \
+         and gGame["oDeal"]["revealsBy"][tPos] is empty \
+         and gGame["oDeal"]["mySeedHex"] is not empty then
       put "true" into gGame["oDeal"]["revealSent"]
       heNetSendAction "seedReveal", "pos=" & tPos & ",seed=" & gGame["oDeal"]["mySeedHex"]
    end if
@@ -2864,7 +3002,8 @@ command heNetGameReact
    end if
    -- 10. co-sign the settlement receipt (spec 8.3, chained hand to hand)
    if gGame["oDeal"]["settleDone"] is "true" and tPos > 0 \
-         and gGame["oDeal"]["receiptSent"] is not "true" then
+         and gGame["oDeal"]["receiptSent"] is not "true" \
+         and gGame["oDeal"]["receiptsBy"][tMySeat] is empty then
       put "true" into gGame["oDeal"]["receiptSent"]
       put gGame["rcptHeadHex"] into tHeadHex
       put heReceiptSigHex(tHeadHex, gGame["idSecData"]) into tSigHex
@@ -2872,7 +3011,8 @@ command heNetGameReact
    end if
    -- 11. our audit verdict (spec 7.1 step 5)
    if gGame["oDeal"]["settleDone"] is "true" and tPos > 0 \
-         and gGame["oDeal"]["auditSent"] is not "true" then
+         and gGame["oDeal"]["auditSent"] is not "true" \
+         and gGame["oDeal"]["auditsBy"][tMySeat] is empty then
       put "true" into gGame["oDeal"]["auditSent"]
       put heNetAuditHand() into tResultTxt
       heNetSendAction "audit", "result=" & tResultTxt
@@ -2921,17 +3061,32 @@ command heNetDealerDeal
    put tDealA into gGame["oDeal"]["dealerDealA"]
    put gGame["state"]["occ"] into tOccList
    repeat for each item tSeatNum in tOccList
-      put tDealA["holesBy"][tSeatNum] into tHolePair
-      put gGame["pubBySeat"][tSeatNum] into tPeerPubHex
-      put gGame["boxByPub"][tPeerPubHex] into tPeerBoxHex
-      try
-         put heBin2HexS(sxSeal(textEncode(tHolePair, "utf-8"), heHex2BinD(tPeerBoxHex))) into tSealedOut
-         heNetSendAction "holeDeliver", "seat=" & tSeatNum & ",sealed=" & tSealedOut
-      catch tSealErr
-         put "ERROR  could not seal holes for seat " & tSeatNum & return after gGame["netLog"]
-      end try
+      -- presence-guarded per seat: a reconnected dealer re-derives the deck
+      -- above but never re-sends a delivery the transcript already carries
+      if gGame["oDeal"]["holeSealedBy"][tSeatNum] is empty then
+         put tDealA["holesBy"][tSeatNum] into tHolePair
+         put gGame["pubBySeat"][tSeatNum] into tPeerPubHex
+         put gGame["boxByPub"][tPeerPubHex] into tPeerBoxHex
+         try
+            put heBin2HexS(sxSeal(textEncode(tHolePair, "utf-8"), heHex2BinD(tPeerBoxHex))) into tSealedOut
+            heNetSendAction "holeDeliver", "seat=" & tSeatNum & ",sealed=" & tSealedOut
+         catch tSealErr
+            put "ERROR  could not seal holes for seat " & tSeatNum & return after gGame["netLog"]
+         end try
+      end if
    end repeat
 end heNetDealerDeal
+
+function heNetHandSeedHex
+   -- the per-hand deal seed: H(domain || idSeed || "|" || table || "|" ||
+   -- hand), hex end to end through the standing crypto seams. Secret-keyed by
+   -- the identity seed (it never leaves the machine), fresh per hand (the
+   -- hand number is in the input, spec 5 freshness law), and DETERMINISTIC --
+   -- a reconnecting client re-derives the exact seed it committed, so it can
+   -- still seal and reveal after a crash (spec 9).
+   return heHashDomHex(kHeDomainSeedP, textEncode(gGame["idSeedHex"] & "|" \
+         & gGame["tableIdHex"] & "|" & gGame["handNum"], "utf-8"))
+end heNetHandSeedHex
 
 function heNetDealFromSeeds pSeedsA, pCount
    -- the committed keyed-stream deal (spec 7.1 step 3) from position-indexed
@@ -7999,21 +8154,10 @@ end heTestNetSim
 
 command heTNetDeliver pPayloadTxt
    -- netplay loopback: deliver one captured rp1 payload into the CURRENT
-   -- gGame context, exactly as heNetOnMessage routes it ("c" -> host relay,
-   -- "w" -> ingest; "s?" cannot occur in this ordered exchange)
-   local tKind, tRest, tSaved
-   put the itemDelimiter into tSaved
-   set the itemDelimiter to tab
-   put item 1 of pPayloadTxt into tKind
-   put item 2 to -1 of pPayloadTxt into tRest
-   set the itemDelimiter to tSaved
-   if tKind is "c" then
-      if gGame["isHost"] is "true" then
-         heHostRelay 0, tRest
-      end if
-   else if tKind is "w" then
-      heNetIngestWire tRest
-   end if
+   -- gGame context through the REAL message router, so control frames (the
+   -- "r!" catch-up marker above all) take exactly the production path. Peer
+   -- handle 0 is the loopback's stand-in for the counterparty's live handle.
+   heNetOnMessage 0, textEncode(pPayloadTxt, "utf-8")
 end heTNetDeliver
 
 command heTNetPump
@@ -8070,7 +8214,7 @@ command heTNetAct pSeatNum, pBodyTxt
    heTNetPump
 end heTNetAct
 
-command heTNetPlayCtx pIsHost, pPubHex, pSecData, pBoxPub, pBoxSec, pHostPubHex
+command heTNetPlayCtx pIsHost, pPubHex, pSecData, pBoxPub, pBoxSec, pHostPubHex, pIdSeedHex
    -- one netplay context: the online keys + game store a create/join builds,
    -- with the capture seam on and the host's between-hands timer off
    put empty into gGame
@@ -8078,6 +8222,7 @@ command heTNetPlayCtx pIsHost, pPubHex, pSecData, pBoxPub, pBoxSec, pHostPubHex
    put pIsHost into gGame["isHost"]
    put pPubHex into gGame["idPubHex"]
    put pSecData into gGame["idSecData"]
+   put pIdSeedHex into gGame["idSeedHex"]
    put pBoxPub into gGame["boxPubData"]
    put pBoxSec into gGame["boxSecData"]
    put pHostPubHex into gGame["hostPubHex"]
@@ -8097,6 +8242,9 @@ command heTNetPlayCtx pIsHost, pPubHex, pSecData, pBoxPub, pBoxSec, pHostPubHex
    put "false" into gGame["autoNext"]
    put "true" into gGame["netCap"]
    put empty into gGame["netOutbox"]
+   -- the loopback's peer handle for the host is 0 (heTNetDeliver's stand-in),
+   -- so the "r!" catch-up marker's from-the-host transport check passes
+   put 0 into gGame["peerByPub"][pHostPubHex]
    put "idle" into gGame["phase"]
 end heTNetPlayCtx
 
@@ -8113,6 +8261,8 @@ command heTestNetPlay
    local tSaved, tHostPub, tHostSec, tPlayPub, tPlaySec, tHostPubHex, tPlayPubHex
    local tHostBoxPub, tHostBoxSec, tPlayBoxPub, tPlayBoxSec, tBoxErr
    local tStateA, tSbSeat, tBbSeat, tStep, tSeat, tOwe, tBoardTxt, tRcptHand1
+   local tSnapG, tEvil, tEvilC, tOffPub, tOffSec, tDlrSeat, tDlrPub, tDlrSec, tStackSnap
+   local tSeqSnap
    put return & "-- 15. Online Level 0 hand, end to end (single-machine loopback)" & return after gRpt
    if not heHasSodium() then
       heTSkip "netplay: online hand", "SodiumXT not installed"
@@ -8137,7 +8287,7 @@ command heTestNetPlay
    end try
 
    -- host context opens the table: signed cfg + roster, then its own join
-   heTNetPlayCtx "true", tHostPubHex, tHostSec, tHostBoxPub, tHostBoxSec, tHostPubHex
+   heTNetPlayCtx "true", tHostPubHex, tHostSec, tHostBoxPub, tHostBoxSec, tHostPubHex, kKatIdSeed1
    put "true" into gGame["admittedA"][tHostPubHex]
    put "true" into gGame["admittedA"][tPlayPubHex]
    put "host" into gGame["roleByPub"][tHostPubHex]
@@ -8145,7 +8295,7 @@ command heTestNetPlay
    heNetSendAction "cfg", heLobbyCfgBody()
    heHostEmitRoster
    put gGame into gTNetHostG
-   heTNetPlayCtx "false", tPlayPubHex, tPlaySec, tPlayBoxPub, tPlayBoxSec, tHostPubHex
+   heTNetPlayCtx "false", tPlayPubHex, tPlaySec, tPlayBoxPub, tPlayBoxSec, tHostPubHex, kKatIdSeed2
    put gGame into gTNetPlayG
    heTNetPump
    heTAssert "netplay: both session box keys bound on-chain (host view)", \
@@ -8190,14 +8340,97 @@ command heTestNetPlay
    heTContains "netplay: seat 2 audits the deal clean", gTNetPlayG["netLog"], "audit  seat 2: pass"
    put gTNetPlayG["rcptHeadHex"] into tRcptHand1
 
-   -- hand 2: kicked by the host (the sim keeps autoNext off), checked down to
-   -- a showdown -- real entropy decides the winner, so the asserts are the
-   -- invariants: five board cards on the wire, chip conservation, agreement,
-   -- a fresh receipt link, clean audits
+   -- hand 2: kicked by the host (the sim keeps autoNext off). Played to the
+   -- flop, then the PLAYER CRASHES AND RECONNECTS mid-hand: its context is
+   -- rebuilt from nothing but its keys and identity seed, the host replays
+   -- the whole signed transcript (spec 9), and the rebuilt client must
+   -- converge byte-for-byte AND keep playing -- the deterministic per-hand
+   -- seed re-derives, the sealed holes re-open from the replayed wire, and
+   -- the hand checks down to a showdown with the usual invariants (real
+   -- entropy decides the winner): five board cards on the wire, chip
+   -- conservation, agreement, a fresh receipt link, clean audits.
    put gTNetHostG into gGame
    heNetHandKick
    put gGame into gTNetHostG
    heTNetPump
+   -- preflop: SB completes, BB checks -> the dealer wires the flop
+   put gTNetPlayG["state"] into tStateA
+   heTNetAct tStateA["toAct"], "verb=call,amount=1"
+   put gTNetPlayG["state"] into tStateA
+   heTNetAct tStateA["toAct"], "verb=check,amount=0"
+   put gTNetPlayG["oDeal"]["boardList"] into tBoardTxt
+   heTAssert "netplay: the flop is on the wire before the crash", the number of items of tBoardTxt, 3
+
+   -- adversarial probe, mid-hand: an out-of-turn act -- host-signed and
+   -- correctly sequenced, so it APPLIES to the chain -- must be ENGINE-
+   -- rejected on fold (drop-and-log). Probes run on a THROWAWAY copy of the
+   -- player context so the poisoned chain never leaks into the honest stream.
+   put gTNetPlayG into tSnapG
+   put gTNetPlayG into gGame
+   put gGame["state"] into tStateA
+   if tStateA["toAct"] is heNetMySeat() then
+      put tHostPubHex into tOffPub
+      put tHostSec into tOffSec
+   else
+      put tPlayPubHex into tOffPub
+      put tPlaySec into tOffSec
+   end if
+   put heEnvContentLine(kKatTableHex, gGame["handNum"], tOffPub, "act", "verb=check,amount=0") into tEvilC
+   put heWireBuild(tEvilC, tOffSec, gGame["lastSeq"] + 1, gGame["chainHeadHex"], tHostSec) into tEvil
+   heNetIngestWire tEvil
+   heTContains "netplay: an out-of-turn act is engine-rejected on fold", \
+         gGame["netLog"], "engine-rejected act"
+   put tSnapG into gTNetPlayG
+
+   -- adversarial probe: a holeDeliver that will not OPEN (junk ciphertext,
+   -- but host-signed and dealer-authored) is a logged drop, never a throw,
+   -- and the holes stay unset
+   put gTNetPlayG into tSnapG
+   put gTNetPlayG into gGame
+   put gGame["oDeal"]["dealerSeat"] into tDlrSeat
+   put gGame["pubBySeat"][tDlrSeat] into tDlrPub
+   if tDlrPub is tHostPubHex then
+      put tHostSec into tDlrSec
+   else
+      put tPlaySec into tDlrSec
+   end if
+   put empty into gGame["oDeal"]["myHoles"]
+   put empty into gGame["oDeal"]["holeSealedBy"][heNetMySeat()]
+   put heEnvContentLine(kKatTableHex, gGame["handNum"], tDlrPub, "holeDeliver", \
+         "seat=" & heNetMySeat() & ",sealed=deadbeef") into tEvilC
+   put heWireBuild(tEvilC, tDlrSec, gGame["lastSeq"] + 1, gGame["chainHeadHex"], tHostSec) into tEvil
+   heNetIngestWire tEvil
+   heTContains "netplay: a junk sealed delivery is a logged drop", \
+         gGame["netLog"], "would not open"
+   heTAssert "netplay: the junk delivery leaves the holes unset", \
+         (gGame["oDeal"]["myHoles"] is empty), "true"
+   put tSnapG into gTNetPlayG
+
+   -- RECONNECT: rebuild the player from nothing but its keys and identity
+   -- seed, then the host replays the whole signed transcript into it. The
+   -- replay must add ZERO new wires to the live chain -- the "r!" catch-up
+   -- marker suppresses the rebuilt client's reactions until it is caught up,
+   -- so mid-replay states never leak duplicate emissions (Codex, PR #39).
+   put gTNetHostG["lastSeq"] into tSeqSnap
+   heTNetPlayCtx "false", tPlayPubHex, tPlaySec, tPlayBoxPub, tPlayBoxSec, tHostPubHex, kKatIdSeed2
+   put gGame into gTNetPlayG
+   put gTNetHostG into gGame
+   heNetReplayLogTo 0
+   put gGame into gTNetHostG
+   heTNetPump
+   heTAssert "reconnect: the catch-up replay added ZERO wires to the chain", \
+         gTNetHostG["lastSeq"], tSeqSnap
+   heTAssert "reconnect: the rebuilt client reaches the host's chain head", \
+         gTNetPlayG["chainHeadHex"], gTNetHostG["chainHeadHex"]
+   heTAssert "reconnect: seat map and stacks recovered", \
+         gTNetPlayG["stacksBy"][1] & "/" & gTNetPlayG["stacksBy"][2] & "/" & gTNetPlayG["seatByPub"][tPlayPubHex], \
+         gTNetHostG["stacksBy"][1] & "/" & gTNetHostG["stacksBy"][2] & "/" & gTNetHostG["seatByPub"][tPlayPubHex]
+   heTAssert "reconnect: the mid-hand street recovered", \
+         gTNetPlayG["state"]["street"], gTNetHostG["state"]["street"]
+   heTAssert "reconnect: the sealed holes re-opened from the replayed wire", \
+         (gTNetPlayG["oDeal"]["myHoles"] is not empty), "true"
+
+   -- ...and the hand keeps playing from the reconnected state: check it down
    repeat with tStep = 1 to 20
       put gTNetPlayG["state"] into tStateA
       if tStateA["phase"] is not "acting" then
@@ -8225,6 +8458,40 @@ command heTestNetPlay
          and gTNetPlayG["rcptHeadHex"] is gTNetHostG["rcptHeadHex"]), "true"
    heTAssert "netplay: both sides end at the same chain head", \
          gTNetPlayG["chainHeadHex"], gTNetHostG["chainHeadHex"]
+
+   -- adversarial probe, post-hand: a seedReveal that does not open its
+   -- commitment is NAMED and never stored (the commit check runs first)
+   put gTNetPlayG into tSnapG
+   put gTNetPlayG into gGame
+   put gGame["pubBySeat"][heNetSeatAtPos(1)] into tOffPub
+   if tOffPub is tHostPubHex then
+      put tHostSec into tOffSec
+   else
+      put tPlaySec into tOffSec
+   end if
+   put heEnvContentLine(kKatTableHex, gGame["handNum"], tOffPub, "seedReveal", \
+         "pos=1,seed=" & kKatSeed3) into tEvilC
+   put heWireBuild(tEvilC, tOffSec, gGame["lastSeq"] + 1, gGame["chainHeadHex"], tHostSec) into tEvil
+   heNetIngestWire tEvil
+   heTContains "netplay: a reveal that breaks its commitment is named", \
+         gGame["netLog"], "does not match its commit"
+   put tSnapG into gTNetPlayG
+
+   -- adversarial probe, post-hand: a host settle that LIES about the deltas
+   -- is refused outright -- the client recomputes and never folds it
+   put gTNetPlayG into tSnapG
+   put gTNetPlayG into gGame
+   put "false" into gGame["oDeal"]["settleDone"]
+   put gGame["stacksBy"][1] into tStackSnap
+   put heEnvContentLine(kKatTableHex, gGame["handNum"], tHostPubHex, "settle", \
+         "deltas=1:400|2:-400") into tEvilC
+   put heWireBuild(tEvilC, tHostSec, gGame["lastSeq"] + 1, gGame["chainHeadHex"], tHostSec) into tEvil
+   heNetIngestWire tEvil
+   heTContains "netplay: a lying host settle is refused", gGame["netLog"], "SETTLE-MISMATCH"
+   heTAssert "netplay: the refused settle moved no chips", gGame["stacksBy"][1], tStackSnap
+   heTAssert "netplay: the refused settle did not complete the hand", \
+         gGame["oDeal"]["settleDone"], "false"
+   put tSnapG into gTNetPlayG
 
    put empty into gTNetHostG
    put empty into gTNetPlayG
