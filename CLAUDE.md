@@ -20,11 +20,18 @@ your table stack (this repo)                 src/holdem.livecodescript (planned)
    |- b2k*  Box2Dxt Kit org.openxtalk.box2dxt            card sprites, chip physics, frame loop
 ```
 
-The three documents that govern this repo:
+The documents that govern this repo:
 
 - **`holdem-spec.md`** — the design contract (deal protocol ladder, transcript, threat
   model, settlement receipts). Where code differs from the spec, the code wins and the
   spec gets updated.
+- **`HOLDEM-PROTOCOL.md`** — the as-built wire protocol, stated language-neutrally so a
+  client in any language can interoperate. It is a distillation of the implementation
+  plus `tools/protocol-kat.py`, NOT a second design authority: where it differs from
+  `src/holdem.livecodescript`, the implementation wins and the protocol doc is a bug.
+  Any change to envelope bytes, domain tags, the shuffle, the betting rules, or the
+  settlement/receipt hashes is a **consensus break** and must update this file, the
+  KAT vectors, and the envelope version together (protocol doc section 16).
 - **`IMPLEMENTATION-PLAN.md`** — the phased build order with exit criteria per phase.
 - **This file** — how to work here without getting bitten by OXT.
 
@@ -398,6 +405,7 @@ README.md                          front door
 CLAUDE.md                          you are here
 LICENSE                            MIT (the family default, decided Phase 0)
 holdem-spec.md                     the design contract
+HOLDEM-PROTOCOL.md                 the wire protocol, language-neutral (for porters)
 IMPLEMENTATION-PLAN.md             the phased build order
 tools/check-livecodescript.py     static gates (carried from the family)
 tools/check-docs.py                docs smart-quote scan

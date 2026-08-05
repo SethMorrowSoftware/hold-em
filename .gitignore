@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# web client: npm deps and lockfile churn stay out of the repo
+web/node_modules/
+web/package-lock.json

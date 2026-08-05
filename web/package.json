@@ -1,0 +1,31 @@
+{
+  "name": "holdem-protocol",
+  "version": "0.1.0",
+  "description": "holde-em wire protocol core -- a JavaScript port of HOLDEM-PROTOCOL.md, for browser and Node clients",
+  "type": "module",
+  "main": "holdem-protocol.mjs",
+  "exports": {
+    ".": "./holdem-protocol.mjs"
+  },
+  "files": [
+    "holdem-protocol.mjs",
+    "engine.mjs",
+    "client.mjs",
+    "transport.mjs"
+  ],
+  "scripts": {
+    "test": "node conformance.mjs",
+    "test:engine": "node engine-conformance.mjs",
+    "sim": "node table-sim.mjs --players 3 --hands 3 --quiet",
+    "sim:lossy": "node table-sim.mjs --players 4 --hands 5 --lossy --quiet",
+    "relay": "node relay.mjs"
+  },
+  "dependencies": {
+    "libsodium-wrappers": "^0.8.4"
+  },
+  "license": "MIT",
+  "private": true,
+  "devDependencies": {
+    "ws": "^8.21.2"
+  }
+}

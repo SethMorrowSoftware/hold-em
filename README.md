@@ -82,6 +82,13 @@ or skip-charge a blind). All of this runs headless in CI (`tools/*-kat.py` +
 - **[holdem-spec.md](holdem-spec.md)** — the design contract: threat model, the
   three-level deal protocol ladder, the transcript, settlement receipts, and the honest
   non-goals (read section 13 before ever thinking about real stakes).
+- **[HOLDEM-PROTOCOL.md](HOLDEM-PROTOCOL.md)** — **the wire protocol, language-neutral.**
+  Everything a client in *any* language needs to join a table and play a hand to a
+  co-signed receipt: primitives, envelope bytes, the ingest/ordering algorithm, the
+  message vocabulary and authority matrix, the Level 0 deal, the betting and settlement
+  rules, and a conformance checklist against the pinned vectors
+  (`python3 tools/protocol-kat.py --json`). A pure-Python, Go, or Rust holde-em client
+  is a supported thing to build — nothing in the protocol is xTalk-specific.
 - **[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)** — the build order, Phase 0
   (bootstrap) through Phase 5 (hardening), with exit criteria per phase.
 - **[CLAUDE.md](CLAUDE.md)** — the engineering playbook: everything about OXT /
