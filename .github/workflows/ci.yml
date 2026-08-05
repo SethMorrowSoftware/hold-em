@@ -36,3 +36,23 @@ jobs:
         run: python3 tools/sounds-kat.py
       - name: independent-reference fuzz (rules, not the port)
         run: python3 tools/logic-fuzz.py
+
+  # A THIRD implementation of the protocol crypto path (after the xTalk and the
+  # Python KAT), written from HOLDEM-PROTOCOL.md and checked against the same
+  # pinned vectors. Its real job is to keep the protocol doc honest: if the doc
+  # ever drifts from the implementation, this port -- which follows the doc --
+  # stops matching the KAT. Separate job so an npm-registry hiccup cannot red
+  # the pure-Python gates above.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install (libsodium-wrappers only)
+        working-directory: web
+        run: npm install --no-audit --no-fund
+      - name: JS protocol conformance (vs tools/protocol-kat.py)
+        working-directory: web
+        run: node conformance.mjs
