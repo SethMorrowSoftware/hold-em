@@ -1,6 +1,9 @@
 # Online Texas Hold'em for the OXT extension family — design spec
 
-**Status: pre-implementation spec (plan, not as-built).** This is the design brief for a
+**Status: living contract, corrected against the as-built code inline.** (The
+"pre-implementation" label this line carried was stale by v0.2.0; the body below marks
+every place the build diverged, per the convention at the end of this paragraph —
+corrected in the 2026-08-15 fold's truth pass.) This is the design brief for a
 serverless online no-limit Texas Hold'em game built on the OpenXTalk extension family:
 Box2Dxt (presentation), TorrentXT (transport + rendezvous), SodiumXT (all cryptography),
 and optionally OnionXT (anonymous transport / oracle hosting). This spec is the contract
@@ -497,7 +500,7 @@ This spec makes the *game* value-ready; it does not make a *product* value-ready
 
 | Repo | Item | Size |
 |---|---|---|
-| **SodiumXT** | Expose ristretto255: `sxRistrettoFromHash`, `sxRistrettoScalarMultPoint`, `sxRistrettoScalarRandom`, `sxRistrettoScalarInvert`, `sxRistrettoPointValid`, plus `sxHash512` if not already public (libsodium carries all of it; this is expose-only, no new cryptography) + ABI bump + KAT vectors | the only blocking native work |
+| **SodiumXT** | **SHIPPED 2026-08-15 (suite-internal, SodiumXT ABI 8)**: `sxRistrettoFromHash`, `sxRistrettoScalarMultPoint`, `sxRistrettoScalarRandom`, `sxRistrettoScalarInvert`, `sxRistrettoPointValid` (no `sxHash512` needed - `sxHash(tData, 64)` is the 64-byte hash), with cross-checked KATs (C smoke test + this repo's `tools/protocol-kat.py` independent reference). Verified statically; the `sxRistretto*` handlers need their OXT pass. Was: the only blocking native work |
 | **SodiumXT** (later) | `sxRistrettoScalarMultBatch` (52 points, one crossing); point add/sub + `sxRistrettoScalarMultBase` for DLEQ (7.4) | optimization / hardening pass |
 | **TorrentXT** | none — rp1 + BEP44 + phantom swarms suffice as shipped | — |
 | **OnionXT** | none — streams + onion services as shipped (L1 oracle, onion tables) | — |

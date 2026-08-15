@@ -4,6 +4,58 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 repository. Read it before touching anything; it carries everything already learned the
 hard way across the sibling repos so it never has to be re-learned here.
 
+> **Folded into the monorepo 2026-08-15.** This directory was copied verbatim (via
+> `git archive`, tracked files only) from the standalone `hold-em` repository, which
+> becomes a mirror; development happens here now, like every other member. The seed
+> docs the suite had carried at `docs/holde-em/` (stale at pre-implementation while
+> this repo reached v0.18.0) were REMOVED in the fold - this directory is the one
+> authority. What the fold changed, each per suite law:
+>
+> - `tools/check-livecodescript.py` was REPLACED with the suite's unified checker,
+>   registered in `tools/check-checker-drift.py` and fixture-tested by
+>   `tools/test-checker.py` - never edit it here alone. First contact found TWO real
+>   engine traps this repo's own lineage could not see, both in the Level 0 deal
+>   path: `heXorSeedsHex` walked its hex pairs with `repeat with ... step 2` (OXT
+>   ignores the increment - it would have XORed 63 OVERLAPPING pairs and derived a
+>   wrong-but-internally-consistent deck), and `heDeckFromStreamKey` re-threw from
+>   inside a `catch` (the throw never reaches the caller on OXT). Both are rewritten;
+>   both handlers are re-labelled "verified statically; needs an OXT re-pass", and
+>   whether the PREVIOUS on-engine Level 0 runs dealt from the stepped or the
+>   1-stepped stream is exactly what that re-pass should establish (the Python KAT
+>   mirrors pin the 2-stepped semantics).
+> - The hold-em lineage checker survives as `tools/check-holdem-idioms.py`: eight of
+>   its checks (H6 chunk-of-array, H7 bitwise, engine-token names, undeclared catch
+>   vars, command-with-parens, dynamic property names, message-box prose, undeclared
+>   k-constants) have no unified-checker counterpart and every one has shipped-defect
+>   provenance here. It runs IN ADDITION via `tools/build-all.sh`; porting those
+>   checks INTO the unified checker (and retiring the file) is recorded follow-up.
+> - All ten pure-logic gates (the idiom checker, `check-docs.py`, the seven KATs,
+>   `logic-fuzz.py`) are wired into the suite's `tools/build-all.sh --gates`, which
+>   CI runs on every push; this member's own `.github/workflows/ci.yml` stays for
+>   standalone work but is inert here (GitHub runs only root workflows).
+> - `src/holdem.livecodescript` is EXEMPT in the suite's `tools/check-ui-kit-drift.py`
+>   ("game table on the b2k Kit; suite-kit chrome is phase-2" - the box2dxt games'
+>   reasoning). Registering it exposed a latent suite-gate bug the fold fixed: the
+>   gate's window-building regex ended in a literal backspace byte, so the
+>   width/height spelling had never matched; the rect spelling this stack uses was
+>   also unknown to it (and to `tools/check-stack-size.py`, which now parses it).
+> - The stack ships at 1024x690 - 50px over the suite's 720p height budget, with the
+>   status line and quick-bet row genuinely below y=640. It carries a written SKIP in
+>   `tools/check-stack-size.py`; the 720p re-layout is recorded follow-up work, not a
+>   number a gate can hold down.
+> - The `he*` prefix is registered in `tools/check-handler-calls.py`, which also
+>   learned to strip `/* */` block comments (this file's header changelog leaked
+>   prose into its candidate set - and 31 phantom "definitions" out of it, suite-wide).
+> - Registered in the `start-here.livecodescript` launcher. NOT folded into the
+>   generated suite selftest or its coverage gate: this member's harness lives
+>   EMBEDDED in the game stack (`heRunSelftest`), not as a separate foldable file -
+>   extracting it (or teaching the fold machinery an embedded harness) is recorded
+>   follow-up, the box2dxt precedent.
+>
+> Where this file and the suite root `CLAUDE.md` conflict, this file wins inside
+> `holde-em/`; paths in the docs below may still read as if this were its own repo
+> root (the suite's standing consolidation-debt caveat).
+
 ## What this is
 
 **holde-em** is a serverless online no-limit Texas Hold'em game for **OpenXTalk (OXT)**
@@ -12,7 +64,7 @@ pure-script project: **no native code lives in this repo**. It composes four sib
 extensions, each of which wraps its own native library behind a friendly xTalk surface:
 
 ```
-your table stack (this repo)                 src/holdem.livecodescript (planned)
+your table stack (this repo)                 src/holdem.livecodescript
    |- game logic: transcript, deal ladder, betting, evaluator = pure xTalk, here
    |- bt*   TorrentXT   org.openxtalk.library.torrent    rp1 messaging, DHT rendezvous, BEP44
    |- sx*   SodiumXT    org.openxtalk.library.sodium     identity, sealing, hashing, randomness
@@ -28,8 +80,11 @@ The three documents that govern this repo:
 - **`IMPLEMENTATION-PLAN.md`** — the phased build order with exit criteria per phase.
 - **This file** — how to work here without getting bitten by OXT.
 
-**Status: pre-implementation.** The repo was seeded from Box2Dxt's `docs/holde-em/`
-folder; Phase 0 of the plan (bootstrap) is the current work.
+**Status: Phase 2 online lobby + online play (2d) written at v0.18.0, on Phase 1
+hotseat.** The project was seeded from Box2Dxt's `docs/holde-em/` folder, built out in
+its own repository, and folded home into the suite 2026-08-15 (the blockquote above).
+README.md's Status section is the current authority; IMPLEMENTATION-PLAN.md carries the
+per-phase ledger.
 
 **Because chips may someday carry real value**, the security posture is not optional
 polish: read spec sections 2 (threat model), 13 (value-readiness), and 16 (security
@@ -61,19 +116,22 @@ checklist) before writing any protocol code, and follow section 16 as law.
 
 ## Commands
 
-**Static verification** (the only automated gate that exists for xTalk; run after
+**Static verification** (the only automated gate that exists for xTalk; run BOTH after
 **every** `.livecodescript` edit, and in CI):
 
 ```sh
-python3 tools/check-livecodescript.py
+python3 tools/check-livecodescript.py   # the suite's UNIFIED checker (drift-gated copy)
+python3 tools/check-holdem-idioms.py    # this member's extra idiom checks
 ```
 
-It scans every `.livecodescript` under `src/` and `examples/` for: **smart/curly
-quotes** (any single one fails OXT compilation), **handler balance**, **control-structure
-balance**, and the **dangling-else** pairing. Exit non-zero on any failure. It was
-carried from Box2Dxt (where it has caught real breakage repeatedly); the embedded-kit
-drift check was dropped as not-yet-applicable — restore it if this repo ever embeds a
-library between sentinels.
+Since the 2026-08-15 fold, `check-livecodescript.py` is the suite's unified twelve-check
+gate (ASCII, balance incl. switch/try, constants-before-use, token-shadow, zero-arg
+statement calls, repeat-step and throw-in-catch refusals, and the per-dialect
+antipattern sets) - byte-identical in every member and held so by the suite's
+checker-drift gate: never edit the copy here alone. `check-holdem-idioms.py` is the
+hold-em lineage checker it replaced, kept because eight of its checks (see its
+docstring) exist nowhere in the unified tool and each has caught a real shipped defect
+here. Exit non-zero on any failure, either tool.
 
 **Pure-logic pinning** (Phase 1+): the evaluator vectors, betting-engine cases, and
 protocol KATs run headless in CI because they are plain algorithms — the one part of
@@ -148,7 +206,7 @@ user confirms in the IDE. This discipline is house law across the family.
 | Extension | Library id | Prefix | Needed from | Notes |
 |---|---|---|---|---|
 | **TorrentXT** | `org.openxtalk.library.torrent` | `bt*` | Phase 2 | ABI v8+. Uses: session settings, `btAddInfohash` phantom swarms, `btDhtAnnounce`/`btDhtGetPeers`, **rp1** (`btRp1Enable/SetToken/Send/Poll`), BEP44 (`btDhtBep44SignBuf` + `btDhtPutSigned`, `btDhtGetMutable`), `btMapPort` for the optional direct-TCP upgrade. Also install its `torrent-helpers` poll dispatcher (`btStartPolling`). |
-| **SodiumXT** | `org.openxtalk.library.sodium` | `sx*` | Phase 2 (Phase 1 uses only `sxRandomBytes`/`sxHash` if installed) | Identity, sealing, commitments, randomness. **Phase 4 requires the planned ristretto255 surface** (`sxRistretto*`) — an upstream SodiumXT work item (expose-only; libsodium already carries the primitives). |
+| **SodiumXT** | `org.openxtalk.library.sodium` | `sx*` | Phase 2 (Phase 1 uses only `sxRandomBytes`/`sxHash` if installed) | Identity, sealing, commitments, randomness. **Phase 4's ristretto255 surface SHIPPED 2026-08-15** (SodiumXT ABI 8, `sxRistretto*` — cross-checked KATs green, handlers still need their OXT pass). |
 | **OnionXT** | script libraries `onionxt` (+ `onion-httpd`) | `ox*` | optional (onion tables; Phase 3 oracle hosting) | Not an extension bundle: two `.livecodescript` libraries plus a **locally running tor daemon** (SOCKS 9050, control 9051). Needs SodiumXT ABI >= 6 for deterministic onions. |
 | **Box2Dxt** | `org.openxtalk.box2dxt` + the Kit stack | `b2*` / `b2k*` | Phase 1 | Presentation only: spritesheet cards, physics chips, the `on b2kFrame` loop. The Kit is a `.livecodescript` stack (`box2dxt-kit`); whether this repo `start using`s it or embeds a synced copy between sentinels (the Box2Dxt-examples pattern) is a Phase 1 decision recorded in the plan. |
 
@@ -192,8 +250,12 @@ pKey, pOutLen)`, `sxHmacSha256`. Hex helpers `sxBin2Hex`/`sxHex2Bin` take and re
 `sxRandomBytes`, `sxRandomUniform`. Utility: `sxMemEqual` (constant-time — the ONLY
 legal way to compare secrets/MACs), `sxBin2Hex`/`sxHex2Bin`, `sxBin2Base64`/
 `sxBase642Bin`. Passphrases (if a UI lock is ever added): `sxPwHash*` (Argon2id).
-Planned (Phase 4 prerequisite): `sxRistrettoFromHash`, `sxRistrettoScalarMultPoint`,
-`sxRistrettoScalarRandom`, `sxRistrettoScalarInvert`, `sxRistrettoPointValid`.
+Shipped for Phase 4 (SodiumXT ABI 8, 2026-08-15): `sxRistrettoFromHash(h64)`,
+`sxRistrettoScalarMultPoint(k, p)`, `sxRistrettoScalarRandom()`,
+`sxRistrettoScalarInvert(k)` (all -> 32-byte `Data`, throw on failure - the
+catch path is the detection path), `sxRistrettoPointValid(p)` -> Boolean (a
+predicate, never throws on malformed input); the 64-byte from-hash input is
+`sxHash(tData, 64)`. Verified statically; needs an OXT pass.
 
 **OnionXT** — assumes a reachable tor daemon; it is a transport + naming layer and adds
 no cryptography of its own (composes SodiumXT). Dial-out: `oxDial` through SOCKS5 →
@@ -376,8 +438,9 @@ keys only ever sign. When in doubt, the spec's threat model (section 2) decides.
 
 ## Workflow
 
-- **After every `.livecodescript` edit:** `python3 tools/check-livecodescript.py`.
-- **The self-test harness** (`src/holdem-selftest.livecodescript`, Phase 1+) follows the
+- **After every `.livecodescript` edit:** `python3 tools/check-livecodescript.py` AND
+  `python3 tools/check-holdem-idioms.py`.
+- **The self-test harness** (`heRunSelftest`, embedded in the one stack) follows the
   Box2Dxt pattern: deterministic assertions, a version constant (`kHeHarnessV`) printed
   in the report header and **bumped on every engine-behavior change** so a stale paste
   identifies itself, and self-diagnosing asserts that print what was observed, not just
@@ -391,7 +454,7 @@ keys only ever sign. When in doubt, the spec's threat model (section 2) decides.
 - **Style:** this codebase comments the *why*, densely, in the family's voice — mirror
   it. Straight quotes everywhere, including docs.
 
-## Repo layout (planned end-state; see IMPLEMENTATION-PLAN.md for sequencing)
+## Repo layout (as-built; see IMPLEMENTATION-PLAN.md for sequencing)
 
 ```
 README.md                          front door
@@ -399,13 +462,20 @@ CLAUDE.md                          you are here
 LICENSE                            MIT (the family default, decided Phase 0)
 holdem-spec.md                     the design contract
 IMPLEMENTATION-PLAN.md             the phased build order
-tools/check-livecodescript.py     static gates (carried from the family)
+tools/check-livecodescript.py      the suite's UNIFIED static checker (drift-gated)
+tools/check-holdem-idioms.py       this member's extra idiom checks (the old lineage)
 tools/check-docs.py                docs smart-quote scan
 tools/evaluator-kat.py             spec 8.2 evaluator vectors (CI mirror of heEval7)
 tools/betting-kat.py               spec 8.1/8.3 betting + settlement cases (CI mirror)
 tools/shuffle-kat.py               playable integer deal (CI mirror of heShuffleDeck)
-tools/protocol-kat.py              spec 6/7.1 crypto envelope/chain/deal (Phase 2 target)
+tools/protocol-kat.py              spec 6/7.1 crypto envelope/chain/deal wires
+tools/fold-kat.py                  transcript fold + settlement/deal audits (CI mirror)
+tools/atlas-kat.py                 Kenney card atlas <-> frame-name mapping
+tools/sounds-kat.py                vendored casino WAVs <-> stack mapping
+tools/logic-fuzz.py                INDEPENDENT-reference fuzz (rules, not the port)
+assets/cards/, assets/sounds/      vendored Kenney CC0 art + audio (see NOTICE.md)
 src/holdem.livecodescript          the whole thing: game + self-test + sodium probe,
                                    one self-building paste-and-run stack
-.github/workflows/ci.yml           runs the gates + KATs on every push/PR
+.github/workflows/ci.yml           the standalone mirror's CI; INERT in the suite
+                                   (tools/build-all.sh --gates runs the same set here)
 ```

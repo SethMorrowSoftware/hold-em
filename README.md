@@ -103,5 +103,7 @@ the full workflow.
 
 ---
 
-*Seeded from the [Box2Dxt](https://github.com/SethMorrowSoftware/Box2Dxt) repository
-(`docs/holde-em/`), where the spec was first developed.*
+*Seeded from the Box2Dxt repository's `docs/holde-em/` folder, where the spec was
+first developed; built out in its own repository; folded home into the
+[xTalk suite monorepo](https://github.com/SethMorrowSoftware/xtalk-suite) as the
+member directory `holde-em/` on 2026-08-15 (the standalone repository is a mirror).*

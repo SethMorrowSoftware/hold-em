@@ -11,7 +11,15 @@ M3 = Phase 4 (+ workstream U), M4 = Phase 5.
 
 ---
 
-## Phase 0 — repo bootstrap (done, pending the OXT compile confirmation)
+## Phase 0 — repo bootstrap (done)
+
+> **Where this project lives (updated in the 2026-08-15 fold):** the seed folder
+> left Box2Dxt for its own repository as step 1 planned, was built there through
+> v0.18.0, and then folded home into the xTalk suite monorepo as the member
+> directory `holde-em/` — the riptide/nocloud mold. The standalone repository
+> becomes a mirror; the suite's stale seed copy at `docs/holde-em/` was removed
+> in the fold. The safety net below now ALSO runs suite-side on every push, via
+> `tools/build-all.sh --gates`.
 
 The seed folder becomes its own repository and gains its safety net.
 
@@ -31,8 +39,11 @@ The seed folder becomes its own repository and gains its safety net.
    a Phase 1d option once the Kit is actually wired to art and the paste size can be
    measured; the sync tooling is not carried until then.
 
-**Exit:** CI green in the new repo ✅; skeleton stack compiles in OXT (user-confirmed —
-**pending, needs the first OXT pass**).
+**Exit:** CI green in the new repo ✅; stack compiles and runs in OXT ✅ (the
+"pending, needs the first OXT pass" this line carried was stale by v0.11.1 — the
+stack's changelog records repeated OXT passes from v0.2.0 on, and the v0.17.2
+defect was found AT first run on engine; corrected in the 2026-08-15 fold's
+truth pass).
 
 ## Phase 1 — hotseat game (spec M0)
 
@@ -154,6 +165,17 @@ completes with the oracle never holding a seat; killing the oracle mid-hand void
 resumes per spec 9.
 
 ## Workstream U — upstream SodiumXT ristretto255 (parallel; blocks Phase 4)
+
+> **SHIPPED 2026-08-15 (statically).** With both projects now members of the
+> xtalk-suite monorepo, this landed as suite-internal work: SodiumXT ABI 8
+> exposes the five handlers below, KAT-pinned twice over (libsodium-derived
+> vectors in its C smoke test and member harness, re-derived by the
+> independent RFC 9496 reference now embedded in this repo's
+> `tools/protocol-kat.py` - the exit criterion's cross-check). `sxHash512`
+> proved unnecessary: `sxHash(tData, 64)` already yields the 64-byte digest
+> `sxRistrettoFromHash` wants. Still open before Phase 4 leans on it: the
+> `sxRistretto*` handlers' first OXT engine pass, and the recorded Phase 5
+> follow-ons (batch multiplication, point add/sub, base mult for DLEQ).
 
 Runs in the **SodiumXT repo**, not here; tracked in this plan because Phase 4 cannot
 start without it.

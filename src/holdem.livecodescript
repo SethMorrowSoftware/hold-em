@@ -1112,10 +1112,15 @@ function heByteXor pA, pB
 end heByteXor
 
 function heXorSeedsHex pSeedsHexA, pCount
-   -- XOR of pCount 32-byte seeds (each a 64-hex string), done in hex; returns hex
+   -- XOR of pCount 32-byte seeds (each a 64-hex string), done in hex; returns hex.
+   -- The pair walk is a repeat-while because OXT does not honour the increment
+   -- of `repeat with ... step N` (family lesson; the suite checker refuses it) -
+   -- a stepped loop here would XOR 63 OVERLAPPING pairs instead of 32 aligned
+   -- ones and derive a wrong-but-internally-consistent deck.
    local tPairPos, tSeatPos, tAcc, tHexTxt, tOutHex, tPairHex, tByteVal
    put empty into tOutHex
-   repeat with tPairPos = 1 to 63 step 2
+   put 1 into tPairPos
+   repeat while tPairPos <= 63
       put 0 into tAcc
       repeat with tSeatPos = 1 to pCount
          put pSeedsHexA[tSeatPos] into tHexTxt
@@ -1127,6 +1132,7 @@ function heXorSeedsHex pSeedsHexA, pCount
          put "0" & tPairHex into tPairHex
       end if
       put tPairHex after tOutHex
+      add 2 to tPairPos
    end repeat
    return tOutHex
 end heXorSeedsHex
@@ -1198,10 +1204,14 @@ end heShuffleFromStreamHex
 
 function heDeckFromStreamKey pKeyData
    -- 16 blocks (1024 hex chars) covers 51 draws with slack; extend on the
-   -- astronomically-unlikely stream exhaustion rather than fail
-   local tBlockCount, tDeckList, tShufErr
+   -- astronomically-unlikely stream exhaustion rather than fail. The terminal
+   -- error is captured and re-thrown AFTER `end try`: a `throw` inside a
+   -- `catch` never reaches the caller on OXT (family lesson; the suite
+   -- checker refuses the in-catch form).
+   local tBlockCount, tDeckList, tShufErr, tFatal
    put 16 into tBlockCount
    repeat forever
+      put empty into tFatal
       try
          put heShuffleFromStreamHex(heStreamBlocksHex(pKeyData, tBlockCount)) into tDeckList
          return tDeckList
@@ -1209,9 +1219,12 @@ function heDeckFromStreamKey pKeyData
          if tShufErr contains "he-stream-exhausted" and tBlockCount < 256 then
             put tBlockCount * 2 into tBlockCount
          else
-            throw tShufErr
+            put tShufErr into tFatal
          end if
       end try
+      if tFatal is not empty then
+         throw tFatal
+      end if
    end repeat
 end heDeckFromStreamKey
 
